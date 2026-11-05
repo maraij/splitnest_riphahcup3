@@ -1,0 +1,786 @@
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+
+import '../../core/constants.dart';
+import '../../domain/insights.dart';
+import '../../domain/models.dart';
+import '../../core/format.dart';
+import '../../core/money.dart';
+import '../../state/app_state.dart';
+import '../../core/theme.dart';
+import '../../core/widgets/entrance.dart';
+import '../../core/widgets/error_banner.dart';
+import '../../core/widgets/illustrations.dart';
+import '../../core/widgets/member_avatar.dart';
+import '../../core/widgets/money_text.dart';
+
+/// Expenses tab: recent-expense list (session-only history — there is
+/// no GET /api/expenses endpoint) + an Add New Expense bottom sheet.
+///
+/// Search + filters and the Quick-add favourites below are purely
+/// local UI state; the list itself always comes from AppState.
+class ExpensesScreen extends StatefulWidget {
+  const ExpensesScreen({super.key});
+
+  @override
+  State<ExpensesScreen> createState() => _ExpensesScreenState();
+}
+
+class _ExpensesScreenState extends State<ExpensesScreen> {
+  final _query = TextEditingController();
+  String _category = 'All';
+  String _payer = 'All';
+
+  @override
+  void dispose() {
+    _query.dispose();
+    super.dispose();
+  }
+
+  List<ExpenseRecord> _filtered(AppState state) {
+    final q = _query.text.trim().toLowerCase();
+    return state.recentExpenses.where((e) {
+      if (q.isNotEmpty && !e.title.toLowerCase().contains(q)) return false;
+      if (_category != 'All' && e.category != _category) return false;
+      if (_payer != 'All' && e.payerId != _payer) return false;
+      return true;
+    }).toList();
+  }
+
+  /// One-tap re-add of a favourite: posts a REAL expense via the API
+  /// (same title, amount, payer and split as its last occurrence,
+  /// dated today) and refreshes the single store.
+  Future<void> _quickAdd(AppState state, FavouriteExpense fav) async {
+    final now = DateTime.now();
+    final date =
+        '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+    final ok = await state.addExpense(
+      title: fav.title,
+      category: fav.category,
+      date: date,
+      amount: fav.amount,
+      payerId: fav.payerId,
+      splitType: fav.splitType,
+      splits: fav.splitType == 'custom' ? fav.splitsPayload : null,
+      splitMembers: fav.splitType == 'equal'
+          ? (fav.splitMemberIds.isNotEmpty
+              ? fav.splitMemberIds
+              : state.members.map((m) => m.id).toList())
+          : null,
+    );
+    if (ok && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Added ${fav.title} — PKR ${fav.amount}.')),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+    final history = state.recentExpenses;
+    final favourites = quickAddFavourites(history);
+    final filtered = _filtered(state);
+    final categoriesInUse = categories
+        .where((c) => history.any((e) => e.category == c))
+        .toList();
+    final payersInUse = state.members
+        .where((m) => history.any((e) => e.payerId == m.id))
+        .toList();
+    return RefreshIndicator(
+      onRefresh: state.refresh,
+      child: ListView(
+        padding: const EdgeInsets.all(SplitNestTheme.screenPadding),
+        children: [
+          if (state.errorMessage != null) ...[
+            ErrorBanner(
+              message: state.errorMessage!,
+              onDismiss: state.clearError,
+              onRetry: state.refresh,
+            ),
+            const SizedBox(height: 16),
+          ],
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Recent expenses',
+                  style: SplitNestTheme.sectionStyle),
+              const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  onPressed: state.isBusy
+                      ? null
+                      : () => _openAddExpense(context, state),
+                  icon: const Icon(Icons.add),
+                  label: const Text('Add New Expense'),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          if (favourites.isNotEmpty) ...[
+            const Text('Quick add', style: SplitNestTheme.sectionStyle),
+            const SizedBox(height: 8),
+            const Text(
+              'Tap to re-add a frequent expense with its last amount and split.',
+              style: SplitNestTheme.supportingStyle,
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: favourites
+                  .map((fav) => OutlinedButton.icon(
+                        onPressed: state.isBusy
+                            ? null
+                            : () => _quickAdd(state, fav),
+                        icon: const Icon(Icons.replay_rounded, size: 18),
+                        label: Text(
+                            '${fav.title} — PKR ${fav.amount}'),
+                      ))
+                  .toList(),
+            ),
+            const SizedBox(height: 16),
+          ],
+          if (history.isNotEmpty) ...[
+            TextField(
+              controller: _query,
+              textCapitalization: TextCapitalization.sentences,
+              decoration: InputDecoration(
+                labelText: 'Search expenses by title',
+                prefixIcon: const Icon(Icons.search),
+                suffixIcon: _query.text.isEmpty
+                    ? null
+                    : IconButton(
+                        icon: const Icon(Icons.clear),
+                        tooltip: 'Clear search',
+                        onPressed: () => setState(_query.clear),
+                      ),
+              ),
+              onChanged: (_) => setState(() {}),
+            ),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                ChoiceChip(
+                  label: const Text('All categories'),
+                  selected: _category == 'All',
+                  onSelected: (_) => setState(() => _category = 'All'),
+                ),
+                ...categoriesInUse.map((c) => ChoiceChip(
+                      label: Text(c),
+                      selected: _category == c,
+                      onSelected: (_) => setState(() => _category = c),
+                    )),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                ChoiceChip(
+                  label: const Text('All members'),
+                  selected: _payer == 'All',
+                  onSelected: (_) => setState(() => _payer = 'All'),
+                ),
+                ...payersInUse.map((m) => ChoiceChip(
+                      avatar: MemberAvatar(
+                          memberId: m.id, name: m.name, radius: 13),
+                      label: Text(m.name),
+                      selected: _payer == m.id,
+                      onSelected: (_) => setState(() => _payer = m.id),
+                    )),
+              ],
+            ),
+            const SizedBox(height: 16),
+          ],
+          if (state.isLoading && history.isEmpty)
+            const Padding(
+              padding: EdgeInsets.all(32),
+              child: Center(child: CircularProgressIndicator()),
+            )
+          else if (history.isEmpty)
+            Entrance(
+              child: const Card(
+                child: Padding(
+                  padding: EdgeInsets.all(24),
+                  child: Column(
+                    children: [
+                      EmptyStateIllustration(
+                          kind: EmptyArtKind.receipt),
+                      SizedBox(height: 8),
+                      Text('No expenses added yet in this session',
+                          style: SplitNestTheme.sectionStyle,
+                          textAlign: TextAlign.center),
+                      SizedBox(height: 4),
+                      Text(
+                        'Expenses you add here appear below; balances and budget always come live from the backend.',
+                        style: SplitNestTheme.supportingStyle,
+                        textAlign: TextAlign.center,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            )
+          else if (filtered.isEmpty)
+            const Card(
+              child: Padding(
+                padding: EdgeInsets.all(24),
+                child: Column(
+                  children: [
+                    Icon(Icons.search_off_outlined, size: 40),
+                    SizedBox(height: 8),
+                    Text('No expenses match your filters',
+                        style: SplitNestTheme.sectionStyle,
+                        textAlign: TextAlign.center),
+                    SizedBox(height: 4),
+                    Text(
+                      'Try a different search term or clear the category and member filters.',
+                      style: SplitNestTheme.supportingStyle,
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ...filtered.map((e) => Card(
+                child: ListTile(
+                  leading: MemberAvatar(
+                    memberId: e.payerId,
+                    name: memberName(state.members, e.payerId),
+                  ),
+                  title: Text(e.title),
+                  subtitle: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '${e.category} · ${e.date ?? ''} · Paid by ${memberName(state.members, e.payerId)}',
+                      ),
+                      if (e.shares.isNotEmpty)
+                        Text(
+                          '${e.splitType == 'custom' ? 'Custom' : 'Equal'} split: ${e.shares.map((s) => '${memberName(state.members, s.memberId)} ${s.amount}').join(' · ')}',
+                          style: SplitNestTheme.supportingStyle,
+                        ),
+                    ],
+                  ),
+                  trailing: MoneyText(e.amount,
+                      style: SplitNestTheme.bodyStyle
+                          .copyWith(fontWeight: FontWeight.w700)),
+                  isThreeLine: e.shares.isNotEmpty,
+                ),
+              )),
+          const SizedBox(height: 16),
+        ],
+      ),
+    );
+  }
+}
+
+Future<void> _openAddExpense(BuildContext context, AppState state) async {
+  final ok = await showModalBottomSheet<bool>(
+    context: context,
+    isScrollControlled: true,
+    useSafeArea: true,
+    builder: (ctx) => _AddExpenseSheet(state: state),
+  );
+  if (ok == true && context.mounted) {
+    ScaffoldMessenger.of(context)
+        .showSnackBar(const SnackBar(content: Text('Expense added.')));
+  }
+}
+
+/// Add New Expense bottom sheet.
+///
+/// Split strategies — the UI labels ARE the backend split types,
+/// no translation layer:
+/// - Equal: pick the members who share, split evenly among the chosen
+///   (remainder paisa in member-ID order).
+/// - Custom: enter an exact PKR amount per member; shares must sum
+///   exactly to the total.
+class _AddExpenseSheet extends StatefulWidget {
+  const _AddExpenseSheet({required this.state});
+  final AppState state;
+
+  @override
+  State<_AddExpenseSheet> createState() => _AddExpenseSheetState();
+}
+
+class _AddExpenseSheetState extends State<_AddExpenseSheet> {
+  final _title = TextEditingController();
+  final _amount = TextEditingController();
+  String _category = 'Groceries';
+  String _payerId = 'M01';
+  String _splitType = 'equal';
+  DateTime _date = DateTime.now();
+  final Map<String, TextEditingController> _exact = {};
+  final Set<String> _splitMembers = {};
+  String? _titleError;
+  String? _amountError;
+  String? _formError;
+
+  AppState get state => widget.state;
+
+  @override
+  void initState() {
+    super.initState();
+    // Payer defaults to the logged-in member, so every screen agrees
+    // on who is acting — never a hardcoded member.
+    _payerId = state.activeMemberId;
+    _splitMembers.addAll(state.members.map((m) => m.id));
+  }
+
+  @override
+  void dispose() {
+    _title.dispose();
+    _amount.dispose();
+    for (final c in _exact.values) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  TextEditingController _exactCtrl(String id) =>
+      _exact.putIfAbsent(id, () => TextEditingController(text: '0.00'));
+
+  int _exactSum() {
+    var sum = 0;
+    for (final c in _exact.values) {
+      sum += parsePaisa(c.text.trim()) ?? 0;
+    }
+    return sum;
+  }
+
+  Future<void> _submit() async {
+    final amountPaisa = parsePaisa(_amount.text.trim());
+    setState(() {
+      _titleError =
+          _title.text.trim().isEmpty ? 'Enter an expense title.' : null;
+      _amountError = amountPaisa == null || amountPaisa <= 0
+          ? 'Enter a positive amount, e.g. 1500.00.'
+          : null;
+      _formError = null;
+    });
+    if (_titleError != null || _amountError != null) return;
+    List<Map<String, String>>? splits;
+    List<String>? splitMembers;
+    if (_splitType == 'custom') {
+      // Custom = exact per-member amounts; must sum exactly to the total.
+      splits = [];
+      var sum = 0;
+      for (final m in state.members) {
+        final p = parsePaisa(_exactCtrl(m.id).text.trim());
+        if (p == null || p < 0) {
+          setState(() => _formError =
+              'Each custom share must be a non-negative amount.');
+          return;
+        }
+        sum += p;
+        splits.add({'member_id': m.id, 'amount': formatPaisa(p)});
+      }
+      if (sum != amountPaisa) {
+        setState(() => _formError =
+            'Custom shares sum to PKR ${formatPaisa(sum)} but the amount is PKR ${formatPaisa(amountPaisa!)}.');
+        return;
+      }
+    } else {
+      // Equal = split evenly among the picked members.
+      if (_splitMembers.isEmpty) {
+        setState(
+            () => _formError = 'Pick at least one member to share with.');
+        return;
+      }
+      splitMembers = _splitMembers.toList()..sort();
+    }
+    final date =
+        '${_date.year}-${_date.month.toString().padLeft(2, '0')}-${_date.day.toString().padLeft(2, '0')}';
+    final ok = await state.addExpense(
+          title: _title.text.trim(),
+          category: _category,
+          date: date,
+          amount: formatPaisa(amountPaisa!),
+          payerId: _payerId,
+          splitType: _splitType,
+          splits: splits,
+          splitMembers: splitMembers,
+        );
+    if (ok && mounted) Navigator.of(context).pop(true);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final amountPaisa = parsePaisa(_amount.text.trim());
+    final colors = StatusColors.of(context);
+    return Padding(
+      padding: EdgeInsets.only(
+        left: 16,
+        right: 16,
+        top: 12,
+        bottom: MediaQuery.of(context).viewInsets.bottom + 16,
+      ),
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Center(
+              child: Container(
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.outline,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            const Text('Add New Expense', style: SplitNestTheme.titleStyle),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _title,
+              textCapitalization: TextCapitalization.sentences,
+              decoration: InputDecoration(
+                labelText: 'Title (e.g. Internet Bill)',
+                errorText: _titleError,
+                prefixIcon: const Icon(Icons.receipt_long_outlined),
+              ),
+              onChanged: (_) {
+                if (_titleError != null) setState(() => _titleError = null);
+              },
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _amount,
+              keyboardType:
+                  const TextInputType.numberWithOptions(decimal: true),
+              decoration: InputDecoration(
+                labelText: 'Amount (PKR)',
+                hintText: 'e.g. 1500.00',
+                errorText: _amountError,
+                prefixIcon: const Icon(Icons.payments_outlined),
+              ),
+              onChanged: (_) => setState(() {}),
+            ),
+            const SizedBox(height: 12),
+            const Text('Category', style: SplitNestTheme.sectionStyle),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: categories
+                  .map((c) => ChoiceChip(
+                        avatar: Icon(categoryIcons[c], size: 18),
+                        label: Text(c),
+                        selected: _category == c,
+                        onSelected: (_) => setState(() => _category = c),
+                      ))
+                  .toList(),
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: DropdownButtonFormField<String>(
+                     isExpanded: true,
+                    initialValue: _payerId,
+                    decoration: const InputDecoration(
+                      labelText: 'Payer',
+                      prefixIcon: Icon(Icons.person_outline),
+                    ),
+                    items: state.members
+                        .map((m) => DropdownMenuItem(
+                            value: m.id, child: Text(m.name)))
+                        .toList(),
+                    onChanged: (v) => setState(() => _payerId = v!),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: () async {
+                      final picked = await showDatePicker(
+                        context: context,
+                        initialDate: _date,
+                        firstDate: DateTime(2020),
+                        lastDate: DateTime(2100),
+                      );
+                      if (picked != null) setState(() => _date = picked);
+                    },
+                    icon: const Icon(Icons.calendar_today),
+                    label: Text(formatDate(_date)),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            const Text('Split Strategy', style: SplitNestTheme.sectionStyle),
+            const SizedBox(height: 8),
+            SegmentedButton<String>(
+              segments: const [
+                ButtonSegment(value: 'equal', label: Text('Equal')),
+                ButtonSegment(value: 'custom', label: Text('Custom')),
+              ],
+              selected: {_splitType},
+              onSelectionChanged: (s) => setState(() => _splitType = s.first),
+            ),
+            const SizedBox(height: 12),
+            if (_splitType == 'equal')
+              _EqualSplit(
+                amountPaisa: amountPaisa,
+                members: state.members,
+                selected: _splitMembers,
+                onToggle: (id, selected) => setState(() {
+                  if (selected) {
+                    _splitMembers.add(id);
+                  } else {
+                    _splitMembers.remove(id);
+                  }
+                }),
+              )
+            else
+              _CustomAmounts(
+                amountPaisa: amountPaisa,
+                members: state.members,
+                exactCtrl: _exactCtrl,
+                exactSum: _exactSum(),
+                onChanged: () => setState(() {}),
+              ),
+            if (_formError != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(_formError!,
+                    style: TextStyle(color: colors.error)),
+              ),
+            const SizedBox(height: 16),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                onPressed: state.isBusy ? null : _submit,
+                icon: state.isBusy
+                    ? const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.add),
+                label: Text(state.isBusy ? 'Adding…' : 'Add expense'),
+              ),
+            ),
+            const SizedBox(height: 8),
+            SizedBox(
+              width: double.infinity,
+              child: TextButton(
+                onPressed: () => Navigator.of(context).pop(false),
+                child: const Text('Cancel'),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _EqualPreview extends StatelessWidget {
+  const _EqualPreview({required this.amountPaisa, required this.members});
+  final int? amountPaisa;
+  final List<Member> members;
+
+  @override
+  Widget build(BuildContext context) {
+    if (amountPaisa == null || amountPaisa! <= 0 || members.isEmpty) {
+      return const Text(
+        'Enter an amount to see each person’s share.',
+        style: SplitNestTheme.supportingStyle,
+      );
+    }
+    final shares =
+        equalSplit(amountPaisa!, members.map((m) => m.id).toList());
+    return _PreviewBox(
+      title:
+          'Equal split — PKR ${formatPaisa(amountPaisa!)} between ${members.length}',
+      lines: shares
+          .map((s) =>
+              '${memberName(members, s.memberId)} pays PKR ${formatPaisa(s.amountPaisa)}')
+          .toList(),
+    );
+  }
+}
+
+class _CustomAmounts extends StatelessWidget {
+  const _CustomAmounts({
+    required this.amountPaisa,
+    required this.members,
+    required this.exactCtrl,
+    required this.exactSum,
+    required this.onChanged,
+  });
+  final int? amountPaisa;
+  final List<Member> members;
+  final TextEditingController Function(String id) exactCtrl;
+  final int exactSum;
+  final VoidCallback onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = StatusColors.of(context);
+    final amount = amountPaisa ?? 0;
+    final remaining = amount - exactSum;
+    final balanced = amount > 0 && remaining == 0;
+    final statusText = amount <= 0
+        ? 'Enter an amount first.'
+        : balanced
+            ? 'Balanced — shares match the amount exactly.'
+            : remaining > 0
+                ? 'PKR ${formatPaisa(remaining)} still to assign.'
+                : 'Over by PKR ${formatPaisa(-remaining)} — reduce a share.';
+    final statusColor = balanced
+        ? colors.success
+        : remaining > 0
+            ? colors.warning
+            : colors.error;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text('Custom shares (must sum exactly to the amount):'),
+        const SizedBox(height: 8),
+        ...members.map((m) => Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: TextField(
+                controller: exactCtrl(m.id),
+                keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true),
+                decoration: InputDecoration(
+                  labelText: '${m.name} share (PKR)',
+                  prefixIcon: Padding(
+                    padding: const EdgeInsets.all(10),
+                    child: MemberAvatar(
+                        memberId: m.id, name: m.name, radius: 13),
+                  ),
+                ),
+                onChanged: (_) => onChanged(),
+              ),
+            )),
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: Theme.of(context).colorScheme.surfaceContainerLow,
+            borderRadius: BorderRadius.circular(SplitNestTheme.cardRadius),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Shares total PKR ${formatPaisa(exactSum)} of PKR ${formatPaisa(amount)}',
+                style: SplitNestTheme.bodyStyle
+                    .copyWith(fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 4),
+              Row(
+                children: [
+                  Icon(
+                    balanced
+                        ? Icons.check_circle_outline
+                        : Icons.info_outline,
+                    size: 18,
+                    color: statusColor,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(statusText,
+                        style: SplitNestTheme.supportingStyle
+                            .copyWith(color: statusColor)),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Equal split: pick who shares, split evenly among the chosen.
+class _EqualSplit extends StatelessWidget {
+  const _EqualSplit({
+    required this.amountPaisa,
+    required this.members,
+    required this.selected,
+    required this.onToggle,
+  });
+  final int? amountPaisa;
+  final List<Member> members;
+  final Set<String> selected;
+  final void Function(String id, bool selected) onToggle;
+
+  @override
+  Widget build(BuildContext context) {
+    final chosen =
+        members.where((m) => selected.contains(m.id)).toList();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+            'Pick who shares this expense — split evenly among the chosen:'),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: members.map((m) {
+            final isSelected = selected.contains(m.id);
+            return FilterChip(
+              avatar: MemberAvatar(memberId: m.id, name: m.name, radius: 13),
+              label: Text(m.name),
+              selected: isSelected,
+              onSelected: (v) => onToggle(m.id, v),
+            );
+          }).toList(),
+        ),
+        const SizedBox(height: 12),
+        if (amountPaisa == null || amountPaisa! <= 0 || chosen.isEmpty)
+          const Text(
+            'Enter an amount and pick at least one member to see the split.',
+            style: SplitNestTheme.supportingStyle,
+          )
+        else
+          _EqualPreview(
+            amountPaisa: amountPaisa,
+            members: chosen,
+          ),
+      ],
+    );
+  }
+}
+
+class _PreviewBox extends StatelessWidget {
+  const _PreviewBox({required this.title, required this.lines});
+  final String title;
+  final List<String> lines;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(SplitNestTheme.cardRadius),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(title,
+              style: SplitNestTheme.bodyStyle
+                  .copyWith(fontWeight: FontWeight.w700)),
+          const SizedBox(height: 4),
+          ...lines.map((l) => Text(l, style: SplitNestTheme.supportingStyle)),
+        ],
+      ),
+    );
+  }
+}
