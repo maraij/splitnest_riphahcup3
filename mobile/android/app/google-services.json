@@ -1,0 +1,47 @@
+{
+  "project_info": {
+    "project_number": "780339874841",
+    "project_id": "splitnest-b8071",
+    "storage_bucket": "splitnest-b8071.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:780339874841:android:1f8dc989ad8b3e8a4d6e88",
+        "android_client_info": {
+          "package_name": "com.practice.splitnest.splitnest"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "780339874841-tajhc0j14rajottrl237v1f9mdqf4piv.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.practice.splitnest.splitnest",
+            "certificate_hash": "b0d09eda6e5024fb0af483c518ff80559e950d47"
+          }
+        },
+        {
+          "client_id": "780339874841-o9eaoan4imbo23gjge4s99cah5pqkgpo.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDKHNOAfVVHUeUErwhVSwKYBdPbzPVYVvM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "780339874841-o9eaoan4imbo23gjge4s99cah5pqkgpo.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

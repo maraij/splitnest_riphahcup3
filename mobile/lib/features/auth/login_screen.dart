@@ -2,19 +2,23 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../../state/app_state.dart';
+import '../../data/google_auth_service.dart';
 import '../../core/theme.dart';
 import '../../core/widgets/entrance.dart';
 import '../../core/widgets/error_banner.dart';
 import '../../core/widgets/illustrations.dart';
 import '../../core/widgets/member_avatar.dart';
 
-/// Real login — member + password, checked by POST /api/auth/login.
-/// The form state (_selectedId + _password) is the ONLY input to the
-/// login call: the Log in button and the Demo popup both fill this
-/// form and run the same _submit. On a wrong password the backend
-/// returns 401, the store surfaces "Wrong password, try again", and
-/// the user stays on this page. On success the store holds the
-/// session token and Home opens.
+/// Real login — member + password, checked by POST /api/auth/login,
+/// or Google: the account chooser runs on the device, then the user
+/// picks which member that Google account is, and the store logs
+/// them in via POST /api/auth/google (the backend verifies the ID
+/// token against Google first). The form state (_selectedId +
+/// _password) is the ONLY input to the password login call: the Log
+/// in button and the Demo popup both fill this form and run the same
+/// _submit. On a wrong password the backend returns 401, the store
+/// surfaces "Wrong password, try again", and the user stays on this
+/// page. On success the store holds the session token and Home opens.
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
 
@@ -26,6 +30,7 @@ class _LoginScreenState extends State<LoginScreen> {
   String? _selectedId;
   final _password = TextEditingController();
   bool _obscure = true;
+  bool _googleBusy = false;
 
   @override
   void dispose() {
@@ -222,10 +227,11 @@ class _LoginScreenState extends State<LoginScreen> {
                   // accounts (user request, 2026-11-05): a full-width
                   // dark pill, like the reference screenshot — black
                   // background, thin light border, fully rounded ends,
-                  // Google "G" logo, white text. It does NOT sign in:
-                  // Google sign-in needs Firebase Auth, which is not
-                  // wired in this practice build, so the tap opens an
-                  // honest popup and offers the member login instead.
+                  // Google "G" logo, white text. It runs the REAL
+                  // Google sign-in (account chooser / Gmail + password
+                  // on the device), then asks which member this Google
+                  // account is, then logs that member in via
+                  // POST /api/auth/google.
                   Row(
                     children: [
                       const Expanded(child: Divider()),
@@ -246,7 +252,9 @@ class _LoginScreenState extends State<LoginScreen> {
                   ),
                   const SizedBox(height: 20),
                   _GoogleSignInButton(
-                    onPressed: () => _showGoogleInfo(context),
+                    onPressed: (state.isBusy || _googleBusy)
+                        ? null
+                        : () => _signInWithGoogle(state),
                   ),
                   const SizedBox(height: 20),
                   // ONE Demo button: it opens a popup with the three demo
@@ -292,29 +300,83 @@ class _LoginScreenState extends State<LoginScreen> {
     if (ok && mounted) _password.clear();
   }
 
-  /// Google sign-in is NOT wired in this practice build (it needs a
-  /// Firebase project, google-services.json and an Android SHA-1), so
-  /// the button never pretends to sign in: it opens this popup and
-  /// offers the member login instead. No state changes, no fake
-  /// session.
-  Future<void> _showGoogleInfo(BuildContext context) async {
-    await showDialog<void>(
+  /// REAL Google sign-in: the account chooser / Gmail + password flow
+  /// runs on the device, Google returns an ID token, and this screen
+  /// asks which SplitNest member that Google account belongs to —
+  /// then the store logs that member in via POST /api/auth/google,
+  /// which verifies the token against Google before issuing a session.
+  /// A cancelled chooser or any failure stays on this page with a
+  /// clear message. There is no fake session anywhere in this flow.
+  Future<void> _signInWithGoogle(AppState state) async {
+    if (_googleBusy || state.isBusy) return;
+    setState(() => _googleBusy = true);
+    try {
+      final result = await state.googleAuth.signIn();
+      if (!mounted) return;
+      switch (result) {
+        case GoogleSignedIn(:final idToken, :final email):
+          final memberId = await _pickGoogleMember(email);
+          if (memberId == null || !mounted) return;
+          final ok = await state.loginWithGoogle(
+            idToken: idToken,
+            memberId: memberId,
+          );
+          if (ok && mounted) _password.clear();
+        case GoogleSignInCancelled():
+          state.showError('Google sign-in was cancelled.');
+        case GoogleSignInFailed(:final message):
+          state.showError(message);
+      }
+    } finally {
+      if (mounted) setState(() => _googleBusy = false);
+    }
+  }
+
+  /// After Google signs in, the user picks which SplitNest member
+  /// this Google account is. Returns the member id, or null when the
+  /// user backs out (then nothing is logged in).
+  Future<String?> _pickGoogleMember(String googleEmail) {
+    final members = context.read<AppState>().members;
+    return showDialog<String>(
       context: context,
+      barrierDismissible: true,
       builder: (dialogCtx) => AlertDialog(
         shape: RoundedRectangleBorder(
           borderRadius:
               BorderRadius.circular(SplitNestTheme.cardRadius),
         ),
-        title: const Text('Continue with Google'),
-        content: const Text(
-          'Google sign-in isn\'t connected in this practice build yet — '
-          'it needs Firebase Auth set up first. Please sign in with '
-          'your member account and password instead.',
+        title: const Text('Choose your account'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              'Signed in with Google as $googleEmail. '
+              'Which SplitNest member is this?',
+              style: SplitNestTheme.supportingStyle,
+            ),
+            const SizedBox(height: 12),
+            ...members.map((m) => Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: SizedBox(
+                    width: double.infinity,
+                    child: OutlinedButton.icon(
+                      onPressed: () => Navigator.of(dialogCtx).pop(m.id),
+                      icon: MemberAvatar(
+                        memberId: m.id,
+                        name: m.name,
+                        radius: 13,
+                      ),
+                      label: Text('${m.name} • ${m.id}'),
+                    ),
+                  ),
+                )),
+          ],
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(dialogCtx).pop(),
-            child: const Text('Use member login'),
+            child: const Text('Cancel'),
           ),
         ],
       ),
@@ -395,7 +457,7 @@ class _LoginScreenState extends State<LoginScreen> {
 class _GoogleSignInButton extends StatelessWidget {
   const _GoogleSignInButton({required this.onPressed});
 
-  final VoidCallback onPressed;
+  final VoidCallback? onPressed;
 
   @override
   Widget build(BuildContext context) {

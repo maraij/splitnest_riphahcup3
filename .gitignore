@@ -8,3 +8,7 @@ mobile/.dart_tool/
 mobile/.idea/
 *.log
 .DS_Store
+# NOTE: mobile/android/app/google-services.json is intentionally NOT
+# ignored — the CI build needs it, and its API key is a client key
+# restricted to this package + SHA-1; the same key ships inside
+# every APK anyway. Rotate it in Firebase console if ever needed.

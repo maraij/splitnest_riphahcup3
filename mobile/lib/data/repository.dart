@@ -18,6 +18,14 @@ class SplitNestRepository {
   }) =>
       _api.login(memberId: memberId, password: password);
 
+  /// POST /api/auth/google — the same session as the password login,
+  /// for a Google ID token the backend has verified.
+  Future<({String token, Member member})> loginWithGoogle({
+    required String idToken,
+    required String memberId,
+  }) =>
+      _api.loginWithGoogle(idToken: idToken, memberId: memberId);
+
   /// Clears the session token (logout). After this, no endpoint call
   /// may succeed until login runs again.
   void clearToken() => _api.clearToken();

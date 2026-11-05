@@ -49,6 +49,9 @@ class ApiClient {
     String path,
     Map<String, dynamic>? body, {
     bool isLogin = false,
+    // Message for a 401 on a login call. Login calls report their own
+    // friendly text instead of the generic session-expired one.
+    String? unauthorizedMessage,
   }) async {
     late http.Response res;
     try {
@@ -86,7 +89,7 @@ class ApiClient {
       // A 401 on login means wrong credentials; anywhere else it means
       // the session is gone — the user must log in again.
       throw ApiException(isLogin
-          ? 'Wrong password, try again'
+          ? (unauthorizedMessage ?? 'Wrong password, try again')
           : 'Session expired. Log in again.');
     }
     final msg = data is Map && data['error'] is Map
@@ -106,6 +109,31 @@ class ApiClient {
       '/api/auth/login',
       {'member_id': memberId, 'password': password},
       isLogin: true,
+    );
+    final map = data as Map<String, dynamic>;
+    final token = map['token'] as String;
+    _token = token;
+    return (
+      token: token,
+      member: Member.fromJson(map['member'] as Map<String, dynamic>),
+    );
+  }
+
+  /// POST /api/auth/google — exchanges a verified Google ID token for
+  /// the same session token as the password login. The backend
+  /// verifies the token against Google before issuing anything, so a
+  /// 401 here means the Google token was rejected.
+  Future<({String token, Member member})> loginWithGoogle({
+    required String idToken,
+    required String memberId,
+  }) async {
+    final data = await _call(
+      'POST',
+      '/api/auth/google',
+      {'idToken': idToken, 'memberId': memberId},
+      isLogin: true,
+      unauthorizedMessage: 'Google sign-in could not be verified. '
+          'Please try again or use member login.',
     );
     final map = data as Map<String, dynamic>;
     final token = map['token'] as String;

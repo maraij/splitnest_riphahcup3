@@ -7,6 +7,7 @@ import 'package:image_picker_platform_interface/image_picker_platform_interface.
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:splitnest/data/api_client.dart';
+import 'package:splitnest/data/google_auth_service.dart';
 import 'package:splitnest/core/money.dart';
 import 'package:splitnest/data/repository.dart';
 import 'package:splitnest/domain/models.dart';
@@ -230,6 +231,27 @@ class FakeApi extends ApiClient {
     return (token: token, member: member);
   }
 
+  /// Fake Google login: the token is already verified (that is the
+  /// backend's job, tested in test/api.test.js) — here it just issues
+  /// the same session shape for the picked member.
+  @override
+  Future<({String token, Member member})> loginWithGoogle({
+    required String idToken,
+    required String memberId,
+  }) async {
+    final members = await getMembers();
+    Member? member;
+    for (final m in members) {
+      if (m.id == memberId) member = m;
+    }
+    if (member == null) {
+      throw ApiException('Member $memberId does not exist.');
+    }
+    const token = 'fake-google-token';
+    setToken(token);
+    return (token: token, member: member);
+  }
+
   int _expenseSeq = 0;
 
   /// Fake add-expense: echoes the inputs back as a recorded expense,
@@ -290,6 +312,15 @@ class FakeRepository extends SplitNestRepository {
   FakeRepository({ApiClient? api}) : super(api: api ?? FakeApi());
 }
 
+/// Fake Google sign-in returning a scripted result, so the login
+/// screen's Google flow can be tested without a device or Google.
+class FakeGoogleAuthService implements GoogleAuthService {
+  FakeGoogleAuthService(this.result);
+  final GoogleSignInResult result;
+  @override
+  Future<GoogleSignInResult> signIn() async => result;
+}
+
 /// API that always fails, for the network-error test.
 class ThrowingApi extends ApiClient {
   ThrowingApi() : super(baseUrl: 'http://fake');
@@ -299,11 +330,13 @@ class ThrowingApi extends ApiClient {
 }
 
 Future<void> pumpApp(WidgetTester tester,
-    {SplitNestRepository? repository}) async {
+    {SplitNestRepository? repository, GoogleAuthService? googleAuth}) async {
   await tester.pumpWidget(
     ChangeNotifierProvider(
-      create: (_) =>
-          AppState(repository: repository ?? FakeRepository())..refresh(),
+      create: (_) => AppState(
+        repository: repository ?? FakeRepository(),
+        googleAuth: googleAuth,
+      )..refresh(),
       child: const SplitNestApp(),
     ),
   );
@@ -792,9 +825,13 @@ void main() {
   });
 
   testWidgets(
-      'Continue with Google sits below the accounts and explains itself',
+      'Continue with Google sits below the accounts and signs in',
       (tester) async {
-    await pumpApp(tester);
+    await pumpApp(tester,
+        googleAuth: FakeGoogleAuthService(const GoogleSignedIn(
+          idToken: 'fake-id-token',
+          email: 'test.user@gmail.com',
+        )));
     // One Google button, below the member accounts (not above them).
     expect(find.text('Continue with Google'), findsOneWidget);
     final googleY =
@@ -802,17 +839,55 @@ void main() {
     for (final name in ['Ali', 'Ayesha', 'Bilal']) {
       expect(tester.getCenter(find.text(name)).dy, lessThan(googleY));
     }
-    // Tapping it never signs in: it opens the honest popup, and
-    // closing it leaves the user on the login page.
+    // Tapping it runs the Google flow, then asks which member this
+    // Google account is — no password, no fake session.
     await tester.ensureVisible(find.text('Continue with Google'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Continue with Google'));
     await tester.pumpAndSettle();
-    expect(find.textContaining('Google sign-in isn\'t connected'),
-        findsOneWidget);
-    expect(find.textContaining('Firebase Auth'), findsOneWidget);
-    await tester.tap(find.text('Use member login'));
+    expect(find.text('Choose your account'), findsOneWidget);
+    expect(find.textContaining('test.user@gmail.com'), findsOneWidget);
+    await tester.tap(find.text('Ali • M01'));
     await tester.pumpAndSettle();
+    // Logged in as Ali: the welcome popup, then Home.
+    if (find.text('Got it').evaluate().isNotEmpty) {
+      await tester.tap(find.text('Got it'));
+      await tester.pumpAndSettle();
+      if (find.text('Dismiss').evaluate().isNotEmpty) {
+        await tester.tap(find.text('Dismiss'));
+        await tester.pumpAndSettle();
+      }
+    }
+    expect(find.text('Log in'), findsNothing);
+    expect(find.text('Home'), findsOneWidget);
+  });
+
+  testWidgets('cancelling Google sign-in stays on login with a message',
+      (tester) async {
+    await pumpApp(tester,
+        googleAuth: FakeGoogleAuthService(const GoogleSignInCancelled()));
+    await tester.ensureVisible(find.text('Continue with Google'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Continue with Google'));
+    await tester.pumpAndSettle();
+    expect(find.text('Google sign-in was cancelled.'), findsOneWidget);
+    expect(find.text('Log in'), findsOneWidget);
+  });
+
+  testWidgets('a failed Google sign-in stays on login with a message',
+      (tester) async {
+    await pumpApp(tester,
+        googleAuth: FakeGoogleAuthService(const GoogleSignInFailed(
+          'Google sign-in failed. Please try again or use member login.',
+        )));
+    await tester.ensureVisible(find.text('Continue with Google'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Continue with Google'));
+    await tester.pumpAndSettle();
+    expect(
+        find.text(
+            'Google sign-in failed. Please try again or use member login.'),
+        findsOneWidget);
     expect(find.text('Log in'), findsOneWidget);
   });
 

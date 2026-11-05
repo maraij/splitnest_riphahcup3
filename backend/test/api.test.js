@@ -341,3 +341,150 @@ test('fixed monthly expenses: seeded list, create, edit, apply idempotently, del
 });
 
 });
+
+// ---- POST /api/auth/google ----
+// The token check hits Google's tokeninfo endpoint; in tests it is
+// pointed at this local stub (GOOGLE_TOKENINFO_URL) which answers
+// from the id_token value, so no real Google account is needed.
+const http = require('node:http');
+const { GOOGLE_WEB_CLIENT_ID } = require('../src/auth');
+
+function tokeninfoStub() {
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://127.0.0.1');
+    const token = url.searchParams.get('id_token');
+    const now = Math.floor(Date.now() / 1000);
+    const base = {
+      iss: 'https://accounts.google.com',
+      aud: GOOGLE_WEB_CLIENT_ID,
+      email: 'test.user@gmail.com',
+      email_verified: 'true',
+      exp: now + 3600,
+    };
+    let body = base;
+    if (token === 'wrong-aud-token') {
+      body = { ...base, aud: 'someone-else.apps.googleusercontent.com' };
+    } else if (token === 'expired-token') {
+      body = { ...base, exp: now - 10 };
+    } else if (token === 'unverified-token') {
+      body = { ...base, email_verified: 'false' };
+    } else if (token === 'bad-token') {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid_token' }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(body));
+  });
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => resolve(server));
+  });
+}
+
+async function withGoogleStub(fn) {
+  const stub = await tokeninfoStub();
+  const prev = process.env.GOOGLE_TOKENINFO_URL;
+  process.env.GOOGLE_TOKENINFO_URL =
+    `http://127.0.0.1:${stub.address().port}/tokeninfo`;
+  try {
+    await fn();
+  } finally {
+    stub.close();
+    if (prev === undefined) delete process.env.GOOGLE_TOKENINFO_URL;
+    else process.env.GOOGLE_TOKENINFO_URL = prev;
+  }
+}
+
+test('POST /api/auth/google issues a session for a valid token', async () => {
+  await withGoogleStub(async () => {
+    const { base, stop } = await start();
+    try {
+      const r = await req(base, 'POST', '/api/auth/google',
+        { idToken: 'valid-token', memberId: 'M02' }, { noAuth: true });
+      assert.equal(r.status, 200, JSON.stringify(r.json));
+      assert.equal(r.json.member.id, 'M02');
+      assert.equal(r.json.member.name, 'Ayesha');
+      assert.equal(r.json.google_email, 'test.user@gmail.com');
+      assert.ok(typeof r.json.token === 'string' && r.json.token.length >= 32);
+      // The issued token works on a protected endpoint.
+      const bal = await req(base, 'GET', '/api/balances', undefined,
+        { headers: { Authorization: `Bearer ${r.json.token}` } });
+      assert.equal(bal.status, 200);
+    } finally { await stop(); }
+  });
+});
+
+test('POST /api/auth/google rejects a token for the wrong audience with 401', async () => {
+  await withGoogleStub(async () => {
+    const { base, stop } = await start();
+    try {
+      const r = await req(base, 'POST', '/api/auth/google',
+        { idToken: 'wrong-aud-token', memberId: 'M01' }, { noAuth: true });
+      assert.equal(r.status, 401);
+      assert.ok(r.json.error);
+      assert.equal(r.json.token, undefined);
+    } finally { await stop(); }
+  });
+});
+
+test('POST /api/auth/google rejects an expired token with 401', async () => {
+  await withGoogleStub(async () => {
+    const { base, stop } = await start();
+    try {
+      const r = await req(base, 'POST', '/api/auth/google',
+        { idToken: 'expired-token', memberId: 'M01' }, { noAuth: true });
+      assert.equal(r.status, 401);
+      assert.ok(r.json.error);
+    } finally { await stop(); }
+  });
+});
+
+test('POST /api/auth/google rejects an unverified email with 401', async () => {
+  await withGoogleStub(async () => {
+    const { base, stop } = await start();
+    try {
+      const r = await req(base, 'POST', '/api/auth/google',
+        { idToken: 'unverified-token', memberId: 'M01' }, { noAuth: true });
+      assert.equal(r.status, 401);
+      assert.ok(r.json.error);
+    } finally { await stop(); }
+  });
+});
+
+test('POST /api/auth/google rejects a token Google itself rejects with 401', async () => {
+  await withGoogleStub(async () => {
+    const { base, stop } = await start();
+    try {
+      const r = await req(base, 'POST', '/api/auth/google',
+        { idToken: 'bad-token', memberId: 'M01' }, { noAuth: true });
+      assert.equal(r.status, 401);
+      assert.ok(r.json.error);
+    } finally { await stop(); }
+  });
+});
+
+test('POST /api/auth/google rejects an unknown member with 404', async () => {
+  await withGoogleStub(async () => {
+    const { base, stop } = await start();
+    try {
+      const r = await req(base, 'POST', '/api/auth/google',
+        { idToken: 'valid-token', memberId: 'M99' }, { noAuth: true });
+      assert.equal(r.status, 404);
+      assert.ok(r.json.error);
+    } finally { await stop(); }
+  });
+});
+
+test('POST /api/auth/google rejects missing fields with 400', async () => {
+  await withGoogleStub(async () => {
+    const { base, stop } = await start();
+    try {
+      const r = await req(base, 'POST', '/api/auth/google',
+        { memberId: 'M01' }, { noAuth: true });
+      assert.equal(r.status, 400);
+      const r2 = await req(base, 'POST', '/api/auth/google',
+        { idToken: 'valid-token' }, { noAuth: true });
+      assert.equal(r2.status, 400);
+    } finally { await stop(); }
+  });
+});

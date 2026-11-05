@@ -1,12 +1,12 @@
 'use strict';
 /**
  * SplitNest backend — Express app factory.
- * Thirteen endpoints: GET /api/members, GET /api/shopping,
+ * Fourteen endpoints: GET /api/members, GET /api/shopping,
  * POST /api/shopping, POST /api/shopping/checkout, POST /api/expenses,
  * GET /api/balances, POST /api/settle, POST /api/auth/login,
- * GET /api/fixed-expenses, POST /api/fixed-expenses,
- * PATCH /api/fixed-expenses/:id, DELETE /api/fixed-expenses/:id,
- * POST /api/fixed-expenses/:id/apply.
+ * POST /api/auth/google, GET /api/fixed-expenses,
+ * POST /api/fixed-expenses, PATCH /api/fixed-expenses/:id,
+ * DELETE /api/fixed-expenses/:id, POST /api/fixed-expenses/:id/apply.
  * All endpoints except /api/auth/login require a valid session:
  * Authorization: Bearer <token>. Unauthenticated calls get 401.
  *
@@ -18,7 +18,7 @@
 const express = require('express');
 const { openDb, nextId, UNITS } = require('./db');
 const { parsePaisa, formatPaisa, isPositiveInt, equalSplit } = require('./money');
-const { verifyPassword, createSession, getSessionMember } = require('./auth');
+const { verifyPassword, createSession, getSessionMember, verifyGoogleIdToken } = require('./auth');
 
 function error(res, status, code, message) {
   return res.status(status).json({ error: { code, message } });
@@ -145,6 +145,42 @@ function createApp(dbPath) {
       .get(member_id);
     if (!row || !verifyPassword(password, row.password_hash)) return invalid();
     res.json({ token: createSession(row.id), member: { id: row.id, name: row.name } });
+  });
+
+  // ---- POST /api/auth/google (public) ----
+  // Real Google sign-in: the Flutter app sends the ID token Google
+  // issued for its Web client id plus the member this Google account
+  // belongs to. The token is verified against Google (audience,
+  // issuer, verified email, expiry) before ANY session is issued —
+  // a forged or stale token gets 401 and nothing is logged in.
+  // On success the response is the same session shape as the
+  // password login, and the Google email is recorded on the session.
+  app.post('/api/auth/google', async (req, res) => {
+    const body = req.body || {};
+    const idToken = body.idToken || body.id_token;
+    const memberId = body.memberId || body.member_id;
+    if (typeof idToken !== 'string' || idToken === '' ||
+        typeof memberId !== 'string' || memberId === '') {
+      return error(res, 400, 'INVALID_GOOGLE_LOGIN',
+        'idToken and memberId are required.');
+    }
+    const row = db
+      .prepare('SELECT id, name FROM members WHERE id = ?')
+      .get(memberId);
+    if (!row) {
+      return error(res, 404, 'UNKNOWN_MEMBER',
+        `Member ${memberId} does not exist.`);
+    }
+    const verified = await verifyGoogleIdToken(idToken);
+    if (!verified) {
+      return error(res, 401, 'INVALID_GOOGLE_TOKEN',
+        'Google sign-in could not be verified. Please try again.');
+    }
+    res.json({
+      token: createSession(row.id, verified.email),
+      member: { id: row.id, name: row.name },
+      google_email: verified.email,
+    });
   });
 
   // ---- GET /api/members ----

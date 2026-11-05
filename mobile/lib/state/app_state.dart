@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../data/api_client.dart';
+import '../data/google_auth_service.dart';
 import '../data/repository.dart';
 import '../domain/insights.dart';
 import '../domain/models.dart';
@@ -18,8 +19,12 @@ import '../domain/models.dart';
 /// never refresh per-screen. Every mutation refreshes this store once
 /// and all screens rebuild from it.
 class AppState extends ChangeNotifier {
-  AppState({SplitNestRepository? repository, bool? initialDarkMode})
-      : _repository = repository ?? SplitNestRepository() {
+  AppState({
+    SplitNestRepository? repository,
+    GoogleAuthService? googleAuth,
+    bool? initialDarkMode,
+  })  : _repository = repository ?? SplitNestRepository(),
+        googleAuth = googleAuth ?? RealGoogleAuthService() {
     _isDarkMode = initialDarkMode ?? false;
     // When the caller did not preload the saved theme (tests), load
     // it here; main() preloads it before first paint instead.
@@ -29,6 +34,11 @@ class AppState extends ChangeNotifier {
   }
 
   final SplitNestRepository _repository;
+
+  /// Google sign-in service (real in production, fake in widget
+  /// tests). The login screen calls it; the store never talks to
+  /// Google directly.
+  final GoogleAuthService googleAuth;
 
   // ---- Theme (light / dark) — one state, AppBar + drawer toggles ----
   static const _themeModeKey = 'theme_mode';
@@ -320,6 +330,40 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  /// Google login: a Google ID token the backend has verified, plus
+  /// the member the user picked. Same session handling as the
+  /// password login — token stored, logged-in + active member set,
+  /// welcome popup armed, data refreshed. A rejected token returns
+  /// false with the verification error and stays logged out.
+  Future<bool> loginWithGoogle({
+    required String idToken,
+    required String memberId,
+  }) async {
+    if (isBusy) return false;
+    isBusy = true;
+    errorMessage = null;
+    notifyListeners();
+    try {
+      final result = await _repository.loginWithGoogle(
+        idToken: idToken,
+        memberId: memberId,
+      );
+      sessionToken = result.token;
+      loggedInMemberId = result.member.id;
+      activeMemberId = result.member.id;
+      _welcomeShownForMemberId = null;
+      _welcomeDialogPending = false;
+      await refresh();
+      return true;
+    } on ApiException catch (e) {
+      errorMessage = e.message;
+      return false;
+    } finally {
+      isBusy = false;
+      notifyListeners();
+    }
+  }
+
   /// Logout: clears the token (no endpoint call may succeed after
   /// this), the logged-in member and the welcome state; returns to login.
   void logout() {
@@ -566,6 +610,13 @@ class AppState extends ChangeNotifier {
       );
     }
     return ok;
+  }
+
+  /// Shows a message on the login page (e.g. a cancelled Google
+  /// sign-in). The login screen's error banner displays it.
+  void showError(String message) {
+    errorMessage = message;
+    notifyListeners();
   }
 
   void clearError() {
