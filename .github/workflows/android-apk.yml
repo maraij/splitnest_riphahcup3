@@ -18,6 +18,8 @@ jobs:
         with:
           flutter-version: "3.47.9"
           channel: stable
+      - name: Install Pillow
+        run: pip install pillow
       - name: Generate launcher icons and app logo
         run: python3 .github/scripts/generate_assets.py
       - run: flutter pub get
