@@ -1,0 +1,10 @@
+node_modules/
+backend/splitnest.db
+backend/splitnest.db-journal
+backend/splitnest.db-wal
+backend/splitnest.db-shm
+mobile/build/
+mobile/.dart_tool/
+mobile/.idea/
+*.log
+.DS_Store
