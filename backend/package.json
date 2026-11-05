@@ -1,0 +1,18 @@
+{
+  "name": "splitnest-backend",
+  "version": "1.0.0",
+  "description": "SplitNest practice-only backend: Node + Express + SQLite (file-based). PRACTICE ONLY - NOT FOR SUBMISSION.",
+  "type": "commonjs",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/money.test.js test/api.test.js"
+  },
+  "dependencies": {
+    "bcrypt": "^6.0.0",
+    "express": "^4.21.2"
+  },
+  "engines": {
+    "node": ">=22.5"
+  }
+}
