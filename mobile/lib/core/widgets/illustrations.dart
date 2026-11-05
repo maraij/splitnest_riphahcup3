@@ -6,7 +6,8 @@ import '../theme.dart';
 
 /// Lightweight Flutter-drawn animated illustrations (CustomPainter +
 /// one-shot TweenAnimationBuilder). No new dependency, no stock photos,
-/// no emoji. Palette is white + teal + navy + gold only.
+/// no emoji. Colours come from the current theme (primary/secondary +
+/// gold), so the art follows light and dark mode.
 ///
 /// Motion is deliberately ONE-SHOT (fade/draw-in + a single slow float
 /// swell, ~2.4s) rather than an infinite loop: an endlessly repeating
@@ -38,7 +39,11 @@ class NestIllustration extends StatelessWidget {
             child: Opacity(
               opacity: 0.35 + 0.65 * t,
               child: CustomPaint(
-                painter: _NestPainter(progress: t),
+                painter: _NestPainter(
+                  progress: t,
+                  primary: Theme.of(context).colorScheme.primary,
+                  secondary: Theme.of(context).colorScheme.secondary,
+                ),
               ),
             ),
           );
@@ -49,22 +54,31 @@ class NestIllustration extends StatelessWidget {
 }
 
 class _NestPainter extends CustomPainter {
-  _NestPainter({required this.progress});
+  _NestPainter({
+    required this.progress,
+    required this.primary,
+    required this.secondary,
+  });
 
   /// 0 → 1 draw-in progress.
   final double progress;
+
+  /// Theme colours (teal/light-teal in light mode, plum/mauve in
+  /// dark mode) — passed in so the art follows the theme.
+  final Color primary;
+  final Color secondary;
 
   @override
   void paint(Canvas canvas, Size size) {
     final w = size.width;
     final h = size.height;
     final teal = Paint()
-      ..color = SplitNestTheme.primary
+      ..color = primary
       ..style = PaintingStyle.stroke
       ..strokeWidth = w * 0.045
       ..strokeCap = StrokeCap.round;
     final tealLight = Paint()
-      ..color = SplitNestTheme.primaryLight
+      ..color = secondary
       ..style = PaintingStyle.stroke
       ..strokeWidth = w * 0.035
       ..strokeCap = StrokeCap.round;
@@ -177,7 +191,14 @@ class EmptyStateIllustration extends StatelessWidget {
             offset: Offset(0, dy),
             child: Opacity(
               opacity: t,
-              child: CustomPaint(painter: _EmptyPainter(kind: kind, t: t)),
+              child: CustomPaint(
+              painter: _EmptyPainter(
+                kind: kind,
+                t: t,
+                primary: Theme.of(context).colorScheme.primary,
+                secondary: Theme.of(context).colorScheme.secondary,
+              ),
+            ),
             ),
           );
         },
@@ -187,23 +208,32 @@ class EmptyStateIllustration extends StatelessWidget {
 }
 
 class _EmptyPainter extends CustomPainter {
-  _EmptyPainter({required this.kind, required this.t});
+  _EmptyPainter({
+    required this.kind,
+    required this.t,
+    required this.primary,
+    required this.secondary,
+  });
 
   final EmptyArtKind kind;
   final double t;
+
+  /// Theme colours — passed in so the art follows light/dark mode.
+  final Color primary;
+  final Color secondary;
 
   @override
   void paint(Canvas canvas, Size size) {
     final w = size.width;
     final h = size.height;
     final teal = Paint()
-      ..color = SplitNestTheme.primary
+      ..color = primary
       ..style = PaintingStyle.stroke
       ..strokeWidth = w * 0.045
       ..strokeCap = StrokeCap.round
       ..strokeJoin = StrokeJoin.round;
     final tealLight = Paint()
-      ..color = SplitNestTheme.primaryLight
+      ..color = secondary
       ..style = PaintingStyle.stroke
       ..strokeWidth = w * 0.04
       ..strokeCap = StrokeCap.round

@@ -1,8 +1,21 @@
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+
+import '../../state/app_state.dart';
+import '../theme.dart';
 
 /// Initials avatar in a fixed per-member colour, so each roommate is
 /// recognisable at a glance. Colours are decorative only — balances are
 /// always labelled with text as well.
+///
+/// If the member has picked a profile photo (AppState.profileImages,
+/// keyed by member id, persisted in SharedPreferences), the photo is
+/// shown here instead of the initials — so a photo set on Profile
+/// updates EVERY avatar app-wide (Home, Settle Up, welcome popup,
+/// login cards, shopping/expenses rows). With no photo, initials.
+/// An explicit [imageBytes] overrides the stored photo (tests).
 class MemberAvatar extends StatelessWidget {
   const MemberAvatar({
     super.key,
@@ -10,15 +23,17 @@ class MemberAvatar extends StatelessWidget {
     required this.name,
     this.radius = 20,
     this.selected = false,
+    this.imageBytes,
   });
 
   final String memberId;
   final String name;
   final double radius;
   final bool selected;
+  final Uint8List? imageBytes;
 
   static const _palette = {
-    'M01': (Color(0xFF0F766E), Colors.white), // Ali — teal
+    'M01': (SplitNestTheme.primary, Colors.white), // Ali — deep teal-green
     'M02': (Color(0xFF9D174D), Colors.white), // Ayesha — rose
     'M03': (Color(0xFFB45309), Colors.white), // Bilal — gold-amber
   };
@@ -35,6 +50,31 @@ class MemberAvatar extends StatelessWidget {
     final (bg, fg) = _palette[memberId] ??
         (Theme.of(context).colorScheme.primary,
             Theme.of(context).colorScheme.onPrimary);
+    // Photo from the single source of truth (or an explicit override).
+    final Uint8List? photo =
+        imageBytes ?? context.watch<AppState>().profileImageFor(memberId);
+    final Widget face = photo != null
+        ? ClipOval(
+            child: Image.memory(
+              photo,
+              width: radius * 2,
+              height: radius * 2,
+              fit: BoxFit.cover,
+            ),
+          )
+        : CircleAvatar(
+            radius: radius,
+            backgroundColor: bg,
+            foregroundColor: fg,
+            child: Text(
+              _initials,
+              style: TextStyle(
+                fontSize: radius * 0.75,
+                fontWeight: FontWeight.w700,
+                color: fg,
+              ),
+            ),
+          );
     return Container(
       decoration: selected
           ? BoxDecoration(
@@ -50,19 +90,7 @@ class MemberAvatar extends StatelessWidget {
               ],
             )
           : null,
-      child: CircleAvatar(
-        radius: radius,
-        backgroundColor: bg,
-        foregroundColor: fg,
-        child: Text(
-          _initials,
-          style: TextStyle(
-            fontSize: radius * 0.75,
-            fontWeight: FontWeight.w700,
-            color: fg,
-          ),
-        ),
-      ),
+      child: face,
     );
   }
 }

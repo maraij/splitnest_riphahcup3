@@ -36,7 +36,7 @@ function openDb(dbPath) {
       id TEXT PRIMARY KEY, title TEXT NOT NULL, category TEXT NOT NULL,
       expense_date TEXT NOT NULL, amount_paisa INTEGER NOT NULL CHECK (amount_paisa > 0),
       payer_id TEXT NOT NULL REFERENCES members(id), split_type TEXT NOT NULL,
-      created_at TEXT NOT NULL
+      fixed_expense_id TEXT, created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS expense_shares (
       expense_id TEXT NOT NULL REFERENCES expenses(id),
@@ -54,10 +54,17 @@ function openDb(dbPath) {
     CREATE TABLE IF NOT EXISTS household_budget (
       month_key TEXT PRIMARY KEY, limit_paisa INTEGER NOT NULL CHECK (limit_paisa >= 0)
     );
+    CREATE TABLE IF NOT EXISTS fixed_expenses (
+      id TEXT PRIMARY KEY, title TEXT NOT NULL, category TEXT NOT NULL,
+      amount_paisa INTEGER NOT NULL CHECK (amount_paisa > 0),
+      payer_id TEXT NOT NULL REFERENCES members(id),
+      split_members TEXT NOT NULL, created_at TEXT NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(expense_date);
     CREATE INDEX IF NOT EXISTS idx_shares_member ON expense_shares(member_id);
     CREATE INDEX IF NOT EXISTS idx_shopping_status ON shopping_items(status);
     CREATE INDEX IF NOT EXISTS idx_settlements ON settlements(sender_id, recipient_id);
+    CREATE INDEX IF NOT EXISTS idx_expenses_fixed ON expenses(fixed_expense_id, expense_date);
   `);
   // Migration for DBs created before passwords existed.
   const cols = db
@@ -66,6 +73,14 @@ function openDb(dbPath) {
     .map((c) => c.name);
   if (!cols.includes('password_hash')) {
     db.exec('ALTER TABLE members ADD COLUMN password_hash TEXT');
+  }
+  // Migration for DBs created before fixed expenses existed.
+  const expenseCols = db
+    .prepare('PRAGMA table_info(expenses)')
+    .all()
+    .map((c) => c.name);
+  if (!expenseCols.includes('fixed_expense_id')) {
+    db.exec('ALTER TABLE expenses ADD COLUMN fixed_expense_id TEXT');
   }
   seed(db);
   ensurePasswordHashes(db);
@@ -100,6 +115,14 @@ function seed(db) {
     'INSERT INTO shopping_items (id, title, unit, requested_qty, status) VALUES (?, ?, ?, ?, ?)');
   item.run('S01', 'Milk', 'bottle', 2, 'Pending');
   item.run('S02', 'Rice', 'pack', 1, 'Pending');
+  // Fixed monthly templates (NOT expenses: seeding them posts nothing,
+  // so balances and the benchmark are untouched until Apply runs).
+  const fixed = db.prepare(
+    'INSERT INTO fixed_expenses (id, title, category, amount_paisa, payer_id, split_members, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
+  const now = new Date().toISOString();
+  const all = JSON.stringify(['M01', 'M02', 'M03']);
+  fixed.run('F01', 'Internet', 'Utilities', 150000, 'M03', all, now);
+  fixed.run('F02', 'Electricity', 'Utilities', 102000, 'M01', all, now);
 }
 
 function nextId(db, table, prefix) {

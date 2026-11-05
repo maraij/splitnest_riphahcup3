@@ -7,7 +7,7 @@ import '../../core/widgets/entrance.dart';
 import '../../core/widgets/illustrations.dart';
 
 /// Splash page: SplitNest logo centred on white, wordmark underneath,
-/// then the app auto-advances (after ~1.8s) to the login page.
+/// then the app auto-advances (after ~2.5s) to the login page.
 /// Shown in every build, including web — it is a Flutter widget,
 /// not a native-only splash.
 ///
@@ -25,7 +25,6 @@ class SplashScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final reduceMotion = animationsDisabled(context);
     return Scaffold(
-      backgroundColor: Colors.white,
       body: SafeArea(
         child: Center(
           child: Column(
@@ -63,7 +62,7 @@ class SplashScreen extends StatelessWidget {
                   child: ClipRRect(
                     borderRadius: BorderRadius.circular(32),
                     child: Image.asset(
-                      'assets/splitnest-logo-v2.webp',
+                      'assets/splitnest-logo-v3.webp',
                       width: 160,
                       height: 160,
                       fit: BoxFit.cover,
@@ -80,7 +79,7 @@ class SplashScreen extends StatelessWidget {
                 'SplitNest',
                 style: SplitNestTheme.titleStyle.copyWith(
                   fontSize: 30,
-                  color: SplitNestTheme.ink,
+                  color: Theme.of(context).colorScheme.onSurface,
                 ),
               ),
               const SizedBox(height: 12),

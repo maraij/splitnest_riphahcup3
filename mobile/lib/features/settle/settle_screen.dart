@@ -15,7 +15,7 @@ import '../../core/widgets/money_text.dart';
 /// Settle Up & Balances tab: balances table (Paid / Share / Net with
 /// owed/owe label), a Smart Settle suggestion card computed from LIVE
 /// balances (greedy largest-debtor → largest-creditor), and the
-/// Settle Debt dialog. Settlements never change total spending.
+/// Settle Debt dialog.
 class SettleScreen extends StatelessWidget {
   const SettleScreen({super.key});
 
@@ -106,8 +106,6 @@ class SettleScreen extends StatelessWidget {
                     const Divider(height: 1),
                     ListTile(
                       title: const Text('Total spending'),
-                      subtitle: const Text(
-                          'Settlements never change this total.'),
                       trailing: MoneyText(b.totalSpending,
                           style: SplitNestTheme.bodyStyle
                               .copyWith(fontWeight: FontWeight.w700)),
@@ -127,20 +125,6 @@ class SettleScreen extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Row(
-                      children: [
-                        Icon(Icons.auto_awesome,
-                            color: Theme.of(context).colorScheme.primary),
-                        const SizedBox(width: 8),
-                        const Expanded(
-                          child: Text(
-                            'Fewest transfers from live balances',
-                            style: SplitNestTheme.supportingStyle,
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 12),
                     if (plan.isEmpty)
                       const Column(
                         children: [

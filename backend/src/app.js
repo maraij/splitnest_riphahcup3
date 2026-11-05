@@ -1,9 +1,12 @@
 'use strict';
 /**
  * SplitNest backend — Express app factory.
- * Eight endpoints: GET /api/members, GET /api/shopping,
+ * Thirteen endpoints: GET /api/members, GET /api/shopping,
  * POST /api/shopping, POST /api/shopping/checkout, POST /api/expenses,
- * GET /api/balances, POST /api/settle, POST /api/auth/login.
+ * GET /api/balances, POST /api/settle, POST /api/auth/login,
+ * GET /api/fixed-expenses, POST /api/fixed-expenses,
+ * PATCH /api/fixed-expenses/:id, DELETE /api/fixed-expenses/:id,
+ * POST /api/fixed-expenses/:id/apply.
  * All endpoints except /api/auth/login require a valid session:
  * Authorization: Bearer <token>. Unauthenticated calls get 401.
  *
@@ -57,12 +60,12 @@ function createApp(dbPath) {
   }
 
   /** Insert one expense + its shares. Caller must be inside a transaction. */
-  function insertExpense({ title, category, date, amountPaisa, payerId, splitType, shares }) {
+  function insertExpense({ title, category, date, amountPaisa, payerId, splitType, shares, fixedExpenseId = null }) {
     const id = nextId(db, 'expenses', 'E');
     const now = new Date().toISOString();
     db.prepare(
-      'INSERT INTO expenses (id, title, category, expense_date, amount_paisa, payer_id, split_type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(id, title, category, date, amountPaisa, payerId, splitType, now);
+      'INSERT INTO expenses (id, title, category, expense_date, amount_paisa, payer_id, split_type, fixed_expense_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(id, title, category, date, amountPaisa, payerId, splitType, fixedExpenseId, now);
     const ins = db.prepare(
       'INSERT INTO expense_shares (expense_id, member_id, share_paisa) VALUES (?, ?, ?)');
     for (const s of shares) ins.run(id, s.member_id, s.amount_paisa);
@@ -343,6 +346,162 @@ function createApp(dbPath) {
     res.status(201).json({
       id, sender_id, recipient_id, amount: formatPaisa(amountPaisa),
     });
+  });
+
+  // ---- Fixed monthly expenses (templates, not expenses) ----
+  // A template posts at most ONE expense per YYYY-MM, only when the
+  // app calls Apply (explicit button). Nothing here runs on server
+  // start and nothing auto-applies, so the benchmark — which never
+  // calls Apply — is untouched. The seeded Internet template is an
+  // EQUAL split (500 each); the benchmark's Internet expense is a
+  // separate CUSTOM split (500/300/700) posted manually, so the two
+  // never interfere.
+  function publicFixedExpense(r) {
+    return {
+      id: r.id, title: r.title, category: r.category,
+      amount: formatPaisa(r.amount_paisa), payer_id: r.payer_id,
+      split_members: JSON.parse(r.split_members),
+      created_at: r.created_at,
+    };
+  }
+
+  function validateSplitMembers(members) {
+    const list = Array.isArray(members) && members.length > 0
+      ? members
+      : ['M01', 'M02', 'M03'];
+    if (new Set(list).size !== list.length || list.some((m) => !memberExists(m))) {
+      return null;
+    }
+    return [...list].sort();
+  }
+
+  // ---- GET /api/fixed-expenses ----
+  app.get('/api/fixed-expenses', requireAuth, (req, res) => {
+    const rows = db.prepare('SELECT * FROM fixed_expenses ORDER BY id').all();
+    res.json({ fixed_expenses: rows.map(publicFixedExpense) });
+  });
+
+  // ---- POST /api/fixed-expenses ----
+  app.post('/api/fixed-expenses', requireAuth, (req, res) => {
+    const { title, category, amount, payer_id, split_members } = req.body || {};
+    if (typeof title !== 'string' || title.trim() === '') {
+      return error(res, 400, 'INVALID_FIXED', 'Title is required.');
+    }
+    const amountPaisa = parsePaisa(amount);
+    if (amountPaisa === null || amountPaisa <= 0) {
+      return error(res, 400, 'INVALID_AMOUNT', 'Amount must be a positive amount.');
+    }
+    if (!memberExists(payer_id)) {
+      return error(res, 404, 'UNKNOWN_PAYER', `Payer ${payer_id} does not exist.`);
+    }
+    const members = validateSplitMembers(split_members);
+    if (!members) {
+      return error(res, 400, 'INVALID_SPLIT', 'Split members must be known members, listed once.');
+    }
+    const id = nextId(db, 'fixed_expenses', 'F');
+    db.prepare(
+      'INSERT INTO fixed_expenses (id, title, category, amount_paisa, payer_id, split_members, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(id, title.trim(), (category || 'General').trim(), amountPaisa, payer_id,
+        JSON.stringify(members), new Date().toISOString());
+    const row = db.prepare('SELECT * FROM fixed_expenses WHERE id = ?').get(id);
+    res.status(201).json(publicFixedExpense(row));
+  });
+
+  // ---- PATCH /api/fixed-expenses/:id ----
+  app.patch('/api/fixed-expenses/:id', requireAuth, (req, res) => {
+    const row = db.prepare('SELECT * FROM fixed_expenses WHERE id = ?').get(req.params.id);
+    if (!row) {
+      return error(res, 404, 'UNKNOWN_FIXED', `Fixed expense ${req.params.id} does not exist.`);
+    }
+    const { title, category, amount, payer_id, split_members } = req.body || {};
+    const next = {
+      title: row.title, category: row.category,
+      amount_paisa: row.amount_paisa, payer_id: row.payer_id,
+      split_members: row.split_members,
+    };
+    if (title !== undefined) {
+      if (typeof title !== 'string' || title.trim() === '') {
+        return error(res, 400, 'INVALID_FIXED', 'Title is required.');
+      }
+      next.title = title.trim();
+    }
+    if (category !== undefined) {
+      if (typeof category !== 'string' || category.trim() === '') {
+        return error(res, 400, 'INVALID_FIXED', 'Category is required.');
+      }
+      next.category = category.trim();
+    }
+    if (amount !== undefined) {
+      const amountPaisa = parsePaisa(amount);
+      if (amountPaisa === null || amountPaisa <= 0) {
+        return error(res, 400, 'INVALID_AMOUNT', 'Amount must be a positive amount.');
+      }
+      next.amount_paisa = amountPaisa;
+    }
+    if (payer_id !== undefined) {
+      if (!memberExists(payer_id)) {
+        return error(res, 404, 'UNKNOWN_PAYER', `Payer ${payer_id} does not exist.`);
+      }
+      next.payer_id = payer_id;
+    }
+    if (split_members !== undefined) {
+      const members = validateSplitMembers(split_members);
+      if (!members) {
+        return error(res, 400, 'INVALID_SPLIT', 'Split members must be known members, listed once.');
+      }
+      next.split_members = JSON.stringify(members);
+    }
+    db.prepare(
+      'UPDATE fixed_expenses SET title = ?, category = ?, amount_paisa = ?, payer_id = ?, split_members = ? WHERE id = ?')
+      .run(next.title, next.category, next.amount_paisa, next.payer_id, next.split_members, row.id);
+    res.json(publicFixedExpense(
+      db.prepare('SELECT * FROM fixed_expenses WHERE id = ?').get(row.id)));
+  });
+
+  // ---- DELETE /api/fixed-expenses/:id ----
+  app.delete('/api/fixed-expenses/:id', requireAuth, (req, res) => {
+    const row = db.prepare('SELECT * FROM fixed_expenses WHERE id = ?').get(req.params.id);
+    if (!row) {
+      return error(res, 404, 'UNKNOWN_FIXED', `Fixed expense ${req.params.id} does not exist.`);
+    }
+    db.prepare('DELETE FROM fixed_expenses WHERE id = ?').run(row.id);
+    res.json({ deleted: true, id: row.id });
+  });
+
+  // ---- POST /api/fixed-expenses/:id/apply ----
+  // Posts this month's expense for the template — at most once per
+  // YYYY-MM. A second apply in the same month returns applied: false
+  // and posts nothing.
+  app.post('/api/fixed-expenses/:id/apply', requireAuth, (req, res) => {
+    const row = db.prepare('SELECT * FROM fixed_expenses WHERE id = ?').get(req.params.id);
+    if (!row) {
+      return error(res, 404, 'UNKNOWN_FIXED', `Fixed expense ${req.params.id} does not exist.`);
+    }
+    const month = new Date().toISOString().slice(0, 7);
+    const existing = db.prepare(
+      "SELECT * FROM expenses WHERE fixed_expense_id = ? AND substr(expense_date, 1, 7) = ?")
+      .get(row.id, month);
+    if (existing) {
+      return res.json({ applied: false, reason: 'ALREADY_APPLIED', expense: publicExpense(existing) });
+    }
+    const members = JSON.parse(row.split_members);
+    const shares = equalSplit(row.amount_paisa, members);
+    const date = new Date().toISOString().slice(0, 10);
+    try {
+      db.exec('BEGIN IMMEDIATE TRANSACTION');
+      const id = insertExpense({
+        title: row.title, category: row.category, date,
+        amountPaisa: row.amount_paisa, payerId: row.payer_id,
+        splitType: 'equal', shares, fixedExpenseId: row.id,
+      });
+      db.exec('COMMIT');
+      const expense = db.prepare('SELECT * FROM expenses WHERE id = ?').get(id);
+      res.status(201).json({ applied: true, expense: publicExpense(expense) });
+    } catch (e) {
+      try { db.exec('ROLLBACK'); } catch (_) { /* already rolled back */ }
+      console.error(e);
+      return error(res, 500, 'APPLY_FAILED', 'Fixed expense could not be applied.');
+    }
   });
 
   app.use((req, res) => error(res, 404, 'NOT_FOUND', `No route ${req.method} ${req.path}.`));

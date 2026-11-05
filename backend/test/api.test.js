@@ -282,4 +282,62 @@ test('all three demo passwords log in', async () => {
       assert.equal(r.json.member.id, id);
     }
   } finally { await stop(); }
+test('fixed monthly expenses: seeded list, create, edit, apply idempotently, delete', async () => {
+  const { base, stop } = await start();
+  try {
+    await loginAs(base);
+    // Unauthenticated calls are rejected.
+    assert.equal((await req(base, 'GET', '/api/fixed-expenses', undefined, { noAuth: true })).status, 401);
+    // Seeded templates: Internet 1500 (Bilal) + Electricity 1020 (Ali).
+    const list = await req(base, 'GET', '/api/fixed-expenses');
+    assert.equal(list.status, 200);
+    assert.equal(list.json.fixed_expenses.length, 2);
+    assert.deepEqual(list.json.fixed_expenses.map((f) => f.title), ['Internet', 'Electricity']);
+    const internet = list.json.fixed_expenses[0];
+    assert.equal(internet.amount, '1500.00');
+    assert.equal(internet.payer_id, 'M03');
+    assert.deepEqual(internet.split_members, ['M01', 'M02', 'M03']);
+    assert.equal(list.json.fixed_expenses[1].amount, '1020.00');
+    assert.equal(list.json.fixed_expenses[1].payer_id, 'M01');
+    // Seeding alone posts nothing: balances are still zero.
+    assert.equal((await req(base, 'GET', '/api/balances')).json.total_spending, '0.00');
+    // Create a new fixed expense.
+    const created = await req(base, 'POST', '/api/fixed-expenses', {
+      title: 'Water', category: 'Utilities', amount: '600.00', payer_id: 'M02',
+    });
+    assert.equal(created.status, 201);
+    assert.equal(created.json.amount, '600.00');
+    assert.equal(created.json.payer_id, 'M02');
+    assert.deepEqual(created.json.split_members, ['M01', 'M02', 'M03']);
+    const fid = created.json.id;
+    // Invalid create is rejected.
+    assert.equal((await req(base, 'POST', '/api/fixed-expenses', { title: 'Bad', category: 'Utilities', amount: '0.00', payer_id: 'M02' })).status, 400);
+    // Edit its amount.
+    const edited = await req(base, 'PATCH', `/api/fixed-expenses/${fid}`, { amount: '750.00' });
+    assert.equal(edited.status, 200);
+    assert.equal(edited.json.amount, '750.00');
+    // Apply once: posts an equal-split expense (250.00 each).
+    const applied = await req(base, 'POST', `/api/fixed-expenses/${fid}/apply`);
+    assert.equal(applied.status, 201);
+    assert.equal(applied.json.applied, true);
+    assert.equal(applied.json.expense.amount, '750.00');
+    assert.deepEqual(applied.json.expense.shares.map((s) => s.amount), ['250.00', '250.00', '250.00']);
+    assert.equal((await req(base, 'GET', '/api/balances')).json.total_spending, '750.00');
+    // Apply again in the same month: no duplicate expense.
+    const again = await req(base, 'POST', `/api/fixed-expenses/${fid}/apply`);
+    assert.equal(again.status, 200);
+    assert.equal(again.json.applied, false);
+    assert.equal(again.json.reason, 'ALREADY_APPLIED');
+    assert.equal((await req(base, 'GET', '/api/balances')).json.total_spending, '750.00');
+    // Delete it; the two seeds remain.
+    const deleted = await req(base, 'DELETE', `/api/fixed-expenses/${fid}`);
+    assert.equal(deleted.status, 200);
+    assert.equal((await req(base, 'GET', '/api/fixed-expenses')).json.fixed_expenses.length, 2);
+    // Unknown id -> 404.
+    assert.equal((await req(base, 'POST', '/api/fixed-expenses/F99/apply')).status, 404);
+    assert.equal((await req(base, 'PATCH', '/api/fixed-expenses/F99', { amount: '1.00' })).status, 404);
+    assert.equal((await req(base, 'DELETE', '/api/fixed-expenses/F99')).status, 404);
+  } finally { await stop(); }
+});
+
 });

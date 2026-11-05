@@ -10,6 +10,7 @@ import '../../core/widgets/error_banner.dart';
 import '../../core/widgets/member_avatar.dart';
 import '../../core/widgets/money_text.dart';
 import '../../core/widgets/status_pill.dart';
+import 'celebration_dialog.dart';
 import 'insights_cards.dart';
 import 'welcome_dialog.dart';
 
@@ -17,10 +18,41 @@ import 'welcome_dialog.dart';
 /// member's balance card, an Active Members card and a Pending
 /// Shopping card (tap to open the Shopping tab).
 class HomeScreen extends StatelessWidget {
-  const HomeScreen({super.key, this.onGoToShopping});
+  const HomeScreen({super.key, this.onGoToShopping, this.onGoToMonthly});
 
   /// Called when the Pending Shopping card is tapped.
   final VoidCallback? onGoToShopping;
+
+  /// Called when the celebration's "View monthly summary" is tapped.
+  final VoidCallback? onGoToMonthly;
+
+  /// Shows the savings celebration once per login, if it applies.
+  /// Called only AFTER the welcome popup has been dismissed (never
+  /// stacked with it) — or directly when the welcome popup is not
+  /// pending. Guards in AppState stop it showing twice.
+  void _maybeShowCelebration(BuildContext context, AppState state) {
+    if (!state.shouldShowCelebration) {
+      state.clearCelebrationPending();
+      return;
+    }
+    final member = state.loggedInMember;
+    final saved = state.celebrationSavedAmount;
+    if (member == null || saved == null) {
+      state.clearCelebrationPending();
+      return;
+    }
+    state.markCelebrationShown();
+    showCelebrationDialog(
+      context,
+      member: member,
+      savedAmount: saved,
+      // MoM comparison: null when there is no last-month history
+      // or no improvement — then the dialog shows the normal
+      // celebration with no comparison line and no poppers.
+      monthOverMonthSaved: state.monthOverMonthSaved,
+      onViewMonthly: () => onGoToMonthly?.call(),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -30,9 +62,11 @@ class HomeScreen extends StatelessWidget {
     // The store's scheduling guard stops a rebuild from queueing it
     // twice; the store's shown-flag stops it on tab switches, rebuilds
     // and pull-to-refresh. A new login re-arms it.
+    // Celebration: shown AFTER the welcome popup is dismissed (never
+    // stacked), only when the member saved money this month.
     if (state.shouldShowWelcome) {
       state.markWelcomeScheduled();
-      WidgetsBinding.instance.addPostFrameCallback((_) {
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
         if (!context.mounted) {
           state.clearWelcomePending();
           return;
@@ -44,7 +78,18 @@ class HomeScreen extends StatelessWidget {
           return;
         }
         state.markWelcomeShown();
-        showWelcomeDialog(context, member: member, balance: balance);
+        await showWelcomeDialog(context, member: member, balance: balance);
+        if (!context.mounted) return;
+        _maybeShowCelebration(context, state);
+      });
+    } else if (state.shouldShowCelebration) {
+      state.markCelebrationScheduled();
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!context.mounted) {
+          state.clearCelebrationPending();
+          return;
+        }
+        _maybeShowCelebration(context, state);
       });
     }
     final b = state.balances;
@@ -80,7 +125,7 @@ class HomeScreen extends StatelessWidget {
                       child: ClipRRect(
                         borderRadius: BorderRadius.circular(8),
                         child: Image.asset(
-                          'assets/splitnest-logo-v2.webp',
+                          'assets/splitnest-logo-v3.webp',
                           width: 44,
                           height: 44,
                           fit: BoxFit.cover,
@@ -140,12 +185,6 @@ class HomeScreen extends StatelessWidget {
                       style: SplitNestTheme.sectionStyle,
                       textAlign: TextAlign.center,
                     ),
-                    SizedBox(height: 4),
-                    Text(
-                      'Check the backend is running, then pull to refresh.',
-                      style: SplitNestTheme.supportingStyle,
-                      textAlign: TextAlign.center,
-                    ),
                   ],
                 ),
               ),
@@ -194,6 +233,8 @@ class HomeScreen extends StatelessWidget {
             const SizedBox(height: 16),
             // Budget alert: Near Limit at >=80%, Budget exceeded at
             // >=100% — from LIVE balances, never hardcoded.
+            // (House-level alert only. Category-cap warnings live
+            // ONLY in Monthly view > Budgets — no-overlap rule.)
             BudgetAlertBanner(balances: b),
             const SizedBox(height: 16),
             // Monthly Budget ring, centred.
@@ -395,7 +436,7 @@ class HomeScreen extends StatelessWidget {
                             Padding(
                               padding: const EdgeInsets.only(top: 4),
                               child: Text(
-                                '+${pendingItems.length - 2} more — tap to open Shopping',
+                                '+${pendingItems.length - 2} more',
                                 style: SplitNestTheme.supportingStyle,
                               ),
                             ),

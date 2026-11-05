@@ -82,6 +82,70 @@ class Balances {
       );
 }
 
+/// One entry in the in-memory activity log (Timeline screen).
+/// Appended on every successful checkout, expense post and
+/// settlement. Session-only: it resets when the app reloads.
+class ActivityEntry {
+  ActivityEntry({
+    required this.type,
+    required this.title,
+    required this.amount,
+    required this.memberId,
+    required this.detail,
+    required this.timestamp,
+  });
+
+  /// 'checkout' | 'expense' | 'settle'.
+  final String type;
+  final String title;
+
+  /// Amount, two-decimal string ('1500.00').
+  final String amount;
+
+  /// Member who did it (payer for expenses, sender for settlements).
+  final String memberId;
+
+  /// Short extra info, e.g. 'Ayesha → Ali'.
+  final String detail;
+  final DateTime timestamp;
+}
+
+/// A fixed monthly expense TEMPLATE (not an expense itself).
+/// Seeded: Internet 1500.00 (Bilal) + Electricity 1020.00 (Ali),
+/// split equally among all three members. Templates post nothing
+/// on their own; Apply posts one equal-split expense per month.
+class FixedExpense {
+  FixedExpense({
+    required this.id,
+    required this.title,
+    required this.category,
+    required this.amount,
+    required this.payerId,
+    required this.splitMemberIds,
+  });
+  final String id;
+  final String title;
+  final String category;
+
+  /// Monthly amount, two-decimal string ('1500.00').
+  final String amount;
+  final String payerId;
+
+  /// Members sharing it equally.
+  final List<String> splitMemberIds;
+
+  factory FixedExpense.fromJson(Map<String, dynamic> j) => FixedExpense(
+        id: j['id'] as String,
+        title: j['title'] as String,
+        category: j['category'] as String,
+        amount: j['amount'] as String,
+        payerId: j['payer_id'] as String,
+        splitMemberIds: (j['split_members'] as List)
+            .map((e) => e as String)
+            .toList(),
+      );
+}
+
 class ExpenseShare {
   ExpenseShare({required this.memberId, required this.amount});
   final String memberId;

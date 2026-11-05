@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 /// True when the platform asked for reduced motion (e.g. the OS
@@ -32,6 +34,12 @@ class _EntranceState extends State<Entrance>
   late final Animation<double> _opacity;
   late final Animation<Offset> _slide;
 
+  /// The stagger timer. It MUST be cancelled in dispose: a
+  /// below-the-fold Entrance can be disposed before its delay fires
+  /// (e.g. a test ending, or a list rebuild), and an uncancelled
+  /// Future.delayed leaves a pending timer behind.
+  Timer? _delayTimer;
+
   @override
   void initState() {
     super.initState();
@@ -49,7 +57,7 @@ class _EntranceState extends State<Entrance>
     if (widget.delay == Duration.zero) {
       _controller.forward();
     } else {
-      Future.delayed(widget.delay, () {
+      _delayTimer = Timer(widget.delay, () {
         if (mounted) _controller.forward();
       });
     }
@@ -57,6 +65,7 @@ class _EntranceState extends State<Entrance>
 
   @override
   void dispose() {
+    _delayTimer?.cancel();
     _controller.dispose();
     super.dispose();
   }

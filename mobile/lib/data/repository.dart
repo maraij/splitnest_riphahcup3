@@ -79,4 +79,46 @@ class SplitNestRepository {
         recipientId: recipientId,
         amount: amount,
       );
+
+  Future<List<FixedExpense>> getFixedExpenses() =>
+      _api.getFixedExpenses();
+
+  Future<FixedExpense> createFixedExpense({
+    required String title,
+    required String category,
+    required String amount,
+    required String payerId,
+    List<String>? splitMemberIds,
+  }) =>
+      _api.createFixedExpense(
+        title: title,
+        category: category,
+        amount: amount,
+        payerId: payerId,
+        splitMemberIds: splitMemberIds,
+      );
+
+  Future<FixedExpense> updateFixedExpense({
+    required String id,
+    String? title,
+    String? category,
+    String? amount,
+    String? payerId,
+    List<String>? splitMemberIds,
+  }) =>
+      _api.updateFixedExpense(
+        id: id,
+        title: title,
+        category: category,
+        amount: amount,
+        payerId: payerId,
+        splitMemberIds: splitMemberIds,
+      );
+
+  Future<void> deleteFixedExpense(String id) =>
+      _api.deleteFixedExpense(id);
+
+  Future<({bool applied, ExpenseRecord? expense})> applyFixedExpense(
+          String id) =>
+      _api.applyFixedExpense(id);
 }

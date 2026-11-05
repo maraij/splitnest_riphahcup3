@@ -122,11 +122,6 @@ class _ExpensesScreenState extends State<ExpensesScreen> {
           if (favourites.isNotEmpty) ...[
             const Text('Quick add', style: SplitNestTheme.sectionStyle),
             const SizedBox(height: 8),
-            const Text(
-              'Tap to re-add a frequent expense with its last amount and split.',
-              style: SplitNestTheme.supportingStyle,
-            ),
-            const SizedBox(height: 8),
             Wrap(
               spacing: 8,
               runSpacing: 8,
@@ -143,6 +138,15 @@ class _ExpensesScreenState extends State<ExpensesScreen> {
             ),
             const SizedBox(height: 16),
           ],
+          // Fixed monthly expenses (templates, persisted in the
+          // backend). The seeded Internet + Electricity templates are
+          // equal splits; the benchmark's custom-split Internet
+          // expense is separate and untouched by this section.
+          const Text('Fixed monthly expenses',
+              style: SplitNestTheme.sectionStyle),
+          const SizedBox(height: 8),
+          _FixedMonthlySection(state: state),
+          const SizedBox(height: 16),
           if (history.isNotEmpty) ...[
             TextField(
               controller: _query,
@@ -216,12 +220,6 @@ class _ExpensesScreenState extends State<ExpensesScreen> {
                       Text('No expenses added yet in this session',
                           style: SplitNestTheme.sectionStyle,
                           textAlign: TextAlign.center),
-                      SizedBox(height: 4),
-                      Text(
-                        'Expenses you add here appear below; balances and budget always come live from the backend.',
-                        style: SplitNestTheme.supportingStyle,
-                        textAlign: TextAlign.center,
-                      ),
                     ],
                   ),
                 ),
@@ -238,12 +236,6 @@ class _ExpensesScreenState extends State<ExpensesScreen> {
                     Text('No expenses match your filters',
                         style: SplitNestTheme.sectionStyle,
                         textAlign: TextAlign.center),
-                    SizedBox(height: 4),
-                    Text(
-                      'Try a different search term or clear the category and member filters.',
-                      style: SplitNestTheme.supportingStyle,
-                      textAlign: TextAlign.center,
-                    ),
                   ],
                 ),
               ),
@@ -275,7 +267,242 @@ class _ExpensesScreenState extends State<ExpensesScreen> {
                 ),
               )),
           const SizedBox(height: 16),
+          // Per-member view: every member's paid total, share total
+          // and expense list, from the shared recorded history.
+          // No member's expenses are hidden from the others.
+          const Text('Expenses by member',
+              style: SplitNestTheme.sectionStyle),
+          const SizedBox(height: 8),
+          ...memberExpenseSummaries(history, state.members)
+              .map((summary) => _MemberExpensesCard(summary: summary)),
+          const SizedBox(height: 16),
         ],
+      ),
+    );
+  }
+}
+
+/// One member's slice of the shared ledger: paid total, share total
+/// and the expenses they paid. Empty members show an honest empty
+/// line, never invented rows.
+class _MemberExpensesCard extends StatelessWidget {
+  const _MemberExpensesCard({required this.summary});
+  final MemberExpenseSummary summary;
+
+  @override
+  Widget build(BuildContext context) {
+    final m = summary.member;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                MemberAvatar(memberId: m.id, name: m.name),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    m.name,
+                    style: SplitNestTheme.sectionStyle,
+                  ),
+                ),
+                Text(
+                  'Paid PKR ${summary.totalPaid.toStringAsFixed(2)} · Share PKR ${summary.totalShare.toStringAsFixed(2)}',
+                  style: SplitNestTheme.bodyStyle
+                      .copyWith(fontWeight: FontWeight.w700),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            if (summary.expenses.isEmpty)
+              const Text(
+                'No expenses recorded yet in this session',
+                style: SplitNestTheme.supportingStyle,
+              )
+            else
+              ...summary.expenses.map((e) => Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            '${e.title} · ${e.date ?? ''}',
+                            style: SplitNestTheme.bodyStyle,
+                          ),
+                        ),
+                        MoneyText(e.amount,
+                            style: SplitNestTheme.bodyStyle
+                                .copyWith(fontWeight: FontWeight.w700)),
+                      ],
+                    ),
+                  )),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Fixed monthly expenses: the persisted templates, their monthly
+/// total and the logged-in member's share, plus Apply (posts each
+/// template at most once per month), edit-amount and delete.
+class _FixedMonthlySection extends StatelessWidget {
+  const _FixedMonthlySection({required this.state});
+  final AppState state;
+
+  /// This member's equal share of one template (exact, remainder
+  /// paisa in member-ID order — same rule as the backend).
+  String _myShare(FixedExpense f) {
+    final paisa = parsePaisa(f.amount) ?? 0;
+    final shares = equalSplit(paisa, f.splitMemberIds);
+    final mine = shares
+        .where((s) => s.memberId == state.activeMemberId)
+        .firstOrNull;
+    return formatPaisa(mine?.amountPaisa ?? 0);
+  }
+
+  double _monthlyTotal() => state.fixedExpenses.fold(
+      0.0, (sum, f) => sum + (double.tryParse(f.amount) ?? 0));
+
+  double _myMonthlyShare() => state.fixedExpenses.fold(0.0, (sum, f) {
+        final paisa = parsePaisa(f.amount) ?? 0;
+        final shares = equalSplit(paisa, f.splitMemberIds);
+        final mine = shares
+            .where((s) => s.memberId == state.activeMemberId)
+            .firstOrNull;
+        return sum + (mine?.amountPaisa ?? 0) / 100;
+      });
+
+  Future<void> _apply(BuildContext context) async {
+    final n = await state.applyFixedForMonth();
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(n > 0
+          ? 'Applied $n fixed expense(s) for this month.'
+          : 'Already applied for this month.'),
+    ));
+  }
+
+  Future<void> _editAmount(BuildContext context, FixedExpense f) async {
+    final paisa = await showDialog<int>(
+      context: context,
+      builder: (ctx) =>
+          _FixedAmountDialog(title: f.title, currentAmount: f.amount),
+    );
+    if (paisa != null) {
+      await state.updateFixedExpense(id: f.id, amount: formatPaisa(paisa));
+    }
+  }
+
+  Future<void> _delete(BuildContext context, FixedExpense f) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Delete ${f.title}?'),
+        content: const Text(
+            'This stops it repeating monthly. Past expenses stay.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) await state.deleteFixedExpense(f.id);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final fixed = state.fixedExpenses;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    'Monthly total PKR ${_monthlyTotal().toStringAsFixed(2)} · Your share PKR ${_myMonthlyShare().toStringAsFixed(2)}',
+                    style: SplitNestTheme.bodyStyle
+                        .copyWith(fontWeight: FontWeight.w700),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            if (fixed.isEmpty)
+              const Text(
+                'No fixed monthly expenses',
+                style: SplitNestTheme.supportingStyle,
+              )
+            else
+              ...fixed.map((f) => Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Row(
+                      children: [
+                        Icon(
+                          categoryIcons[f.category] ??
+                              Icons.receipt_long,
+                          size: 20,
+                          color:
+                              Theme.of(context).colorScheme.primary,
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                '${f.title} — PKR ${f.amount} / month',
+                                style: SplitNestTheme.bodyStyle.copyWith(
+                                    fontWeight: FontWeight.w600),
+                              ),
+                              Text(
+                                '${f.category} · Paid by ${memberName(state.members, f.payerId)} · Your share PKR ${_myShare(f)}',
+                                style: SplitNestTheme.supportingStyle,
+                              ),
+                            ],
+                          ),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.edit_outlined),
+                          tooltip: 'Edit amount',
+                          onPressed: state.isBusy
+                              ? null
+                              : () => _editAmount(context, f),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.delete_outline),
+                          tooltip: 'Delete fixed expense',
+                          onPressed: state.isBusy
+                              ? null
+                              : () => _delete(context, f),
+                        ),
+                      ],
+                    ),
+                  )),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: state.isBusy || fixed.isEmpty
+                    ? null
+                    : () => _apply(context),
+                icon: const Icon(Icons.event_repeat),
+                label: const Text('Apply fixed for this month'),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -286,7 +513,13 @@ Future<void> _openAddExpense(BuildContext context, AppState state) async {
     context: context,
     isScrollControlled: true,
     useSafeArea: true,
-    builder: (ctx) => _AddExpenseSheet(state: state),
+    // Bound the sheet to 90% of the screen: an unbounded sheet
+    // grows taller than a short screen and its scroll view can
+    // then never scroll the submit button into view.
+    builder: (ctx) => SizedBox(
+      height: MediaQuery.of(ctx).size.height * 0.9,
+      child: _AddExpenseSheet(state: state),
+    ),
   );
   if (ok == true && context.mounted) {
     ScaffoldMessenger.of(context)
@@ -313,15 +546,18 @@ class _AddExpenseSheet extends StatefulWidget {
 class _AddExpenseSheetState extends State<_AddExpenseSheet> {
   final _title = TextEditingController();
   final _amount = TextEditingController();
+  final _receipt = TextEditingController();
   String _category = 'Groceries';
   String _payerId = 'M01';
   String _splitType = 'equal';
+  bool _repeatMonthly = false;
   DateTime _date = DateTime.now();
   final Map<String, TextEditingController> _exact = {};
   final Set<String> _splitMembers = {};
   String? _titleError;
   String? _amountError;
   String? _formError;
+  String? _receiptError;
 
   AppState get state => widget.state;
 
@@ -338,10 +574,30 @@ class _AddExpenseSheetState extends State<_AddExpenseSheet> {
   void dispose() {
     _title.dispose();
     _amount.dispose();
+    _receipt.dispose();
     for (final c in _exact.values) {
       c.dispose();
     }
     super.dispose();
+  }
+
+  /// Paste-receipt parser (REGEX only, see parseReceipt): fills title,
+  /// amount and date from the pasted text. On failure the form stays
+  /// EMPTY and a clear message is shown — never invents data.
+  void _parseReceipt() {
+    final parsed = parseReceipt(_receipt.text);
+    setState(() {
+      if (parsed == null) {
+        _receiptError = 'Could not read a price/item from this receipt';
+      } else {
+        _receiptError = null;
+        _title.text = parsed.title;
+        _amount.text = parsed.amount.toStringAsFixed(2);
+        if (parsed.date != null) _date = parsed.date!;
+        _titleError = null;
+        _amountError = null;
+      }
+    });
   }
 
   TextEditingController _exactCtrl(String id) =>
@@ -407,6 +663,7 @@ class _AddExpenseSheetState extends State<_AddExpenseSheet> {
           splitType: _splitType,
           splits: splits,
           splitMembers: splitMembers,
+          repeatMonthly: _repeatMonthly,
         );
     if (ok && mounted) Navigator.of(context).pop(true);
   }
@@ -439,6 +696,34 @@ class _AddExpenseSheetState extends State<_AddExpenseSheet> {
             ),
             const SizedBox(height: 12),
             const Text('Add New Expense', style: SplitNestTheme.titleStyle),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _receipt,
+              maxLines: 4,
+              minLines: 2,
+              textCapitalization: TextCapitalization.sentences,
+              decoration: InputDecoration(
+                labelText: 'Paste receipt',
+                hintText: 'Paste a receipt (WhatsApp / SMS)…',
+                errorText: _receiptError,
+                prefixIcon: const Icon(Icons.paste_outlined),
+              ),
+              onChanged: (_) {
+                // Rebuild so the Parse button enables/disables with
+                // the text, and clear a previous parse error.
+                setState(() => _receiptError = null);
+              },
+            ),
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerRight,
+              child: OutlinedButton.icon(
+                onPressed:
+                    _receipt.text.trim().isEmpty ? null : _parseReceipt,
+                icon: const Icon(Icons.text_snippet_outlined),
+                label: const Text('Parse receipt'),
+              ),
+            ),
             const SizedBox(height: 12),
             TextField(
               controller: _title,
@@ -549,6 +834,11 @@ class _AddExpenseSheetState extends State<_AddExpenseSheet> {
                 exactSum: _exactSum(),
                 onChanged: () => setState(() {}),
               ),
+            SwitchListTile(
+              title: const Text('Repeat monthly'),
+              value: _repeatMonthly,
+              onChanged: (v) => setState(() => _repeatMonthly = v),
+            ),
             if (_formError != null)
               Padding(
                 padding: const EdgeInsets.only(top: 8),
@@ -592,10 +882,7 @@ class _EqualPreview extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (amountPaisa == null || amountPaisa! <= 0 || members.isEmpty) {
-      return const Text(
-        'Enter an amount to see each person’s share.',
-        style: SplitNestTheme.supportingStyle,
-      );
+      return const SizedBox.shrink();
     }
     final shares =
         equalSplit(amountPaisa!, members.map((m) => m.id).toList());
@@ -645,7 +932,7 @@ class _CustomAmounts extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text('Custom shares (must sum exactly to the amount):'),
+        const Text('Custom shares:'),
         const SizedBox(height: 8),
         ...members.map((m) => Padding(
               padding: const EdgeInsets.only(bottom: 8),
@@ -726,7 +1013,7 @@ class _EqualSplit extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         const Text(
-            'Pick who shares this expense — split evenly among the chosen:'),
+            'Split with:'),
         const SizedBox(height: 8),
         Wrap(
           spacing: 8,
@@ -743,10 +1030,7 @@ class _EqualSplit extends StatelessWidget {
         ),
         const SizedBox(height: 12),
         if (amountPaisa == null || amountPaisa! <= 0 || chosen.isEmpty)
-          const Text(
-            'Enter an amount and pick at least one member to see the split.',
-            style: SplitNestTheme.supportingStyle,
-          )
+          const SizedBox.shrink()
         else
           _EqualPreview(
             amountPaisa: amountPaisa,
@@ -781,6 +1065,62 @@ class _PreviewBox extends StatelessWidget {
           ...lines.map((l) => Text(l, style: SplitNestTheme.supportingStyle)),
         ],
       ),
+    );
+  }
+}
+
+/// Fixed-amount edit dialog. Owns its TextEditingController and
+/// disposes it in its own dispose() — disposing a controller right
+/// after showDialog returns crashes, because the dialog is still
+/// animating out and its TextField is rebuilt with the disposed
+/// controller. Returns the new amount in paisa, or null on Cancel.
+class _FixedAmountDialog extends StatefulWidget {
+  const _FixedAmountDialog(
+      {required this.title, required this.currentAmount});
+  final String title;
+  final String currentAmount;
+
+  @override
+  State<_FixedAmountDialog> createState() => _FixedAmountDialogState();
+}
+
+class _FixedAmountDialogState extends State<_FixedAmountDialog> {
+  late final TextEditingController _controller =
+      TextEditingController(text: widget.currentAmount);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text('Edit ${widget.title}'),
+      content: TextField(
+        controller: _controller,
+        keyboardType: const TextInputType.numberWithOptions(decimal: true),
+        decoration: const InputDecoration(labelText: 'Amount (PKR)'),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () {
+            final paisa = parsePaisa(_controller.text.trim());
+            if (paisa == null || paisa <= 0) {
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                  content: Text('Enter a positive amount.')));
+              return;
+            }
+            Navigator.of(context).pop(paisa);
+          },
+          child: const Text('Save'),
+        ),
+      ],
     );
   }
 }

@@ -57,6 +57,14 @@ class ApiClient {
         res = await _client
             .get(uri, headers: _headers)
             .timeout(const Duration(seconds: 10));
+      } else if (method == 'PATCH') {
+        res = await _client
+            .patch(uri, headers: _headers, body: jsonEncode(body ?? {}))
+            .timeout(const Duration(seconds: 10));
+      } else if (method == 'DELETE') {
+        res = await _client
+            .delete(uri, headers: _headers)
+            .timeout(const Duration(seconds: 10));
       } else {
         res = await _client
             .post(uri, headers: _headers, body: jsonEncode(body ?? {}))
@@ -182,4 +190,69 @@ class ApiClient {
       'amount': amount,
     });
   }
+  // ---- Fixed monthly expenses (templates) ----
+  Future<List<FixedExpense>> getFixedExpenses() async {
+    final data = await _call('GET', '/api/fixed-expenses', null);
+    final list = (data as Map<String, dynamic>)['fixed_expenses'] as List;
+    return list
+        .map((e) => FixedExpense.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  Future<FixedExpense> createFixedExpense({
+    required String title,
+    required String category,
+    required String amount,
+    required String payerId,
+    List<String>? splitMemberIds,
+  }) async {
+    final data = await _call('POST', '/api/fixed-expenses', {
+      'title': title,
+      'category': category,
+      'amount': amount,
+      'payer_id': payerId,
+      ...?splitMemberIds == null ? null : {'split_members': splitMemberIds},
+    });
+    return FixedExpense.fromJson(data as Map<String, dynamic>);
+  }
+
+  Future<FixedExpense> updateFixedExpense({
+    required String id,
+    String? title,
+    String? category,
+    String? amount,
+    String? payerId,
+    List<String>? splitMemberIds,
+  }) async {
+    final data = await _call('PATCH', '/api/fixed-expenses/$id', {
+      ...?title == null ? null : {'title': title},
+      ...?category == null ? null : {'category': category},
+      ...?amount == null ? null : {'amount': amount},
+      ...?payerId == null ? null : {'payer_id': payerId},
+      ...?splitMemberIds == null ? null : {'split_members': splitMemberIds},
+    });
+    return FixedExpense.fromJson(data as Map<String, dynamic>);
+  }
+
+  Future<void> deleteFixedExpense(String id) async {
+    await _call('DELETE', '/api/fixed-expenses/$id', null);
+  }
+
+  /// Applies one template for the current month. Returns whether an
+  /// expense was actually posted (false = already applied this month).
+  Future<({bool applied, ExpenseRecord? expense})> applyFixedExpense(
+      String id) async {
+    final data =
+        await _call('POST', '/api/fixed-expenses/$id/apply', {});
+    final map = data as Map<String, dynamic>;
+    final applied = map['applied'] as bool;
+    final expenseJson = map['expense'] as Map<String, dynamic>?;
+    return (
+      applied: applied,
+      expense: expenseJson == null
+          ? null
+          : ExpenseRecord.fromJson(expenseJson),
+    );
+  }
+
 }

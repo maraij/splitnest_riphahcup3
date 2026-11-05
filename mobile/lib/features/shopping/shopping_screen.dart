@@ -11,6 +11,24 @@ import '../../core/widgets/member_avatar.dart';
 
 const List<String> units = ['pack', 'dozen', 'bottle', 'bag'];
 
+/// Daily-basis needs beyond the quick-add favourites — tapping one
+/// adds it to the Shopping list as Pending (default unit pack, qty 1).
+/// NO prices: these are shopping items, priced only at checkout.
+const List<String> otherDailyItems = [
+  'Eggs',
+  'Bread',
+  'Sugar',
+  'Tea',
+  'Cooking Oil',
+  'Vegetables',
+  'Fruits',
+  'Detergent',
+  'Shampoo',
+  'Toothpaste',
+  'Tissue',
+  'Gas refill',
+];
+
 /// Shopping List tab: Current List / History tabs (Current = pending
 /// items, History = bought items). Item rows with checkboxes for
 /// multi-select checkout, unit + quantity, status pills. Add-item form
@@ -86,6 +104,56 @@ class _ShoppingScreenState extends State<ShoppingScreen>
     });
   }
 
+  /// "Others" quick-add: a scrollable list of daily-basis needs.
+  /// Tapping one adds it to the Shopping list as Pending (unit pack,
+  /// qty 1) with a confirmation snackbar. No prices are invented.
+  Future<void> _openOthers(AppState state) async {
+    final picked = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      builder: (ctx) => SizedBox(
+        height: MediaQuery.of(ctx).size.height * 0.6,
+        child: Column(
+          children: [
+            const SizedBox(height: 12),
+            Container(
+              width: 40,
+              height: 4,
+              decoration: BoxDecoration(
+                color: Theme.of(ctx).colorScheme.outline,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            const SizedBox(height: 12),
+            const Text('Others', style: SplitNestTheme.titleStyle),
+            const SizedBox(height: 8),
+            Expanded(
+              child: ListView(
+                children: [
+                  for (final item in otherDailyItems)
+                    ListTile(
+                      leading: const Icon(Icons.shopping_basket_outlined),
+                      title: Text(item),
+                      trailing: const Icon(Icons.add),
+                      onTap: () => Navigator.of(ctx).pop(item),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (picked == null || !mounted) return;
+    final ok =
+        await state.addShoppingItem(title: picked, unit: 'pack', qty: 1);
+    if (ok && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('$picked added to the shopping list.')));
+    }
+  }
+
   Future<void> _openCheckout(AppState state) async {
     final selectedItems =
         state.shopping.where((i) => _selected.contains(i.id)).toList();
@@ -98,7 +166,12 @@ class _ShoppingScreenState extends State<ShoppingScreen>
       context: context,
       isScrollControlled: true,
       useSafeArea: true,
-      builder: (ctx) => StatefulBuilder(
+      // Bound the sheet to 90% of the screen: an unbounded sheet
+      // grows taller than a short screen and its scroll view can
+      // then never scroll the submit button into view.
+      builder: (ctx) => SizedBox(
+        height: MediaQuery.of(ctx).size.height * 0.9,
+        child: StatefulBuilder(
         builder: (ctx, setSheet) => Padding(
           padding: EdgeInsets.only(
             left: 16,
@@ -125,7 +198,7 @@ class _ShoppingScreenState extends State<ShoppingScreen>
                 const Text('Checkout', style: SplitNestTheme.titleStyle),
                 const SizedBox(height: 4),
                 Text(
-                  '${selectedItems.length} item(s) · one shared expense will be posted',
+                  '${selectedItems.length} item(s)',
                   style: SplitNestTheme.supportingStyle,
                 ),
                 const SizedBox(height: 12),
@@ -267,6 +340,7 @@ class _ShoppingScreenState extends State<ShoppingScreen>
           ),
         ),
       ),
+      ),
     );
     if (ok == true && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
@@ -280,6 +354,7 @@ class _ShoppingScreenState extends State<ShoppingScreen>
     final pending = state.shopping.where((i) => i.isPending).toList();
     final bought = state.shopping.where((i) => !i.isPending).toList();
     final theme = Theme.of(context);
+    final colors = StatusColors.of(context);
     return Padding(
       padding: const EdgeInsets.all(SplitNestTheme.screenPadding),
       child: Column(
@@ -374,20 +449,38 @@ class _ShoppingScreenState extends State<ShoppingScreen>
                       ],
                     ),
                     const SizedBox(height: 12),
-                    SizedBox(
-                      width: double.infinity,
-                      child: ElevatedButton.icon(
-                        onPressed:
-                            state.isBusy ? null : () => _addItem(state),
-                        icon: state.isBusy
-                            ? const SizedBox(
-                                width: 20,
-                                height: 20,
-                                child:
-                                    CircularProgressIndicator(strokeWidth: 2))
-                            : const Icon(Icons.add),
-                        label: Text(state.isBusy ? 'Adding…' : 'Add item'),
-                      ),
+                    // Add + Others side by side: stacking two full-width
+                    // 48pt buttons made the card too tall for short
+                    // screens (the tab list below got ~0 height).
+                    Row(
+                      children: [
+                        Expanded(
+                          child: ElevatedButton.icon(
+                            onPressed: state.isBusy
+                                ? null
+                                : () => _addItem(state),
+                            icon: state.isBusy
+                                ? const SizedBox(
+                                    width: 20,
+                                    height: 20,
+                                    child: CircularProgressIndicator(
+                                        strokeWidth: 2))
+                                : const Icon(Icons.add),
+                            label:
+                                Text(state.isBusy ? 'Adding…' : 'Add item'),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: state.isBusy
+                                ? null
+                                : () => _openOthers(state),
+                            icon: const Icon(Icons.more_horiz),
+                            label: const Text('Others'),
+                          ),
+                        ),
+                      ],
                     ),
                   ],
                 ),
@@ -425,20 +518,10 @@ class _ShoppingScreenState extends State<ShoppingScreen>
                                 Text('No pending items',
                                     style: SplitNestTheme.sectionStyle,
                                     textAlign: TextAlign.center),
-                                SizedBox(height: 4),
-                                Text(
-                                  'Add an item above — Milk, Rice, anything the household needs.',
-                                  style: SplitNestTheme.supportingStyle,
-                                  textAlign: TextAlign.center,
-                                ),
                               ],
                             )
                           : ListView(
                               children: [
-                                const Text(
-                                    'Tap an item to select it for checkout',
-                                    style: SplitNestTheme.supportingStyle),
-                                const SizedBox(height: 8),
                                 ...pending.map((item) {
                                   final selected =
                                       _selected.contains(item.id);
@@ -457,10 +540,12 @@ class _ShoppingScreenState extends State<ShoppingScreen>
                                           '${item.title} (${item.unit} × ${item.requestedQty})'),
                                       trailing: Chip(
                                         label: const Text('Pending'),
-                                        backgroundColor:
-                                            Colors.amber.shade100,
+                                        backgroundColor: colors.warning
+                                            .withValues(alpha: 0.15),
                                         labelStyle: TextStyle(
-                                            color: Colors.amber.shade900),
+                                          color: colors.warning,
+                                          fontWeight: FontWeight.w700,
+                                        ),
                                       ),
                                       onTap: () => _toggleSelect(item.id),
                                     ),
@@ -482,12 +567,6 @@ class _ShoppingScreenState extends State<ShoppingScreen>
                             Text('Nothing bought yet',
                                 style: SplitNestTheme.sectionStyle,
                                 textAlign: TextAlign.center),
-                            SizedBox(height: 4),
-                            Text(
-                              'Checked-out items appear here as history.',
-                              style: SplitNestTheme.supportingStyle,
-                              textAlign: TextAlign.center,
-                            ),
                           ],
                         )
                       : ListView(
@@ -541,10 +620,7 @@ class _SplitPreview extends StatelessWidget {
   Widget build(BuildContext context) {
     final total = parsePaisa(totalText.trim());
     if (total == null || total <= 0) {
-      return const Text(
-        'Enter the total paid to see each person’s share.',
-        style: SplitNestTheme.supportingStyle,
-      );
+      return const SizedBox.shrink();
     }
     if (splitMembers.isEmpty) {
       return const Text(
