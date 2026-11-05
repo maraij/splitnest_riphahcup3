@@ -1,9 +1,16 @@
 name: Android APK
 
+
 on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      api_base_url:
+        description: "Backend API base URL for the app"
+        required: false
+        default: "http://10.0.2.2:3000"
+
 
 jobs:
   build-apk:
@@ -28,7 +35,7 @@ jobs:
         working-directory: mobile
       - run: flutter test
         working-directory: mobile
-      - run: flutter build apk --debug
+      - run: flutter build apk --debug --dart-define=API_BASE_URL=${{ inputs.api_base_url || 'http://10.0.2.2:3000' }}
         working-directory: mobile
       - uses: actions/upload-artifact@v4
         with:
