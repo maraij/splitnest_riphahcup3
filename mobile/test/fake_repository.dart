@@ -18,12 +18,16 @@
 //   zero — nobody saved anything, so no celebration may appear.
 library;
 
+import 'dart:typed_data';
+
 import 'package:splitnest/core/money.dart';
 import 'package:splitnest/data/demo_benchmark.dart';
+import 'package:splitnest/domain/expense_auth.dart';
 import 'package:splitnest/domain/invitations.dart';
 import 'package:splitnest/data/repository.dart';
 import 'package:splitnest/domain/balances.dart';
 import 'package:splitnest/domain/models.dart';
+import 'package:splitnest/domain/payment_tracking.dart';
 
 class FakeSplitNestRepository implements SplitNestRepository {
   FakeSplitNestRepository.benchmark()
@@ -81,6 +85,9 @@ class FakeSplitNestRepository implements SplitNestRepository {
     Member(id: 'M02', name: 'Ayesha'),
     Member(id: 'M03', name: 'Bilal'),
   ];
+
+  /// uid → profile-photo download URL (set by setUserPhotoUrl).
+  final Map<String, String> _photoUrls = {};
 
   List<ShoppingItem> _shopping = [];
   List<ExpenseRecord> _expenses = [];
@@ -156,8 +163,27 @@ class FakeSplitNestRepository implements SplitNestRepository {
   }
 
   @override
-  Future<List<Member>> getMembers(String groupId) async =>
-      List.of(_members);
+  Future<List<Member>> getMembers(String groupId) async => _members
+      .map((m) => Member(
+            id: m.id,
+            name: m.name,
+            photoUrl: _photoUrls[_uidForMember(m.id)],
+          ))
+      .toList();
+
+  /// The UID the fake knows for a member id: the UID that signed in
+  /// as that member (recorded by ensureGroup's role map), or null
+  /// when nobody signed in as them yet. Only used to surface stored
+  /// photo URLs on the right member.
+  String? _uidForMember(String memberId) {
+    // Roles are keyed by UID; the fake's demo logins use
+    // 'demo-M01' style UIDs (see AppState.loginWithDemo without a
+    // Firebase service) and 'local-M01' for Google-without-Firebase.
+    for (final uid in _roles[groupId]?.keys ?? <String>[]) {
+      if (uid.endsWith('-$memberId')) return uid;
+    }
+    return null;
+  }
 
   @override
   Future<List<ShoppingItem>> getShopping(String groupId) async {
@@ -290,6 +316,7 @@ class FakeSplitNestRepository implements SplitNestRepository {
     required String splitType,
     List<Map<String, String>>? splits,
     List<String>? splitMembers,
+    List<Map<String, String>>? percentageSplits,
     required String actorUid,
   }) async {
     if (title.trim().isEmpty) {
@@ -310,6 +337,7 @@ class FakeSplitNestRepository implements SplitNestRepository {
       splitType: splitType,
       splits: splits,
       splitMembers: splitMembers,
+      percentageSplits: percentageSplits,
       knownMembers: _knownIds,
     );
     final expense = ExpenseRecord(
@@ -326,9 +354,183 @@ class FakeSplitNestRepository implements SplitNestRepository {
                 amount: formatPaisa(s.amountPaisa),
               ))
           .toList(),
+      createdByUid: actorUid,
     );
     _expenses.insert(0, expense);
     return expense;
+  }
+
+  bool _mayEditExpense(ExpenseRecord expense, String actorUid) {
+    final role = _roles[groupId]?[actorUid];
+    return canEditExpense(
+      isAdmin: role == 'owner' || role == 'admin',
+      actorUid: actorUid,
+      actorMemberId: _memberIdForUid(actorUid),
+      createdByUid: expense.createdByUid,
+      payerMemberId: expense.payerId,
+    );
+  }
+
+  /// The member id for a fake UID (`demo-M01` / `local-M01` style),
+  /// or null for a real Firebase UID the fake never linked.
+  String? _memberIdForUid(String uid) {
+    final m = RegExp(r'-(M\d+)$').firstMatch(uid);
+    return m?.group(1);
+  }
+
+  @override
+  Future<ExpenseRecord> updateExpense({
+    required String groupId,
+    required String id,
+    String? title,
+    String? category,
+    String? date,
+    String? amount,
+    String? payerId,
+    String? splitType,
+    List<Map<String, String>>? splits,
+    List<String>? splitMembers,
+    List<Map<String, String>>? percentageSplits,
+    String? receiptUrl,
+    String? receiptPath,
+    required String actorUid,
+  }) async {
+    final i = _expenses.indexWhere((e) => e.id == id);
+    if (i < 0) throw const CloudDataException('Expense not found.');
+    final old = _expenses[i];
+    if (!_mayEditExpense(old, actorUid)) {
+      throw const CloudDataException(
+          'Only the member who added this expense (or the household '
+          'owner/admin) can change or delete it.');
+    }
+    final newTitle = title?.trim() ?? old.title;
+    if (newTitle.isEmpty) {
+      throw const CloudDataException('Title is required.');
+    }
+    final newAmountPaisa =
+        amount == null ? parsePaisa(old.amount) : parsePaisa(amount);
+    if (newAmountPaisa == null || newAmountPaisa <= 0) {
+      throw const CloudDataException('Amount must be a positive amount.');
+    }
+    final newDate = date ?? old.date;
+    if (newDate == null ||
+        !RegExp(r'^\d{4}-\d{2}-\d{2}$').hasMatch(newDate)) {
+      throw const CloudDataException('Date must be YYYY-MM-DD.');
+    }
+    final newPayerId = payerId ?? old.payerId;
+    if (!_knownIds.contains(newPayerId)) {
+      throw CloudDataException('Payer $newPayerId does not exist.');
+    }
+    final newSplitType = splitType ?? old.splitType ?? 'equal';
+    List<({String memberId, int amountPaisa})> shares;
+    if (splitType != null ||
+        splits != null ||
+        splitMembers != null ||
+        percentageSplits != null ||
+        amount != null) {
+      shares = validatedShares(
+        amountPaisa: newAmountPaisa,
+        splitType: newSplitType,
+        splits: splits ??
+            (newSplitType == 'custom'
+                ? old.shares
+                    .map((s) => {
+                          'member_id': s.memberId,
+                          'amount': s.amount,
+                        })
+                    .toList()
+                : null),
+        splitMembers: splitMembers ??
+            (newSplitType == 'equal'
+                ? old.shares.map((s) => s.memberId).toList()
+                : null),
+        percentageSplits: percentageSplits,
+        knownMembers: _knownIds,
+      );
+    } else {
+      // No money/split change: keep the stored shares, re-checked
+      // against the (unchanged) amount.
+      final sum = old.shares.fold(
+          0, (s, sh) => s + (parsePaisa(sh.amount) ?? 0));
+      if (sum != newAmountPaisa) {
+        throw CloudDataException(
+            'Stored shares sum to ${formatPaisa(sum)} but the amount is '
+            '${formatPaisa(newAmountPaisa)} — re-enter the split.');
+      }
+      shares = old.shares
+          .map((sh) => (
+                memberId: sh.memberId,
+                amountPaisa: parsePaisa(sh.amount) ?? 0,
+              ))
+          .toList();
+    }
+    final updated = ExpenseRecord(
+      id: old.id,
+      title: newTitle,
+      category:
+          category?.trim().isEmpty ?? true ? old.category : category!.trim(),
+      amount: formatPaisa(newAmountPaisa),
+      payerId: newPayerId,
+      date: newDate,
+      splitType: newSplitType,
+      shares: shares
+          .map((s) => ExpenseShare(
+                memberId: s.memberId,
+                amount: formatPaisa(s.amountPaisa),
+              ))
+          .toList(),
+      isDemo: old.isDemo,
+      createdByUid: old.createdByUid,
+      receiptUrl: receiptUrl ?? old.receiptUrl,
+      receiptPath: receiptPath ?? old.receiptPath,
+    );
+    _expenses[i] = updated;
+    return updated;
+  }
+
+  @override
+  Future<void> deleteExpense({
+    required String groupId,
+    required String id,
+    required String actorUid,
+  }) async {
+    final i = _expenses.indexWhere((e) => e.id == id);
+    if (i < 0) throw const CloudDataException('Expense not found.');
+    if (!_mayEditExpense(_expenses[i], actorUid)) {
+      throw const CloudDataException(
+          'Only the member who added this expense (or the household '
+          'owner/admin) can change or delete it.');
+    }
+    _expenses.removeAt(i);
+  }
+
+  @override
+  Future<void> setUserPhotoUrl({
+    required String groupId,
+    required String uid,
+    required String photoUrl,
+  }) async {
+    _photoUrls[uid] = photoUrl;
+  }
+
+  @override
+  Future<({String url, String path})?> uploadReceipt({
+    required String groupId,
+    required String expenseId,
+    required Uint8List bytes,
+  }) async {
+    if (bytes.length > 10 * 1024 * 1024) return null;
+    final path = 'receipts/$groupId/$expenseId/receipt.jpg';
+    return (url: 'https://fake.storage/$path', path: path);
+  }
+
+  @override
+  Future<String?> uploadProfilePhoto({
+    required String uid,
+    required Uint8List bytes,
+  }) async {
+    if (bytes.length > 5 * 1024 * 1024) return null;
+    return 'https://fake.storage/profile-photos/$uid/photo.jpg';
   }
 
   @override
@@ -374,9 +576,13 @@ class FakeSplitNestRepository implements SplitNestRepository {
     final i = _payments.indexWhere((p) => p.id == paymentId);
     if (i < 0) throw const CloudDataException('Payment not found.');
     final old = _payments[i];
-    if (old.status != 'recorded') {
-      throw const CloudDataException('This payment is already verified.');
-    }
+    final role = _roles[groupId]?[actorUid];
+    final error = paymentStatusTransitionError(
+      current: old.status,
+      target: 'verified',
+      isAdmin: role == 'owner' || role == 'admin',
+    );
+    if (error != null) throw CloudDataException(error);
     final verified = PaymentRecord(
       id: old.id,
       senderId: old.senderId,
@@ -384,10 +590,41 @@ class FakeSplitNestRepository implements SplitNestRepository {
       amount: old.amount,
       status: 'verified',
       verifiedBy: actorUid,
+      verifiedAt: DateTime.now(),
       createdAt: old.createdAt,
     );
     _payments[i] = verified;
     return verified;
+  }
+
+  @override
+  Future<PaymentRecord> rejectPayment({
+    required String groupId,
+    required String paymentId,
+    required String actorUid,
+  }) async {
+    final i = _payments.indexWhere((p) => p.id == paymentId);
+    if (i < 0) throw const CloudDataException('Payment not found.');
+    final old = _payments[i];
+    final role = _roles[groupId]?[actorUid];
+    final error = paymentStatusTransitionError(
+      current: old.status,
+      target: 'rejected',
+      isAdmin: role == 'owner' || role == 'admin',
+    );
+    if (error != null) throw CloudDataException(error);
+    final rejected = PaymentRecord(
+      id: old.id,
+      senderId: old.senderId,
+      recipientId: old.recipientId,
+      amount: old.amount,
+      status: 'rejected',
+      rejectedBy: actorUid,
+      rejectedAt: DateTime.now(),
+      createdAt: old.createdAt,
+    );
+    _payments[i] = rejected;
+    return rejected;
   }
 
   @override

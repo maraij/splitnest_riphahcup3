@@ -1,6 +1,9 @@
+import 'dart:typed_data';
+
 import '../core/money.dart';
 import '../domain/balances.dart';
 import '../domain/models.dart';
+import '../domain/percentage_split.dart';
 
 /// The one plain message the app shows whenever the cloud data
 /// source is unreachable, the Firestore database does not exist yet,
@@ -121,7 +124,77 @@ abstract class SplitNestRepository {
     required String splitType,
     List<Map<String, String>>? splits,
     List<String>? splitMembers,
+    List<Map<String, String>>? percentageSplits,
     required String actorUid,
+  });
+
+  /// Edits one expense (title, category, date, amount, payer and/or
+  /// split). Recomputes the splits from the new values, so the
+  /// integer-paisa invariant (splits sum == amount) always holds
+  /// after an edit. Only the expense's payer/creator or a group
+  /// owner/admin may edit (see domain/expense_auth.dart); anyone
+  /// else gets a [CloudDataException] and nothing is written.
+  /// [receiptUrl]/[receiptPath] attach (or replace) a receipt image
+  /// without touching the money fields.
+  Future<ExpenseRecord> updateExpense({
+    required String groupId,
+    required String id,
+    String? title,
+    String? category,
+    String? date,
+    String? amount,
+    String? payerId,
+    String? splitType,
+    List<Map<String, String>>? splits,
+    List<String>? splitMembers,
+    List<Map<String, String>>? percentageSplits,
+    String? receiptUrl,
+    String? receiptPath,
+    required String actorUid,
+  });
+
+  /// Deletes one expense. Only the expense's payer/creator or a
+  /// group owner/admin may delete; anyone else gets a
+  /// [CloudDataException] and nothing is written.
+  Future<void> deleteExpense({
+    required String groupId,
+    required String id,
+    required String actorUid,
+  });
+
+  /// Stores a profile-photo download URL on the user's profile doc
+  /// (and the group members mirror, best-effort). The photo bytes
+  /// themselves live in the backend's photo store (see
+  /// [uploadProfilePhoto]); this only records the URL.
+  Future<void> setUserPhotoUrl({
+    required String groupId,
+    required String uid,
+    required String photoUrl,
+  });
+
+  /// Uploads a receipt image for an expense and returns the
+  /// (download URL, storage path) to store on the expense.
+  /// Backend-dependent seam: the Firestore implementation stores it
+  /// in Firebase Storage at
+  /// `receipts/{groupId}/{expenseId}/receipt.jpg` (images only,
+  /// 10 MB cap); a local-store implementation would keep the bytes
+  /// locally and return a local path instead. Returns null when the
+  /// image is over the cap or the upload fails — never throws for an
+  /// upload failure, so the caller can save the expense without the
+  /// receipt and say so.
+  Future<({String url, String path})?> uploadReceipt({
+    required String groupId,
+    required String expenseId,
+    required Uint8List bytes,
+  });
+
+  /// Uploads a profile photo and returns its download URL (or local
+  /// reference for a local implementation), or null when the image
+  /// is over the cap (5 MB) or the upload fails. The caller stores
+  /// the returned value via [setUserPhotoUrl].
+  Future<String?> uploadProfilePhoto({
+    required String uid,
+    required Uint8List bytes,
   });
 
   /// Records a settlement as `recorded`. Validated against the live
@@ -141,6 +214,17 @@ abstract class SplitNestRepository {
   /// rules on the real database); a verified payment can never be
   /// un-verified.
   Future<PaymentRecord> verifyPayment({
+    required String groupId,
+    required String paymentId,
+    required String actorUid,
+  });
+
+  /// Flips a `recorded` payment to `rejected`, stamping who rejected
+  /// it. Only an owner/admin may do this. A rejected payment counts
+  /// nowhere in any balance; the sender's correctable path is to
+  /// record a new payment. A rejected payment can never be verified
+  /// afterwards, and a verified payment can never be rejected.
+  Future<PaymentRecord> rejectPayment({
     required String groupId,
     required String paymentId,
     required String actorUid,
@@ -358,7 +442,58 @@ class UnavailableSplitNestRepository implements SplitNestRepository {
     required String splitType,
     List<Map<String, String>>? splits,
     List<String>? splitMembers,
+    List<Map<String, String>>? percentageSplits,
     required String actorUid,
+  }) =>
+      _unavailable();
+
+  @override
+  Future<ExpenseRecord> updateExpense({
+    required String groupId,
+    required String id,
+    String? title,
+    String? category,
+    String? date,
+    String? amount,
+    String? payerId,
+    String? splitType,
+    List<Map<String, String>>? splits,
+    List<String>? splitMembers,
+    List<Map<String, String>>? percentageSplits,
+    String? receiptUrl,
+    String? receiptPath,
+    required String actorUid,
+  }) =>
+      _unavailable();
+
+  @override
+  Future<void> deleteExpense({
+    required String groupId,
+    required String id,
+    required String actorUid,
+  }) =>
+      _unavailable();
+
+  @override
+  Future<void> setUserPhotoUrl({
+    required String groupId,
+    required String uid,
+    required String photoUrl,
+  }) =>
+      _unavailable();
+
+  @override
+  Future<({String url, String path})?> uploadReceipt({
+    required String groupId,
+    required String expenseId,
+    required Uint8List bytes,
+  }) =>
+      _unavailable();
+
+  @override
+  Future<String?> uploadProfilePhoto({
+    required String uid,
+    required Uint8List bytes,
   }) =>
       _unavailable();
 
@@ -374,6 +509,14 @@ class UnavailableSplitNestRepository implements SplitNestRepository {
 
   @override
   Future<PaymentRecord> verifyPayment({
+    required String groupId,
+    required String paymentId,
+    required String actorUid,
+  }) =>
+      _unavailable();
+
+  @override
+  Future<PaymentRecord> rejectPayment({
     required String groupId,
     required String paymentId,
     required String actorUid,
@@ -499,15 +642,42 @@ const List<String> shoppingUnits = ['pack', 'dozen', 'bottle', 'bag'];
 /// Validates an expense's shares and returns them as
 /// (memberId, paisa) pairs. `equal` derives them from [splitMembers]
 /// (default: all [knownMembers]); `custom` takes them from [splits]
-/// and requires the sum to equal [amountPaisa] exactly.
+/// and requires the sum to equal [amountPaisa] exactly;
+/// `percentage` takes them from [percentageSplits] (each entry
+/// `{'member_id': id, 'percent': '40'}` — a percent with at most 2
+/// decimals) and requires the percents to sum to exactly 100.
 List<({String memberId, int amountPaisa})> validatedShares({
   required int amountPaisa,
   required String splitType,
   List<Map<String, String>>? splits,
   List<String>? splitMembers,
+  List<Map<String, String>>? percentageSplits,
   required List<String> knownMembers,
 }) {
   bool known(String id) => knownMembers.contains(id);
+  if (splitType == 'percentage') {
+    if (percentageSplits == null || percentageSplits.isEmpty) {
+      throw const CloudDataException(
+          'Percentage split needs at least one share.');
+    }
+    final parsed = <({String memberId, int percentHundredths})>[];
+    for (final s in percentageSplits) {
+      final pct = parsePercentHundredths(s['percent'] ?? '');
+      if (pct == null) {
+        throw const CloudDataException(
+            'Each percentage must be a number between 0 and 100.');
+      }
+      parsed.add(
+          (memberId: s['member_id']!, percentHundredths: pct));
+    }
+    final error = percentageSplitError(
+      amountPaisa: amountPaisa,
+      shares: parsed,
+      knownMembers: knownMembers,
+    );
+    if (error != null) throw CloudDataException(error);
+    return percentageSplit(amountPaisa, parsed);
+  }
   if (splitType == 'custom') {
     if (splits == null || splits.isEmpty) {
       throw const CloudDataException(
@@ -536,8 +706,9 @@ List<({String memberId, int amountPaisa})> validatedShares({
     }
     return out;
   }
-  if (splitType != 'equal') {
-    throw const CloudDataException('split_type must be "equal" or "custom".');
+  if (splitType != 'equal' && splitType != 'percentage') {
+    throw const CloudDataException(
+        'split_type must be "equal", "custom" or "percentage".');
   }
   final members = (splitMembers != null && splitMembers.isNotEmpty)
       ? splitMembers

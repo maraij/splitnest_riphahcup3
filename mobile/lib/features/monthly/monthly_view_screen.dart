@@ -8,6 +8,7 @@ library;
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/money.dart';
 import '../../core/theme.dart';
 import '../../core/widgets/entrance.dart';
 import '../../core/widgets/illustrations.dart';
@@ -203,6 +204,70 @@ class MonthlyViewScreen extends StatelessWidget {
                             .copyWith(fontWeight: FontWeight.w700)),
                   ),
                 )),
+          const SizedBox(height: 16),
+          // Monthly breakdown (Phase 5): who paid, who did not pay,
+          // and how much each member contributed this month —
+          // expenses paid + verified settlements sent. Recorded
+          // (unverified) settlements are shown separately and never
+          // counted as contributions. It sits last so the sections
+          // above keep their order and fold position.
+          const Text('Who paid this month',
+              style: SplitNestTheme.sectionStyle),
+          const SizedBox(height: 8),
+          Entrance(
+            delay: const Duration(milliseconds: 150),
+            child: Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    ...state.monthlyBreakdownFor(DateTime.now()).map(
+                      (c) => Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment:
+                                    CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    c.member.name,
+                                    style: SplitNestTheme.bodyStyle
+                                        .copyWith(
+                                            fontWeight: FontWeight.w600),
+                                  ),
+                                  Text(
+                                    c.didPay
+                                        ? 'Paid PKR ${formatPaisa(c.paidPaisa)} · share PKR ${formatPaisa(c.sharePaisa)}'
+                                        : 'Did not pay this month · share PKR ${formatPaisa(c.sharePaisa)}',
+                                    style:
+                                        SplitNestTheme.supportingStyle,
+                                  ),
+                                  if (c.sentPendingPaisa > 0)
+                                    Text(
+                                      'Pending settlement sent: PKR ${formatPaisa(c.sentPendingPaisa)} (not verified)',
+                                      style:
+                                          SplitNestTheme.supportingStyle,
+                                    ),
+                                ],
+                              ),
+                            ),
+                            Text(
+                              'Contributed PKR ${formatPaisa(c.contributedPaisa)}',
+                              style: SplitNestTheme.bodyStyle.copyWith(
+                                  fontWeight: FontWeight.w700),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
           const SizedBox(height: 16),
         ],
       ),

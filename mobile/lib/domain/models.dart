@@ -5,11 +5,18 @@ library;
 import 'invitations.dart';
 
 class Member {
-  Member({required this.id, required this.name});
+  Member({required this.id, required this.name, this.photoUrl});
   final String id;
   final String name;
-  factory Member.fromJson(Map<String, dynamic> j) =>
-      Member(id: j['id'] as String, name: j['name'] as String);
+
+  /// Download URL of the member's profile photo (Storage), when one
+  /// was uploaded; null means initials avatar.
+  final String? photoUrl;
+  factory Member.fromJson(Map<String, dynamic> j) => Member(
+        id: j['id'] as String,
+        name: j['name'] as String,
+        photoUrl: j['photoUrl'] as String?,
+      );
 }
 
 class ShoppingItem {
@@ -169,6 +176,9 @@ class ExpenseRecord {
     this.splitType,
     this.shares = const [],
     this.isDemo = false,
+    this.createdByUid,
+    this.receiptUrl,
+    this.receiptPath,
   });
   final String id;
   final String title;
@@ -183,6 +193,15 @@ class ExpenseRecord {
   /// (see SplitNestRepository.loadDemoBenchmark). Demo rows are never
   /// mixed silently into a real user's history.
   final bool isDemo;
+
+  /// Firebase UID that recorded the expense (the edit/delete
+  /// authorisation key — see domain/expense_auth.dart).
+  final String? createdByUid;
+
+  /// Receipt image: Storage download URL / path, when a receipt
+  /// photo was attached (see storage.rules `receipts/{gid}/{eid}/`).
+  final String? receiptUrl;
+  final String? receiptPath;
   factory ExpenseRecord.fromJson(Map<String, dynamic> j) => ExpenseRecord(
         id: j['id'] as String,
         title: j['title'] as String,
@@ -202,11 +221,14 @@ class ExpenseRecord {
 ///
 /// A payment is a **record** first and a **verified fact** second:
 /// `status` starts as `recorded` (set by the sender) and moves to
-/// `verified` when an owner/admin confirms it. Either way it counts
-/// in the ledger immediately (Net = Paid − Share + Sent − Received),
-/// exactly as the old backend's settlements did — verification is a
-/// trust flag, not a second posting. A payment never changes total
-/// spending.
+/// `verified` when an owner/admin confirms it, or to `rejected`
+/// when an owner/admin rejects it (a rejected payment counts
+/// nowhere in any balance; the sender records a new, corrected
+/// payment instead — that is the correctable path). Only `verified`
+/// payments count in the settled balance (see
+/// domain/payment_tracking.dart); a `recorded` payment is shown as
+/// pending and never displayed as confirmed. A payment never
+/// changes total spending.
 class PaymentRecord {
   PaymentRecord({
     required this.id,
@@ -215,6 +237,9 @@ class PaymentRecord {
     required this.amount,
     required this.status,
     this.verifiedBy,
+    this.verifiedAt,
+    this.rejectedBy,
+    this.rejectedAt,
     this.createdAt,
   });
   final String id;
@@ -224,9 +249,14 @@ class PaymentRecord {
   /// Amount, two-decimal string ('250.00').
   final String amount;
 
-  /// 'recorded' | 'verified'.
+  /// 'recorded' | 'verified' | 'rejected'.
   final String status;
   final String? verifiedBy;
+  final DateTime? verifiedAt;
+
+  /// UID of the owner/admin who rejected it (set only on reject).
+  final String? rejectedBy;
+  final DateTime? rejectedAt;
   final DateTime? createdAt;
 }
 

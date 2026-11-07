@@ -51,18 +51,32 @@ class MemberAvatar extends StatelessWidget {
         (Theme.of(context).colorScheme.primary,
             Theme.of(context).colorScheme.onPrimary);
     // Photo from the single source of truth (or an explicit override).
-    final Uint8List? photo =
-        imageBytes ?? context.watch<AppState>().profileImageFor(memberId);
-    final Widget face = photo != null
-        ? ClipOval(
-            child: Image.memory(
-              photo,
-              width: radius * 2,
-              height: radius * 2,
-              fit: BoxFit.cover,
-            ),
-          )
-        : CircleAvatar(
+    // Priority: an explicit override, then the local bytes, then the
+    // stored photo URL from the backend (Storage download URL, or a
+    // local path once the store goes local) — the URL is what other
+    // members' devices show. A broken URL falls back to initials.
+    final state = context.watch<AppState>();
+    final Uint8List? photo = imageBytes ?? state.profileImageFor(memberId);
+    final String? photoUrl =
+        photo == null ? state.profilePhotoUrlFor(memberId) : null;
+    final Widget face;
+    if (photo != null) {
+      face = ClipOval(
+        child: Image.memory(
+          photo,
+          width: radius * 2,
+          height: radius * 2,
+          fit: BoxFit.cover,
+        ),
+      );
+    } else if (photoUrl != null) {
+      face = ClipOval(
+        child: Image.network(
+          photoUrl,
+          width: radius * 2,
+          height: radius * 2,
+          fit: BoxFit.cover,
+          errorBuilder: (_, _, _) => CircleAvatar(
             radius: radius,
             backgroundColor: bg,
             foregroundColor: fg,
@@ -74,7 +88,24 @@ class MemberAvatar extends StatelessWidget {
                 color: fg,
               ),
             ),
-          );
+          ),
+        ),
+      );
+    } else {
+      face = CircleAvatar(
+        radius: radius,
+        backgroundColor: bg,
+        foregroundColor: fg,
+        child: Text(
+          _initials,
+          style: TextStyle(
+            fontSize: radius * 0.75,
+            fontWeight: FontWeight.w700,
+            color: fg,
+          ),
+        ),
+      );
+    }
     return Container(
       decoration: selected
           ? BoxDecoration(

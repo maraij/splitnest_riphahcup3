@@ -3,16 +3,20 @@ import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/money.dart';
 import '../data/firebase_auth_service.dart';
 import '../data/google_auth_service.dart';
+import '../data/receipt_service.dart';
 import '../data/repository.dart';
 import '../domain/balances.dart';
+import '../domain/expense_auth.dart';
 import '../domain/insights.dart';
 import '../domain/invitations.dart';
 import '../domain/models.dart';
+import '../domain/payment_tracking.dart';
 
 /// AppState — the SINGLE source of truth for the whole app.
 ///
@@ -36,7 +40,9 @@ class AppState extends ChangeNotifier {
     GoogleAuthService? googleAuth,
     this.firebaseAuth,
     bool? initialDarkMode,
+    ReceiptService? receiptService,
   })  : _repository = repository ?? const UnavailableSplitNestRepository(),
+        receiptService = receiptService ?? ReceiptService(),
         googleAuth = googleAuth ?? RealGoogleAuthService() {
     _isDarkMode = initialDarkMode ?? false;
     // When the caller did not preload the saved theme (tests), load
@@ -66,6 +72,12 @@ class AppState extends ChangeNotifier {
   }
 
   SplitNestRepository _repository;
+
+  /// Receipt capture / OCR / Storage upload (Phase 5). Injectable
+  /// so tests can substitute a stub; the default is the real
+  /// service (Storage is resolved lazily inside it, so building
+  /// AppState never touches Firebase).
+  final ReceiptService receiptService;
 
   /// Swaps the data source (used by main.dart when a Firebase retry
   /// succeeds after the app started on the Unavailable repository).
@@ -441,9 +453,28 @@ class AppState extends ChangeNotifier {
   // ---- Profile picture ----
   Uint8List? profileImageFor(String memberId) => profileImages[memberId];
 
-  Future<void> setProfileImage(Uint8List bytes) async {
+  /// Profile-photo download URLs (Storage), keyed by member id,
+  /// persisted in SharedPreferences. The local bytes in
+  /// [profileImages] win when both exist; the URL is what other
+  /// members' devices show.
+  Map<String, String> profilePhotoUrls = {};
+
+  String? profilePhotoUrlFor(String memberId) =>
+      profilePhotoUrls[memberId] ??
+      members
+          .where((m) => m.id == memberId)
+          .firstOrNull
+          ?.photoUrl;
+
+  /// Saves the picked photo locally AND uploads it to Storage
+  /// (`profile-photos/{uid}/photo.jpg`), storing the URL on the
+  /// user's profile. Returns true when the cloud upload + URL
+  /// store succeeded; false when only the local copy was saved
+  /// (Storage unavailable / upload failed) — the local photo still
+  /// shows, and nothing here ever throws.
+  Future<bool> setProfileImage(Uint8List bytes) async {
     final id = loggedInMemberId;
-    if (id == null) return;
+    if (id == null) return false;
     profileImages[id] = bytes;
     notifyListeners();
     try {
@@ -454,6 +485,40 @@ class AppState extends ChangeNotifier {
       }
     } catch (_) {
       // Session-only then; the picture still shows until reload.
+    }
+    // Cloud upload (Phase 5): through the repository interface
+    // only (never Storage directly from here) — the URL is stored
+    // on the profile. Any failure leaves the local photo in place.
+    try {
+      final url = await _repository.uploadProfilePhoto(
+        uid: currentUid,
+        bytes: bytes,
+      );
+      if (url == null) return false;
+      final gid = groupId;
+      if (gid != null) {
+        try {
+          await _repository.setUserPhotoUrl(
+            groupId: gid,
+            uid: currentUid,
+            photoUrl: url,
+          );
+        } catch (_) {
+          // The URL is still kept locally below; the profile write
+          // is best-effort.
+        }
+      }
+      profilePhotoUrls[id] = url;
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString('profile_photo_url_$id', url);
+      } catch (_) {
+        // In-memory URL still applies for this session.
+      }
+      notifyListeners();
+      return true;
+    } catch (_) {
+      return false;
     }
   }
 
@@ -467,6 +532,11 @@ class AppState extends ChangeNotifier {
         final encoded = prefs.getString('profile_image_$m');
         if (encoded != null) {
           profileImages[m] = base64Decode(encoded);
+          changed = true;
+        }
+        final url = prefs.getString('profile_photo_url_$m');
+        if (url != null) {
+          profilePhotoUrls[m] = url;
           changed = true;
         }
       }
@@ -937,6 +1007,51 @@ class AppState extends ChangeNotifier {
   List<PaymentRecord> get pendingPayments =>
       payments.where((p) => p.status == 'recorded').toList();
 
+  /// Verified payments (status `verified`), newest first.
+  List<PaymentRecord> get verifiedPayments =>
+      payments.where((p) => p.status == 'verified').toList();
+
+  /// Rejected payments (status `rejected`), newest first. A
+  /// rejected payment counts nowhere in any balance.
+  List<PaymentRecord> get rejectedPayments =>
+      payments.where((p) => p.status == 'rejected').toList();
+
+  /// Per-member payment tracking (Phase 5): total owed / paid,
+  /// verified vs pending settlements, settled remaining balance and
+  /// status, monthly contribution, payment history — settled
+  /// balances count `verified` payments only (see
+  /// domain/payment_tracking.dart).
+  List<MemberPaymentSummary> get paymentSummaries =>
+      memberPaymentSummaries(
+        expenses: recentExpenses,
+        payments: payments,
+        members: members,
+      );
+
+  /// Monthly breakdown for [month]: who paid, who did not pay, and
+  /// how much each member contributed.
+  List<MonthlyContribution> monthlyBreakdownFor(DateTime month) =>
+      monthlyBreakdown(
+        expenses: recentExpenses,
+        payments: payments,
+        members: members,
+        month: month,
+      );
+
+  /// True when the signed-in user may verify or reject a recorded
+  /// payment: group owner or admin only.
+  bool get canVerifyPayments => canVerifyPayment(currentRole);
+
+  /// True when the signed-in user may edit or delete [expense]:
+  /// its payer/creator, or a group owner/admin.
+  bool mayEditExpense(ExpenseRecord expense) => canEditExpense(
+        isAdmin: canVerifyPayments,
+        actorUid: currentUid,
+        actorMemberId: loggedInMemberId,
+        createdByUid: expense.createdByUid,
+        payerMemberId: expense.payerId,
+      );
+
   // NOTE: there is no free member switcher. The member is set at
   // login() and changed via logout + login again.
 
@@ -1145,6 +1260,7 @@ class AppState extends ChangeNotifier {
     required String splitType,
     List<Map<String, String>>? splits,
     List<String>? splitMembers,
+    List<Map<String, String>>? percentageSplits,
     bool repeatMonthly = false,
   }) async {
     final ok = await _runMutation(() => _repository.addExpense(
@@ -1157,6 +1273,7 @@ class AppState extends ChangeNotifier {
           splitType: splitType,
           splits: splits,
           splitMembers: splitMembers,
+          percentageSplits: percentageSplits,
           actorUid: currentUid,
         ));
     if (ok) {
@@ -1173,7 +1290,11 @@ class AppState extends ChangeNotifier {
     if (ok && repeatMonthly) {
       final members = splitType == 'custom'
           ? (splits ?? []).map((s) => s['member_id']!).toList()
-          : (splitMembers ?? this.members.map((m) => m.id).toList());
+          : splitType == 'percentage'
+              ? (percentageSplits ?? [])
+                  .map((s) => s['member_id']!)
+                  .toList()
+              : (splitMembers ?? this.members.map((m) => m.id).toList());
       await _runMutation(() => _repository.createFixedExpense(
             groupId: _groupOrUnavailable,
             title: title,
@@ -1183,6 +1304,153 @@ class AppState extends ChangeNotifier {
             splitMemberIds: members,
             actorUid: currentUid,
           ));
+    }
+    return ok;
+  }
+
+  /// Adds an expense with a receipt photo attached: creates the
+  /// expense first (so the Storage path can use its id), uploads the
+  /// photo to `receipts/{groupId}/{expenseId}/`, then attaches the
+  /// URL/path to the expense. The expense is saved even when the
+  /// upload fails — then [errorMessage] says the receipt could not
+  /// be uploaded, so the failure is visible, never silent.
+  Future<bool> addExpenseWithReceipt({
+    required String title,
+    required String category,
+    required String date,
+    required String amount,
+    required String payerId,
+    required String splitType,
+    List<Map<String, String>>? splits,
+    List<String>? splitMembers,
+    List<Map<String, String>>? percentageSplits,
+    required XFile receiptImage,
+  }) async {
+    if (isBusy) return false;
+    isBusy = true;
+    errorMessage = null;
+    notifyListeners();
+    try {
+      final gid = _groupOrUnavailable;
+      final record = await _repository.addExpense(
+        groupId: gid,
+        title: title,
+        category: category,
+        date: date,
+        amount: amount,
+        payerId: payerId,
+        splitType: splitType,
+        splits: splits,
+        splitMembers: splitMembers,
+        percentageSplits: percentageSplits,
+        actorUid: currentUid,
+      );
+      var receiptAttached = false;
+      try {
+        final bytes = await receiptImage.readAsBytes();
+        final uploaded = await _repository.uploadReceipt(
+          groupId: gid,
+          expenseId: record.id,
+          bytes: bytes,
+        );
+        if (uploaded != null) {
+          await _repository.updateExpense(
+            groupId: gid,
+            id: record.id,
+            receiptUrl: uploaded.url,
+            receiptPath: uploaded.path,
+            actorUid: currentUid,
+          );
+          receiptAttached = true;
+        }
+      } catch (_) {
+        receiptAttached = false;
+      }
+      await refresh();
+      _logActivity(
+        type: 'expense',
+        title: 'Expense: $title',
+        amount: amount,
+        memberId: payerId,
+        detail: category,
+      );
+      if (!receiptAttached) {
+        errorMessage =
+            'Expense saved, but the receipt photo could not be uploaded.';
+        notifyListeners();
+      }
+      return true;
+    } on CloudDataException catch (e) {
+      errorMessage = e.message;
+      return false;
+    } catch (_) {
+      errorMessage = 'Something went wrong. Please try again.';
+      return false;
+    } finally {
+      isBusy = false;
+      notifyListeners();
+    }
+  }
+
+  /// Edits one expense (title, category, date, amount, payer and/or
+  /// split). The repository recomputes the splits, so the
+  /// integer-paisa invariant always holds after an edit. Only the
+  /// payer/creator or an owner/admin may edit — the repository
+  /// enforces it and a rejection surfaces as [errorMessage].
+  Future<bool> updateExpense({
+    required String id,
+    String? title,
+    String? category,
+    String? date,
+    String? amount,
+    String? payerId,
+    String? splitType,
+    List<Map<String, String>>? splits,
+    List<String>? splitMembers,
+    List<Map<String, String>>? percentageSplits,
+  }) async {
+    final ok = await _runMutation(() => _repository.updateExpense(
+          groupId: _groupOrUnavailable,
+          id: id,
+          title: title,
+          category: category,
+          date: date,
+          amount: amount,
+          payerId: payerId,
+          splitType: splitType,
+          splits: splits,
+          splitMembers: splitMembers,
+          percentageSplits: percentageSplits,
+          actorUid: currentUid,
+        ));
+    if (ok) {
+      _logActivity(
+        type: 'expense_edited',
+        title: 'Expense edited: ${title ?? ''}',
+        amount: amount ?? '0.00',
+        memberId: payerId ?? loggedInMemberId ?? '',
+        detail: category ?? '',
+      );
+    }
+    return ok;
+  }
+
+  /// Deletes one expense (after the UI's confirmation dialog). Only
+  /// the payer/creator or an owner/admin may delete.
+  Future<bool> deleteExpense(ExpenseRecord expense) async {
+    final ok = await _runMutation(() => _repository.deleteExpense(
+          groupId: _groupOrUnavailable,
+          id: expense.id,
+          actorUid: currentUid,
+        ));
+    if (ok) {
+      _logActivity(
+        type: 'expense_deleted',
+        title: 'Expense deleted: ${expense.title}',
+        amount: expense.amount,
+        memberId: expense.payerId,
+        detail: expense.category,
+      );
     }
     return ok;
   }
@@ -1309,13 +1577,58 @@ class AppState extends ChangeNotifier {
   /// Verifies a recorded payment (recorded → verified). Only an
   /// owner/admin can do this — on the real database the rules
   /// enforce it and a rejection surfaces as the plain cloud message.
-  Future<bool> verifyPayment(String paymentId) => _runMutation(
-        () => _repository.verifyPayment(
-          groupId: _groupOrUnavailable,
-          paymentId: paymentId,
-          actorUid: currentUid,
-        ),
+  /// Writes an activity entry on success.
+  Future<bool> verifyPayment(String paymentId) async {
+    final ok = await _runMutation(
+      () => _repository.verifyPayment(
+        groupId: _groupOrUnavailable,
+        paymentId: paymentId,
+        actorUid: currentUid,
+      ),
+    );
+    if (ok) {
+      final p =
+          payments.where((v) => v.id == paymentId).firstOrNull;
+      _logActivity(
+        type: 'payment_verified',
+        title: 'Payment verified',
+        amount: p?.amount ?? '0.00',
+        memberId: p?.senderId ?? '',
+        detail: p == null
+            ? ''
+            : '${p.senderId} → ${p.recipientId}',
       );
+    }
+    return ok;
+  }
+
+  /// Rejects a recorded payment (recorded → rejected). Only an
+  /// owner/admin can do this. A rejected payment counts nowhere in
+  /// any balance; the sender records a new payment to correct it.
+  /// Writes an activity entry on success.
+  Future<bool> rejectPayment(String paymentId) async {
+    final ok = await _runMutation(
+      () => _repository.rejectPayment(
+        groupId: _groupOrUnavailable,
+        paymentId: paymentId,
+        actorUid: currentUid,
+      ),
+    );
+    if (ok) {
+      final p =
+          payments.where((v) => v.id == paymentId).firstOrNull;
+      _logActivity(
+        type: 'payment_rejected',
+        title: 'Payment rejected',
+        amount: p?.amount ?? '0.00',
+        memberId: p?.senderId ?? '',
+        detail: p == null
+            ? ''
+            : '${p.senderId} → ${p.recipientId}',
+      );
+    }
+    return ok;
+  }
 
   // ---- Shared households + invitations (Phase 4) ----
 

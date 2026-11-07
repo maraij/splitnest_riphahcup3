@@ -586,6 +586,23 @@ void main() {
         () async {
       final repo = FakeSplitNestRepository.benchmark();
       const gid = FakeSplitNestRepository.groupId;
+      // Verification is owner/admin-only (Phase 5): establish the
+      // actor's role first — the first ensureGroup caller owns the
+      // group, a later caller joins as a plain member.
+      await repo.ensureGroup(
+        uid: 'demo-M01',
+        displayName: 'Ali',
+        email: 'ali.demo@splitnest.app',
+        legacyMemberId: 'M01',
+        isDemo: true,
+      );
+      await repo.ensureGroup(
+        uid: 'demo-M02',
+        displayName: 'Ayesha',
+        email: 'ayesha.demo@splitnest.app',
+        legacyMemberId: 'M02',
+        isDemo: true,
+      );
       final payment = await repo.recordPayment(
         groupId: gid,
         senderId: 'M02',
@@ -594,6 +611,15 @@ void main() {
         actorUid: 'demo-M02',
       );
       expect(payment.status, 'recorded');
+      // A plain member may record but never verify.
+      await expectLater(
+        repo.verifyPayment(
+          groupId: gid,
+          paymentId: payment.id,
+          actorUid: 'demo-M02',
+        ),
+        throwsA(isA<CloudDataException>()),
+      );
       var balances = computeBalances(
         expenses: await repo.getExpenses(gid),
         payments: await repo.getPayments(gid),

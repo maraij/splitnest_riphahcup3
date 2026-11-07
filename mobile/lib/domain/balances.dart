@@ -52,6 +52,9 @@ Balances computeBalances({
     }
   }
   for (final p in payments) {
+    // A rejected payment counts nowhere in any balance — the
+    // sender's way to correct it is to record a new payment.
+    if (p.status == 'rejected') continue;
     final amount = parsePaisa(p.amount) ?? 0;
     sent[p.senderId] = (sent[p.senderId] ?? 0) + amount;
     received[p.recipientId] = (received[p.recipientId] ?? 0) + amount;

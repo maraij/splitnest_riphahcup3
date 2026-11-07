@@ -25,7 +25,19 @@ class ProfileScreen extends StatelessWidget {
       );
       if (picked == null) return;
       final bytes = await picked.readAsBytes();
-      await state.setProfileImage(bytes);
+      // Returns false when only the local copy was saved (the
+      // backend upload failed) — the photo still shows, and the
+      // user is told plainly instead of the failure being silent.
+      final uploaded = await state.setProfileImage(bytes);
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(uploaded
+                ? 'Photo updated.'
+                : 'Photo saved on this device — upload unavailable right now.'),
+          ),
+        );
+      }
     } catch (_) {
       if (context.mounted) {
         ScaffoldMessenger.of(context).showSnackBar(

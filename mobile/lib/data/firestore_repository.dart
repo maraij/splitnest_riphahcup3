@@ -1,10 +1,13 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/foundation.dart';
 
 import '../core/money.dart';
 import '../domain/balances.dart';
+import '../domain/expense_auth.dart';
 import '../domain/invitations.dart';
 import '../domain/models.dart';
+import '../domain/payment_tracking.dart';
 import 'demo_benchmark.dart';
 import 'repository.dart';
 
@@ -110,6 +113,9 @@ ExpenseRecord expenseRecordFromData(
             ))
         .toList(),
     isDemo: data['isDemoData'] == true,
+    createdByUid: data['createdBy'] as String?,
+    receiptUrl: data['receiptUrl'] as String?,
+    receiptPath: data['receiptPath'] as String?,
   );
 }
 
@@ -120,6 +126,8 @@ PaymentRecord paymentRecordFromData(
   String Function(String key) memberIdForKey,
 ) {
   final createdAt = data['createdAt'];
+  final verifiedAt = data['verifiedAt'];
+  final rejectedAt = data['rejectedAt'];
   return PaymentRecord(
     id: id,
     senderId: memberIdForKey(data['fromUid'] as String? ?? ''),
@@ -127,6 +135,9 @@ PaymentRecord paymentRecordFromData(
     amount: formatPaisa((data['amountPaisa'] as num?)?.toInt() ?? 0),
     status: data['status'] as String? ?? 'recorded',
     verifiedBy: data['verifiedBy'] as String?,
+    verifiedAt: verifiedAt is Timestamp ? verifiedAt.toDate() : null,
+    rejectedBy: data['rejectedBy'] as String?,
+    rejectedAt: rejectedAt is Timestamp ? rejectedAt.toDate() : null,
     createdAt: createdAt is Timestamp ? createdAt.toDate() : null,
   );
 }
@@ -219,8 +230,9 @@ ActivityEntry activityEntryFromData(Map<String, dynamic> data) {
 /// membership — the failure surfaces as the plain cloud-unavailable
 /// message, never as fake data).
 class FirestoreSplitNestRepository implements SplitNestRepository {
-  FirestoreSplitNestRepository({FirebaseFirestore? firestore}) {
+  FirestoreSplitNestRepository({FirebaseFirestore? firestore, FirebaseStorage? storage}) {
     _firestore = firestore;
+    _storageOverride = storage;
   }
 
   FirebaseFirestore? _firestore;
@@ -386,6 +398,7 @@ class FirestoreSplitNestRepository implements SplitNestRepository {
           members.add(Member(
             id: legacy,
             name: data['displayName'] as String? ?? legacy,
+            photoUrl: data['photoUrl'] as String?,
           ));
         }
         members.sort((a, b) => a.id.compareTo(b.id));
@@ -613,6 +626,7 @@ class FirestoreSplitNestRepository implements SplitNestRepository {
     required String splitType,
     List<Map<String, String>>? splits,
     List<String>? splitMembers,
+    List<Map<String, String>>? percentageSplits,
     required String actorUid,
   }) =>
       _guard(() async {
@@ -637,6 +651,7 @@ class FirestoreSplitNestRepository implements SplitNestRepository {
           splitType: splitType,
           splits: splits,
           splitMembers: splitMembers,
+          percentageSplits: percentageSplits,
           knownMembers: known,
         );
         final ref = await _sub(groupId, 'expenses').add(
@@ -667,8 +682,277 @@ class FirestoreSplitNestRepository implements SplitNestRepository {
                     amount: formatPaisa(s.amountPaisa),
                   ))
               .toList(),
+          createdByUid: actorUid,
         );
       });
+
+  /// Authorisation for an expense edit/delete: the actor is the
+  /// expense's creator (or payer, via the stored key) or a group
+  /// owner/admin. Mirrors domain/expense_auth.dart. NOTE: this is
+  /// enforced here and in the UI, but `firestore.rules` still
+  /// allows expense update/delete by owner/admin ONLY — on a live
+  /// Firebase DB a creator edit/delete would be denied until the
+  /// rules gain the creator branch. That rules change is pending
+  /// the backend-store decision and was deliberately NOT made here.
+  Future<void> _requireExpenseEditAllowed({
+    required String groupId,
+    required Map<String, dynamic> data,
+    required String actorUid,
+  }) async {
+    final createdBy = data['createdBy'] as String?;
+    final paidBy = data['paidBy'] as String?;
+    String? role;
+    try {
+      role = await _roleInGroup(groupId, actorUid);
+    } catch (_) {
+      role = null;
+    }
+    final allowed = canEditExpense(
+      isAdmin: role == 'owner' || role == 'admin',
+      actorUid: actorUid,
+      actorMemberId: _memberFor(actorUid),
+      createdByUid: createdBy,
+      payerMemberId: _memberFor(paidBy ?? ''),
+    );
+    if (!allowed) {
+      throw const CloudDataException(
+          'Only the member who added this expense (or the household '
+          'owner/admin) can change or delete it.');
+    }
+  }
+
+  @override
+  Future<ExpenseRecord> updateExpense({
+    required String groupId,
+    required String id,
+    String? title,
+    String? category,
+    String? date,
+    String? amount,
+    String? payerId,
+    String? splitType,
+    List<Map<String, String>>? splits,
+    List<String>? splitMembers,
+    List<Map<String, String>>? percentageSplits,
+    String? receiptUrl,
+    String? receiptPath,
+    required String actorUid,
+  }) =>
+      _guard(() async {
+        final ref = _sub(groupId, 'expenses').doc(id);
+        final snap = await ref.get();
+        final data = snap.data();
+        if (data == null) {
+          throw const CloudDataException('Expense not found.');
+        }
+        await _requireExpenseEditAllowed(
+          groupId: groupId,
+          data: data,
+          actorUid: actorUid,
+        );
+        final members = await getMembers(groupId);
+        final known = members.map((m) => m.id).toList();
+        final newTitle = title?.trim() ?? data['title'] as String? ?? '';
+        if (newTitle.isEmpty) {
+          throw const CloudDataException('Title is required.');
+        }
+        final newAmountPaisa = amount == null
+            ? (data['amountPaisa'] as num?)?.toInt() ?? 0
+            : parsePaisa(amount);
+        if (newAmountPaisa == null || newAmountPaisa <= 0) {
+          throw const CloudDataException(
+              'Amount must be a positive amount.');
+        }
+        final newDate = date ?? () {
+          final d = data['expenseDate'];
+          return d is Timestamp ? dateStringFromTimestamp(d) : null;
+        }();
+        if (newDate == null ||
+            !RegExp(r'^\d{4}-\d{2}-\d{2}$').hasMatch(newDate)) {
+          throw const CloudDataException('Date must be YYYY-MM-DD.');
+        }
+        final newPayerId = payerId ?? _memberFor(data['paidBy'] as String? ?? '');
+        if (!known.contains(newPayerId)) {
+          throw CloudDataException('Payer $newPayerId does not exist.');
+        }
+        final newSplitType = splitType ?? data['splitType'] as String? ?? 'equal';
+        // Splits are recomputed from the new values, so the
+        // integer-paisa invariant always holds after an edit. When
+        // the caller passes no split at all, the stored splits are
+        // re-derived: equal → same member set, custom/percentage →
+        // the stored shares (already validated when created).
+        List<({String memberId, int amountPaisa})> shares;
+        if (splitType != null ||
+            splits != null ||
+            splitMembers != null ||
+            percentageSplits != null) {
+          shares = validatedShares(
+            amountPaisa: newAmountPaisa,
+            splitType: newSplitType,
+            splits: splits,
+            splitMembers: splitMembers,
+            percentageSplits: percentageSplits,
+            knownMembers: known,
+          );
+        } else if (newSplitType == 'equal') {
+          final stored = data['splits'] as Map<String, dynamic>? ?? {};
+          shares = validatedShares(
+            amountPaisa: newAmountPaisa,
+            splitType: 'equal',
+            splitMembers:
+                stored.keys.map(_memberFor).toList()..sort(),
+            knownMembers: known,
+          );
+        } else {
+          final stored = data['splits'] as Map<String, dynamic>? ?? {};
+          final storedShares = stored.entries
+              .map((e) => ExpenseShare(
+                    memberId: _memberFor(e.key),
+                    amount: formatPaisa((e.value as num).toInt()),
+                  ))
+              .toList();
+          // Amount unchanged + stored custom/percentage shares:
+          // they already sum to the old amount, which equals the
+          // new one here (amount changes with a split change go
+          // through validatedShares above). Re-validate the sum so
+          // a corrupt stored doc can never be re-saved as-is.
+          final sum = storedShares.fold(
+              0, (s, sh) => s + (parsePaisa(sh.amount) ?? 0));
+          if (sum != newAmountPaisa) {
+            throw CloudDataException(
+                'Stored shares sum to ${formatPaisa(sum)} but the amount '
+                'is ${formatPaisa(newAmountPaisa)} — re-enter the split.');
+          }
+          shares = storedShares
+              .map((sh) => (
+                    memberId: sh.memberId,
+                    amountPaisa: parsePaisa(sh.amount) ?? 0,
+                  ))
+              .toList();
+        }
+        final updates = <String, Object?>{
+          'title': newTitle,
+          'category': category?.trim().isEmpty ?? true
+              ? data['category'] as String? ?? 'General'
+              : category!.trim(),
+          'amountPaisa': newAmountPaisa,
+          'expenseDate': timestampFromDateString(newDate),
+          'paidBy': _keyFor(newPayerId),
+          'splitType': newSplitType,
+          'splits': {
+            for (final s in shares) _keyFor(s.memberId): s.amountPaisa,
+          },
+          'updatedAt': Timestamp.now(),
+        };
+        if (receiptUrl != null) updates['receiptUrl'] = receiptUrl;
+        if (receiptPath != null) updates['receiptPath'] = receiptPath;
+        await ref.update(updates);
+        final fresh = await ref.get();
+        return expenseRecordFromData(id, fresh.data() ?? {}, _memberFor);
+      });
+
+  @override
+  Future<void> deleteExpense({
+    required String groupId,
+    required String id,
+    required String actorUid,
+  }) =>
+      _guard(() async {
+        final ref = _sub(groupId, 'expenses').doc(id);
+        final snap = await ref.get();
+        final data = snap.data();
+        if (data == null) {
+          throw const CloudDataException('Expense not found.');
+        }
+        await _requireExpenseEditAllowed(
+          groupId: groupId,
+          data: data,
+          actorUid: actorUid,
+        );
+        await ref.delete();
+      });
+
+  @override
+  Future<void> setUserPhotoUrl({
+    required String groupId,
+    required String uid,
+    required String photoUrl,
+  }) async {
+    // Best-effort mirror update: the members-mirror doc is keyed by
+    // UID for joined members but by legacy id for roster entries
+    // that never signed in — a miss there is not a failure, and the
+    // users-doc write below is the durable record.
+    try {
+      await _store.collection('users').doc(uid).set({
+        'photoUrl': photoUrl,
+        'updatedAt': Timestamp.now(),
+      }, SetOptions(merge: true));
+    } catch (e) {
+      debugPrint('SplitNest: user photoUrl skipped ($e)');
+    }
+    try {
+      await _sub(groupId, 'members').doc(uid).set({
+        'photoUrl': photoUrl,
+      }, SetOptions(merge: true));
+    } catch (e) {
+      debugPrint('SplitNest: member mirror photoUrl skipped ($e)');
+    }
+  }
+
+  // ---- File uploads (Phase 5) ----
+  // The Storage implementation behind the repository interface:
+  // widgets and AppState only ever call the interface methods, so a
+  // local-store implementation can replace these without touching
+  // any screen. Storage is resolved lazily (see _storage) so
+  // building this repository never touches Firebase.
+
+  FirebaseStorage? _storageOverride;
+  FirebaseStorage get _storage =>
+      _storageOverride ?? FirebaseStorage.instance;
+
+  static const int _maxReceiptBytes = 10 * 1024 * 1024;
+  static const int _maxProfilePhotoBytes = 5 * 1024 * 1024;
+
+  @override
+  Future<({String url, String path})?> uploadReceipt({
+    required String groupId,
+    required String expenseId,
+    required Uint8List bytes,
+  }) async {
+    if (bytes.length > _maxReceiptBytes) return null;
+    final path = 'receipts/$groupId/$expenseId/receipt.jpg';
+    try {
+      final ref = _storage.ref(path);
+      await ref.putData(
+        bytes,
+        SettableMetadata(contentType: 'image/jpeg'),
+      );
+      return (url: await ref.getDownloadURL(), path: path);
+    } catch (e) {
+      debugPrint('SplitNest: receipt upload failed ($e)');
+      return null;
+    }
+  }
+
+  @override
+  Future<String?> uploadProfilePhoto({
+    required String uid,
+    required Uint8List bytes,
+  }) async {
+    if (bytes.length > _maxProfilePhotoBytes) return null;
+    final path = 'profile-photos/$uid/photo.jpg';
+    try {
+      final ref = _storage.ref(path);
+      await ref.putData(
+        bytes,
+        SettableMetadata(contentType: 'image/jpeg'),
+      );
+      return await ref.getDownloadURL();
+    } catch (e) {
+      debugPrint('SplitNest: profile photo upload failed ($e)');
+      return null;
+    }
+  }
 
   @override
   Future<PaymentRecord> recordPayment({
@@ -735,19 +1019,58 @@ class FirestoreSplitNestRepository implements SplitNestRepository {
         if (data == null) {
           throw const CloudDataException('Payment not found.');
         }
-        if (data['status'] != 'recorded') {
-          throw const CloudDataException(
-              'This payment is already verified.');
-        }
+        final role = await _roleInGroup(groupId, actorUid);
+        final error = paymentStatusTransitionError(
+          current: data['status'] as String? ?? 'recorded',
+          target: 'verified',
+          isAdmin: role == 'owner' || role == 'admin',
+        );
+        if (error != null) throw CloudDataException(error);
+        final verifiedAt = Timestamp.now();
         await ref.update({
           'status': 'verified',
           'verifiedBy': actorUid,
-          'verifiedAt': Timestamp.now(),
+          'verifiedAt': verifiedAt,
         });
         return paymentRecordFromData(paymentId, {
           ...data,
           'status': 'verified',
           'verifiedBy': actorUid,
+          'verifiedAt': verifiedAt,
+        }, _memberFor);
+      });
+
+  @override
+  Future<PaymentRecord> rejectPayment({
+    required String groupId,
+    required String paymentId,
+    required String actorUid,
+  }) =>
+      _guard(() async {
+        final ref = _sub(groupId, 'payments').doc(paymentId);
+        final snap = await ref.get();
+        final data = snap.data();
+        if (data == null) {
+          throw const CloudDataException('Payment not found.');
+        }
+        final role = await _roleInGroup(groupId, actorUid);
+        final error = paymentStatusTransitionError(
+          current: data['status'] as String? ?? 'recorded',
+          target: 'rejected',
+          isAdmin: role == 'owner' || role == 'admin',
+        );
+        if (error != null) throw CloudDataException(error);
+        final rejectedAt = Timestamp.now();
+        await ref.update({
+          'status': 'rejected',
+          'rejectedBy': actorUid,
+          'rejectedAt': rejectedAt,
+        });
+        return paymentRecordFromData(paymentId, {
+          ...data,
+          'status': 'rejected',
+          'rejectedBy': actorUid,
+          'rejectedAt': rejectedAt,
         }, _memberFor);
       });
 

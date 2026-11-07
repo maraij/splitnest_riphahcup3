@@ -3,6 +3,8 @@ import 'package:provider/provider.dart';
 
 import '../../core/format.dart';
 import '../../core/money.dart';
+import '../../domain/models.dart';
+import '../../domain/payment_tracking.dart';
 import '../../domain/settle_plan.dart';
 import '../../state/app_state.dart';
 import '../../core/theme.dart';
@@ -172,11 +174,25 @@ class SettleScreen extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 16),
+          // Per-member payment tracking (Phase 5): total owed / paid,
+          // remaining settled balance and status, monthly
+          // contribution, and each member's payment history. The
+          // settled balance counts VERIFIED payments only; recorded
+          // payments are shown as pending below and never as settled.
+          const Text('Payment tracking',
+              style: SplitNestTheme.sectionStyle),
+          const SizedBox(height: 8),
+          ...state.paymentSummaries.map(
+            (s) => _MemberPaymentCard(summary: s, state: state),
+          ),
+          const SizedBox(height: 16),
           // Payments recorded but not yet verified. A recorded
-          // payment already counts in the balances above; verification
-          // is the owner/admin confirming it happened. Tapping
-          // Verify flips recorded → verified (the rules enforce that
-          // only an owner/admin can).
+          // payment is shown as pending — it counts in the balances
+          // above only as a ledger preview, never as confirmed.
+          // Verify / Reject are owner/admin only (the buttons are
+          // hidden for plain members; the repository enforces it
+          // again — and the rules enforce Verify; the Reject branch
+          // is a pending rules change, see the report).
           if (state.pendingPayments.isNotEmpty) ...[
             const Text('Pending verification',
                 style: SplitNestTheme.sectionStyle),
@@ -186,14 +202,21 @@ class SettleScreen extends StatelessWidget {
               child: Card(
                 child: Column(
                   children: [
+                    if (!state.canVerifyPayments)
+                      const ListTile(
+                        leading: Icon(Icons.info_outline),
+                        title: Text(
+                          'Only the household owner or an admin can '
+                          'verify or reject a payment.',
+                        ),
+                      ),
                     ...state.pendingPayments.map((p) => ListTile(
                           leading: const Icon(Icons.hourglass_top),
                           title: Text(
                             '${memberName(state.members, p.senderId)} → '
                             '${memberName(state.members, p.recipientId)}',
                           ),
-                          subtitle: const Text(
-                              'Recorded — waiting for verification'),
+                          subtitle: Text(paymentStatusLabel(p.status)),
                           trailing: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
@@ -201,12 +224,20 @@ class SettleScreen extends StatelessWidget {
                                   style: SplitNestTheme.bodyStyle
                                       .copyWith(fontWeight: FontWeight.w700)),
                               const SizedBox(width: 8),
-                              TextButton(
-                                onPressed: state.isBusy
-                                    ? null
-                                    : () => state.verifyPayment(p.id),
-                                child: const Text('Verify'),
-                              ),
+                              if (state.canVerifyPayments) ...[
+                                TextButton(
+                                  onPressed: state.isBusy
+                                      ? null
+                                      : () => state.verifyPayment(p.id),
+                                  child: const Text('Verify'),
+                                ),
+                                TextButton(
+                                  onPressed: state.isBusy
+                                      ? null
+                                      : () => _rejectPayment(context, state, p),
+                                  child: const Text('Reject'),
+                                ),
+                              ],
                             ],
                           ),
                         )),
@@ -216,6 +247,232 @@ class SettleScreen extends StatelessWidget {
             ),
             const SizedBox(height: 16),
           ],
+          // Verified payments: confirmed, with who verified them.
+          // Rejected payments: visible, explicitly NOT counted as
+          // settled — the sender records a new payment to correct
+          // one. Neither list is ever shown as the other.
+          if (state.verifiedPayments.isNotEmpty) ...[
+            const Text('Verified payments',
+                style: SplitNestTheme.sectionStyle),
+            const SizedBox(height: 8),
+            Card(
+              child: Column(
+                children: [
+                  ...state.verifiedPayments.map((p) => ListTile(
+                        leading: const Icon(Icons.verified_outlined),
+                        title: Text(
+                          '${memberName(state.members, p.senderId)} → '
+                          '${memberName(state.members, p.recipientId)}',
+                        ),
+                        subtitle: Text(
+                          p.verifiedAt == null
+                              ? 'Verified'
+                              : 'Verified on ${formatDate(p.verifiedAt!)}',
+                        ),
+                        trailing: MoneyText(p.amount,
+                            style: SplitNestTheme.bodyStyle.copyWith(
+                                fontWeight: FontWeight.w700,
+                                color: colors.success)),
+                      )),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+          ],
+          if (state.rejectedPayments.isNotEmpty) ...[
+            const Text('Rejected payments',
+                style: SplitNestTheme.sectionStyle),
+            const SizedBox(height: 8),
+            Card(
+              child: Column(
+                children: [
+                  ...state.rejectedPayments.map((p) => ListTile(
+                        leading: const Icon(Icons.cancel_outlined),
+                        title: Text(
+                          '${memberName(state.members, p.senderId)} → '
+                          '${memberName(state.members, p.recipientId)}',
+                        ),
+                        subtitle:
+                            Text(paymentStatusLabel(p.status)),
+                        trailing: MoneyText(p.amount,
+                            style: SplitNestTheme.bodyStyle.copyWith(
+                                fontWeight: FontWeight.w700,
+                                color: colors.error)),
+                      )),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+/// Confirms a rejection: a rejected payment counts nowhere, and the
+/// sender's way to correct it is to record a new payment.
+Future<void> _rejectPayment(
+    BuildContext context, AppState state, PaymentRecord p) async {
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: const Text('Reject this payment?'),
+      content: Text(
+        '${memberName(state.members, p.senderId)} → '
+        '${memberName(state.members, p.recipientId)} · PKR ${p.amount}\n\n'
+        'A rejected payment is not counted as settled. The sender '
+        'can record a new, corrected payment.',
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(ctx).pop(false),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(ctx).pop(true),
+          child: const Text('Reject'),
+        ),
+      ],
+    ),
+  );
+  if (ok == true && context.mounted) {
+    await state.rejectPayment(p.id);
+  }
+}
+
+/// One member's payment tracking: owed / paid / remaining (verified
+/// only) / status / monthly contribution / pending amount, plus
+/// their payment history with honest status labels.
+class _MemberPaymentCard extends StatelessWidget {
+  const _MemberPaymentCard({required this.summary, required this.state});
+  final MemberPaymentSummary summary;
+  final AppState state;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = StatusColors.of(context);
+    final s = summary;
+    final statusColor = s.status == 'settled'
+        ? colors.success
+        : s.status == 'owes'
+            ? colors.error
+            : colors.success;
+    final statusLabel = s.status == 'settled'
+        ? 'Settled'
+        : s.status == 'owes'
+            ? 'Owes'
+            : 'Is owed';
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                MemberAvatar(
+                    memberId: s.member.id, name: s.member.name),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    s.member.name,
+                    style: SplitNestTheme.sectionStyle,
+                  ),
+                ),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 10, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: statusColor.withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Text(
+                    statusLabel,
+                    style: SplitNestTheme.bodyStyle.copyWith(
+                      fontWeight: FontWeight.w700,
+                      color: statusColor,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            _PayRow(
+                label: 'Total owed (share)',
+                value: 'PKR ${formatPaisa(s.totalOwedPaisa)}'),
+            _PayRow(
+                label: 'Total paid (expenses)',
+                value: 'PKR ${formatPaisa(s.totalPaidPaisa)}'),
+            _PayRow(
+                label: 'Remaining (verified only)',
+                value: 'PKR ${formatPaisa(s.remainingPaisa)}'),
+            _PayRow(
+                label: 'Monthly contribution',
+                value:
+                    'PKR ${formatPaisa(s.monthlyContributionPaisa)}'),
+            if (s.hasPending)
+              _PayRow(
+                label: 'Pending (recorded, not verified)',
+                value:
+                    'Sent PKR ${formatPaisa(s.sentPendingPaisa)} · '
+                    'Received PKR ${formatPaisa(s.receivedPendingPaisa)}',
+              ),
+            if (s.payments.isEmpty)
+              const Padding(
+                padding: EdgeInsets.only(top: 8),
+                child: Text(
+                  'No payments recorded yet',
+                  style: SplitNestTheme.supportingStyle,
+                ),
+              )
+            else
+              ...s.payments.map((p) => Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            p.senderId == s.member.id
+                                ? 'Sent to ${memberName(state.members, p.recipientId)}'
+                                : 'Received from ${memberName(state.members, p.senderId)}',
+                            style: SplitNestTheme.bodyStyle,
+                          ),
+                        ),
+                        MoneyText(p.amount,
+                            style: SplitNestTheme.bodyStyle.copyWith(
+                                fontWeight: FontWeight.w700)),
+                        const SizedBox(width: 8),
+                        Text(
+                          paymentStatusLabel(p.status),
+                          style: SplitNestTheme.supportingStyle,
+                        ),
+                      ],
+                    ),
+                  )),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _PayRow extends StatelessWidget {
+  const _PayRow({required this.label, required this.value});
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 4),
+      child: Row(
+        children: [
+          Expanded(
+              child: Text(label, style: SplitNestTheme.supportingStyle)),
+          Text(value,
+              style: SplitNestTheme.bodyStyle
+                  .copyWith(fontWeight: FontWeight.w700)),
         ],
       ),
     );

@@ -1,9 +1,12 @@
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:provider/provider.dart';
 
 import '../../core/constants.dart';
 import '../../domain/insights.dart';
 import '../../domain/models.dart';
+import '../../domain/percentage_split.dart';
+import '../../domain/qr_payload.dart';
 import '../../core/format.dart';
 import '../../core/money.dart';
 import '../../state/app_state.dart';
@@ -13,6 +16,8 @@ import '../../core/widgets/error_banner.dart';
 import '../../core/widgets/illustrations.dart';
 import '../../core/widgets/member_avatar.dart';
 import '../../core/widgets/money_text.dart';
+import 'qr_scan_screen.dart';
+import 'verify_receipt_sheet.dart';
 
 /// Expenses tab: the group's recorded expense history (loaded from
 /// Firestore — it persists across reloads) + an Add New Expense
@@ -72,6 +77,39 @@ class _ExpensesScreenState extends State<ExpensesScreen> {
     if (ok && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Added ${fav.title} — PKR ${fav.amount}.')),
+      );
+    }
+  }
+
+  /// Deletes [expense] after an explicit confirmation. Only the
+  /// payer/creator or an owner/admin ever sees the button (gated
+  /// below); the repository enforces it again.
+  Future<void> _deleteExpense(AppState state, ExpenseRecord e) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Delete ${e.title}?'),
+        content: Text(
+          'This removes the PKR ${e.amount} expense and its split. '
+          'This cannot be undone.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    final done = await state.deleteExpense(e);
+    if (done && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Deleted ${e.title}.')),
       );
     }
   }
@@ -256,14 +294,44 @@ class _ExpensesScreenState extends State<ExpensesScreen> {
                       ),
                       if (e.shares.isNotEmpty)
                         Text(
-                          '${e.splitType == 'custom' ? 'Custom' : 'Equal'} split: ${e.shares.map((s) => '${memberName(state.members, s.memberId)} ${s.amount}').join(' · ')}',
+                          '${switch (e.splitType) { 'custom' => 'Custom', 'percentage' => 'Percentage', _ => 'Equal' }} split: ${e.shares.map((s) => '${memberName(state.members, s.memberId)} ${s.amount}').join(' · ')}',
+                          style: SplitNestTheme.supportingStyle,
+                        ),
+                      if (e.receiptUrl != null)
+                        const Text(
+                          'Receipt attached',
                           style: SplitNestTheme.supportingStyle,
                         ),
                     ],
                   ),
-                  trailing: MoneyText(e.amount,
-                      style: SplitNestTheme.bodyStyle
-                          .copyWith(fontWeight: FontWeight.w700)),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      MoneyText(e.amount,
+                          style: SplitNestTheme.bodyStyle
+                              .copyWith(fontWeight: FontWeight.w700)),
+                      // Edit/delete only for the payer/creator or an
+                      // owner/admin (AppState.mayEditExpense); the
+                      // repository + rules enforce it again.
+                      if (state.mayEditExpense(e)) ...[
+                        IconButton(
+                          icon: const Icon(Icons.edit_outlined, size: 20),
+                          tooltip: 'Edit expense',
+                          onPressed: state.isBusy
+                              ? null
+                              : () => _openAddExpense(context, state,
+                                  existing: e),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.delete_outline, size: 20),
+                          tooltip: 'Delete expense',
+                          onPressed: state.isBusy
+                              ? null
+                              : () => _deleteExpense(state, e),
+                        ),
+                      ],
+                    ],
+                  ),
                   isThreeLine: e.shares.isNotEmpty,
                 ),
               )),
@@ -509,7 +577,11 @@ class _FixedMonthlySection extends StatelessWidget {
   }
 }
 
-Future<void> _openAddExpense(BuildContext context, AppState state) async {
+Future<void> _openAddExpense(
+  BuildContext context,
+  AppState state, {
+  ExpenseRecord? existing,
+}) async {
   final ok = await showModalBottomSheet<bool>(
     context: context,
     isScrollControlled: true,
@@ -519,12 +591,14 @@ Future<void> _openAddExpense(BuildContext context, AppState state) async {
     // then never scroll the submit button into view.
     builder: (ctx) => SizedBox(
       height: MediaQuery.of(ctx).size.height * 0.9,
-      child: _AddExpenseSheet(state: state),
+      child: _AddExpenseSheet(state: state, existing: existing),
     ),
   );
   if (ok == true && context.mounted) {
-    ScaffoldMessenger.of(context)
-        .showSnackBar(const SnackBar(content: Text('Expense added.')));
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(
+          existing == null ? 'Expense added.' : 'Expense updated.'),
+    ));
   }
 }
 
@@ -537,8 +611,11 @@ Future<void> _openAddExpense(BuildContext context, AppState state) async {
 /// - Custom: enter an exact PKR amount per member; shares must sum
 ///   exactly to the total.
 class _AddExpenseSheet extends StatefulWidget {
-  const _AddExpenseSheet({required this.state});
+  const _AddExpenseSheet({required this.state, this.existing});
   final AppState state;
+
+  /// When set, the sheet edits this expense instead of adding one.
+  final ExpenseRecord? existing;
 
   @override
   State<_AddExpenseSheet> createState() => _AddExpenseSheetState();
@@ -554,7 +631,17 @@ class _AddExpenseSheetState extends State<_AddExpenseSheet> {
   bool _repeatMonthly = false;
   DateTime _date = DateTime.now();
   final Map<String, TextEditingController> _exact = {};
+  final Map<String, TextEditingController> _percent = {};
   final Set<String> _splitMembers = {};
+
+  /// Receipt photo picked via scan/upload, attached on save.
+  XFile? _receiptImage;
+  String? _receiptNote;
+
+  /// Percentage seed values (hundredths of a percent): from the
+  /// existing percentage split when editing one, otherwise an equal
+  /// split of 100%. Adjusted so they sum to exactly 10000.
+  late final Map<String, int> _percentSeed = _seedPercents();
   String? _titleError;
   String? _amountError;
   String? _formError;
@@ -562,13 +649,54 @@ class _AddExpenseSheetState extends State<_AddExpenseSheet> {
 
   AppState get state => widget.state;
 
+  Map<String, int> _seedPercents() {
+    final ids = state.members.map((m) => m.id).toList()..sort();
+    final ex = widget.existing;
+    if (ex != null && ex.splitType == 'percentage') {
+      final amountPaisa = parsePaisa(ex.amount) ?? 0;
+      final map = <String, int>{};
+      var sum = 0;
+      for (final id in ids) {
+        final share =
+            ex.shares.where((s) => s.memberId == id).firstOrNull;
+        final pct = (share == null || amountPaisa <= 0)
+            ? 0
+            : (parsePaisa(share.amount)! * 10000 ~/ amountPaisa);
+        map[id] = pct;
+        sum += pct;
+      }
+      if (ids.isNotEmpty) map[ids.first] = map[ids.first]! + (10000 - sum);
+      return map;
+    }
+    final base = ids.isEmpty ? 0 : 10000 ~/ ids.length;
+    final rem = ids.isEmpty ? 0 : 10000 - base * ids.length;
+    return {
+      for (var i = 0; i < ids.length; i++) ids[i]: base + (i < rem ? 1 : 0),
+    };
+  }
+
   @override
   void initState() {
     super.initState();
-    // Payer defaults to the logged-in member, so every screen agrees
-    // on who is acting — never a hardcoded member.
-    _payerId = state.activeMemberId;
-    _splitMembers.addAll(state.members.map((m) => m.id));
+    final ex = widget.existing;
+    if (ex != null) {
+      // Edit mode: prefill everything from the stored expense.
+      _title.text = ex.title;
+      _amount.text = ex.amount;
+      _category = ex.category;
+      _payerId = ex.payerId;
+      _splitType = ex.splitType ?? 'equal';
+      _date = DateTime.tryParse(ex.date ?? '') ?? _date;
+      _splitMembers.addAll(ex.shares.map((s) => s.memberId));
+      for (final s in ex.shares) {
+        _exact[s.memberId] = TextEditingController(text: s.amount);
+      }
+    } else {
+      // Payer defaults to the logged-in member, so every screen agrees
+      // on who is acting — never a hardcoded member.
+      _payerId = state.activeMemberId;
+      _splitMembers.addAll(state.members.map((m) => m.id));
+    }
   }
 
   @override
@@ -577,6 +705,9 @@ class _AddExpenseSheetState extends State<_AddExpenseSheet> {
     _amount.dispose();
     _receipt.dispose();
     for (final c in _exact.values) {
+      c.dispose();
+    }
+    for (final c in _percent.values) {
       c.dispose();
     }
     super.dispose();
@@ -604,12 +735,92 @@ class _AddExpenseSheetState extends State<_AddExpenseSheet> {
   TextEditingController _exactCtrl(String id) =>
       _exact.putIfAbsent(id, () => TextEditingController(text: '0.00'));
 
+  TextEditingController _percentCtrl(String id) => _percent.putIfAbsent(
+        id,
+        () => TextEditingController(
+            text: formatPercentHundredths(_percentSeed[id] ?? 0)),
+      );
+
   int _exactSum() {
     var sum = 0;
     for (final c in _exact.values) {
       sum += parsePaisa(c.text.trim()) ?? 0;
     }
     return sum;
+  }
+
+  /// Fills the form from verified scan fields (OCR receipt or QR
+  /// code) and remembers the receipt photo for upload on save.
+  void _applyVerified(
+    VerifiedExpenseFields confirmed, {
+    XFile? receiptImage,
+    String? receiptNote,
+  }) {
+    setState(() {
+      _title.text = confirmed.title;
+      _amount.text = confirmed.amount;
+      _category = confirmed.category;
+      _date = DateTime.tryParse(confirmed.date) ?? _date;
+      _receiptImage = receiptImage ?? _receiptImage;
+      _receiptNote = receiptNote;
+      _titleError = null;
+      _amountError = null;
+    });
+  }
+
+  /// Receipt photo (camera or gallery) → on-device OCR → the
+  /// verify-before-save sheet. When OCR could not run, the sheet
+  /// says so and the fields start empty for manual entry.
+  Future<void> _scanReceipt(ImageSource source) async {
+    final capture = await state.receiptService.pickAndRecognize(source);
+    if (capture == null || !mounted) return;
+    final parsed = capture.ocrText == null
+        ? null
+        : parseReceipt(capture.ocrText!);
+    final confirmed = await showExpenseVerifySheet(
+      context: context,
+      sourceLabel: !capture.ocrAvailable
+          ? 'Photo picked — text recognition is not available here.'
+          : parsed == null
+              ? 'The receipt photo was read, but no title or amount '
+                  'could be found in it. Check the details below.'
+              : 'Read from your receipt photo — check the details '
+                  'before saving.',
+      ocrText: capture.ocrText,
+      ocrAvailable: capture.ocrAvailable,
+      initialTitle: parsed?.title,
+      initialAmount: parsed?.amount.toStringAsFixed(2),
+      initialCategory: _category,
+      initialDate: parsed?.date,
+    );
+    if (confirmed == null || !mounted) return;
+    _applyVerified(
+      confirmed,
+      receiptImage: capture.file,
+      receiptNote:
+          'Receipt photo attached — it uploads when you save.',
+    );
+  }
+
+  /// QR code → parse → the same verify-before-save sheet as OCR.
+  Future<void> _scanQr() async {
+    final payload = await Navigator.of(context).push<QrExpensePayload>(
+      MaterialPageRoute(builder: (_) => const QrScanScreen()),
+    );
+    if (payload == null || !mounted) return;
+    final confirmed = await showExpenseVerifySheet(
+      context: context,
+      sourceLabel:
+          'Read from a SplitNest QR code — check the details before saving.',
+      initialTitle: payload.title,
+      initialAmount: formatPaisa(payload.amountPaisa),
+      initialCategory: payload.category,
+      initialDate: payload.date == null
+          ? null
+          : DateTime.tryParse(payload.date!),
+    );
+    if (confirmed == null || !mounted) return;
+    _applyVerified(confirmed);
   }
 
   Future<void> _submit() async {
@@ -625,6 +836,7 @@ class _AddExpenseSheetState extends State<_AddExpenseSheet> {
     if (_titleError != null || _amountError != null) return;
     List<Map<String, String>>? splits;
     List<String>? splitMembers;
+    List<Map<String, String>>? percentageSplits;
     if (_splitType == 'custom') {
       // Custom = exact per-member amounts; must sum exactly to the total.
       splits = [];
@@ -644,6 +856,34 @@ class _AddExpenseSheetState extends State<_AddExpenseSheet> {
             'Custom shares sum to PKR ${formatPaisa(sum)} but the amount is PKR ${formatPaisa(amountPaisa!)}.');
         return;
       }
+    } else if (_splitType == 'percentage') {
+      // Percentage = per-member percents; must sum to exactly 100.
+      final parsed = <({String memberId, int percentHundredths})>[];
+      for (final m in state.members) {
+        final pct =
+            parsePercentHundredths(_percentCtrl(m.id).text.trim());
+        if (pct == null) {
+          setState(() => _formError =
+              'Each percentage must be a number between 0 and 100.');
+          return;
+        }
+        parsed.add((memberId: m.id, percentHundredths: pct));
+      }
+      final error = percentageSplitError(
+        amountPaisa: amountPaisa,
+        shares: parsed,
+        knownMembers: state.members.map((m) => m.id).toList(),
+      );
+      if (error != null) {
+        setState(() => _formError = error);
+        return;
+      }
+      percentageSplits = parsed
+          .map((p) => {
+                'member_id': p.memberId,
+                'percent': formatPercentHundredths(p.percentHundredths),
+              })
+          .toList();
     } else {
       // Equal = split evenly among the picked members.
       if (_splitMembers.isEmpty) {
@@ -655,17 +895,48 @@ class _AddExpenseSheetState extends State<_AddExpenseSheet> {
     }
     final date =
         '${_date.year}-${_date.month.toString().padLeft(2, '0')}-${_date.day.toString().padLeft(2, '0')}';
-    final ok = await state.addExpense(
-          title: _title.text.trim(),
-          category: _category,
-          date: date,
-          amount: formatPaisa(amountPaisa!),
-          payerId: _payerId,
-          splitType: _splitType,
-          splits: splits,
-          splitMembers: splitMembers,
-          repeatMonthly: _repeatMonthly,
-        );
+    final existing = widget.existing;
+    bool ok;
+    if (existing != null) {
+      ok = await state.updateExpense(
+        id: existing.id,
+        title: _title.text.trim(),
+        category: _category,
+        date: date,
+        amount: formatPaisa(amountPaisa!),
+        payerId: _payerId,
+        splitType: _splitType,
+        splits: splits,
+        splitMembers: splitMembers,
+        percentageSplits: percentageSplits,
+      );
+    } else if (_receiptImage != null) {
+      ok = await state.addExpenseWithReceipt(
+        title: _title.text.trim(),
+        category: _category,
+        date: date,
+        amount: formatPaisa(amountPaisa!),
+        payerId: _payerId,
+        splitType: _splitType,
+        splits: splits,
+        splitMembers: splitMembers,
+        percentageSplits: percentageSplits,
+        receiptImage: _receiptImage!,
+      );
+    } else {
+      ok = await state.addExpense(
+        title: _title.text.trim(),
+        category: _category,
+        date: date,
+        amount: formatPaisa(amountPaisa!),
+        payerId: _payerId,
+        splitType: _splitType,
+        splits: splits,
+        splitMembers: splitMembers,
+        percentageSplits: percentageSplits,
+        repeatMonthly: _repeatMonthly,
+      );
+    }
     if (ok && mounted) Navigator.of(context).pop(true);
   }
 
@@ -696,7 +967,10 @@ class _AddExpenseSheetState extends State<_AddExpenseSheet> {
               ),
             ),
             const SizedBox(height: 12),
-            const Text('Add New Expense', style: SplitNestTheme.titleStyle),
+            Text(
+              widget.existing == null ? 'Add New Expense' : 'Edit Expense',
+              style: SplitNestTheme.titleStyle,
+            ),
             const SizedBox(height: 12),
             TextField(
               controller: _receipt,
@@ -725,6 +999,42 @@ class _AddExpenseSheetState extends State<_AddExpenseSheet> {
                 label: const Text('Parse receipt'),
               ),
             ),
+            const SizedBox(height: 8),
+            // Receipt photo (OCR) + QR scan: both feed the same
+            // verify-before-save sheet — nothing is saved straight
+            // from a scan.
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                OutlinedButton.icon(
+                  onPressed: state.isBusy
+                      ? null
+                      : () => _scanReceipt(ImageSource.camera),
+                  icon: const Icon(Icons.photo_camera_outlined),
+                  label: const Text('Scan receipt'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: state.isBusy
+                      ? null
+                      : () => _scanReceipt(ImageSource.gallery),
+                  icon: const Icon(Icons.photo_outlined),
+                  label: const Text('Upload receipt photo'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: state.isBusy ? null : _scanQr,
+                  icon: const Icon(Icons.qr_code_scanner),
+                  label: const Text('Scan QR'),
+                ),
+              ],
+            ),
+            if (_receiptNote != null) ...[
+              const SizedBox(height: 8),
+              Text(_receiptNote!,
+                  style: SplitNestTheme.supportingStyle.copyWith(
+                    color: StatusColors.of(context).success,
+                  )),
+            ],
             const SizedBox(height: 12),
             TextField(
               controller: _title,
@@ -809,6 +1119,8 @@ class _AddExpenseSheetState extends State<_AddExpenseSheet> {
               segments: const [
                 ButtonSegment(value: 'equal', label: Text('Equal')),
                 ButtonSegment(value: 'custom', label: Text('Custom')),
+                ButtonSegment(
+                    value: 'percentage', label: Text('Percentage')),
               ],
               selected: {_splitType},
               onSelectionChanged: (s) => setState(() => _splitType = s.first),
@@ -827,6 +1139,13 @@ class _AddExpenseSheetState extends State<_AddExpenseSheet> {
                   }
                 }),
               )
+            else if (_splitType == 'percentage')
+              _PercentageSplit(
+                amountPaisa: amountPaisa,
+                members: state.members,
+                percentCtrl: _percentCtrl,
+                onChanged: () => setState(() {}),
+              )
             else
               _CustomAmounts(
                 amountPaisa: amountPaisa,
@@ -835,11 +1154,14 @@ class _AddExpenseSheetState extends State<_AddExpenseSheet> {
                 exactSum: _exactSum(),
                 onChanged: () => setState(() {}),
               ),
-            SwitchListTile(
-              title: const Text('Repeat monthly'),
-              value: _repeatMonthly,
-              onChanged: (v) => setState(() => _repeatMonthly = v),
-            ),
+            // Repeat-monthly only when adding: editing an expense
+            // must not silently create a second template.
+            if (widget.existing == null)
+              SwitchListTile(
+                title: const Text('Repeat monthly'),
+                value: _repeatMonthly,
+                onChanged: (v) => setState(() => _repeatMonthly = v),
+              ),
             if (_formError != null)
               Padding(
                 padding: const EdgeInsets.only(top: 8),
@@ -856,8 +1178,14 @@ class _AddExpenseSheetState extends State<_AddExpenseSheet> {
                         width: 20,
                         height: 20,
                         child: CircularProgressIndicator(strokeWidth: 2))
-                    : const Icon(Icons.add),
-                label: Text(state.isBusy ? 'Adding…' : 'Add expense'),
+                    : Icon(widget.existing == null
+                        ? Icons.add
+                        : Icons.save_outlined),
+                label: Text(state.isBusy
+                    ? 'Saving…'
+                    : widget.existing == null
+                        ? 'Add expense'
+                        : 'Save changes'),
               ),
             ),
             const SizedBox(height: 8),
@@ -894,6 +1222,124 @@ class _EqualPreview extends StatelessWidget {
           .map((s) =>
               '${memberName(members, s.memberId)} pays PKR ${formatPaisa(s.amountPaisa)}')
           .toList(),
+    );
+  }
+}
+
+/// Percentage split: a percent per member; the percents must add
+/// up to exactly 100. Shares are integer paisa with the same
+/// remainder 1-by-1 rule as equal splits, shown live.
+class _PercentageSplit extends StatelessWidget {
+  const _PercentageSplit({
+    required this.amountPaisa,
+    required this.members,
+    required this.percentCtrl,
+    required this.onChanged,
+  });
+  final int? amountPaisa;
+  final List<Member> members;
+  final TextEditingController Function(String id) percentCtrl;
+  final VoidCallback onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = StatusColors.of(context);
+    final amount = amountPaisa ?? 0;
+    var sumHundredths = 0;
+    var allValid = true;
+    final parsed = <({String memberId, int percentHundredths})>[];
+    for (final m in members) {
+      final pct = parsePercentHundredths(percentCtrl(m.id).text.trim());
+      if (pct == null) {
+        allValid = false;
+      } else {
+        sumHundredths += pct;
+        parsed.add((memberId: m.id, percentHundredths: pct));
+      }
+    }
+    final balanced = allValid && sumHundredths == 10000;
+    final statusText = amount <= 0
+        ? 'Enter an amount first.'
+        : !allValid
+            ? 'Each percentage must be a number between 0 and 100.'
+            : balanced
+                ? 'Balanced — percentages add up to 100%.'
+                : 'Percentages add up to ${formatPercentHundredths(sumHundredths)}% — they must add up to 100%.';
+    final statusColor = balanced
+        ? colors.success
+        : amount <= 0
+            ? colors.warning
+            : colors.error;
+    final preview = balanced && amount > 0
+        ? percentageSplit(amount, parsed)
+        : const <({String memberId, int amountPaisa})>[];
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text('Percentage shares:'),
+        const SizedBox(height: 8),
+        ...members.map((m) => Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: TextField(
+                controller: percentCtrl(m.id),
+                keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true),
+                decoration: InputDecoration(
+                  labelText: '${m.name} share (%)',
+                  suffixText: '%',
+                  prefixIcon: Padding(
+                    padding: const EdgeInsets.all(10),
+                    child: MemberAvatar(
+                        memberId: m.id, name: m.name, radius: 13),
+                  ),
+                ),
+                onChanged: (_) => onChanged(),
+              ),
+            )),
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: Theme.of(context).colorScheme.surfaceContainerLow,
+            borderRadius: BorderRadius.circular(SplitNestTheme.cardRadius),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Percentages total ${formatPercentHundredths(sumHundredths)}% of 100%',
+                style: SplitNestTheme.bodyStyle
+                    .copyWith(fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 4),
+              Row(
+                children: [
+                  Icon(
+                    balanced
+                        ? Icons.check_circle_outline
+                        : Icons.info_outline,
+                    size: 18,
+                    color: statusColor,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(statusText,
+                        style: SplitNestTheme.supportingStyle
+                            .copyWith(color: statusColor)),
+                  ),
+                ],
+              ),
+              if (preview.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                ...preview.map((s) => Text(
+                      '${memberName(members, s.memberId)} pays PKR ${formatPaisa(s.amountPaisa)}',
+                      style: SplitNestTheme.supportingStyle,
+                    )),
+              ],
+            ],
+          ),
+        ),
+      ],
     );
   }
 }
