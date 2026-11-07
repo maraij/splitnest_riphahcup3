@@ -1,18 +1,19 @@
-// Pure validation for the Firebase email/password forms (sign-up,
-// sign-in, password reset). No Firebase calls here, so these are
+// Pure validation for the local email/password forms (sign-up,
+// sign-in, password reset). No auth calls here, so these are
 // unit-tested directly. Each validator returns the message to show,
 // or null when the value is valid.
 
-/// Firebase requires passwords of at least 6 characters. The rule is
-/// shown next to the password field so the user sees it before typing.
+/// Local accounts require passwords of at least 6 characters. The
+/// rule is shown next to the password field so the user sees it
+/// before typing.
 const int minPasswordLength = 6;
 
 /// The password rule, shown as a hint under the password field.
 const String passwordRuleText = 'At least 6 characters.';
 
 /// Roughly RFC-5322-shaped, good enough for a sign-up form: something,
-/// an @, something, a dot, something. Firebase itself re-validates
-/// and returns `invalid-email` for anything it rejects.
+/// an @, something, a dot, something. The local auth service
+/// re-validates and rejects anything it does not accept.
 final RegExp _emailPattern =
     RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$');
 

@@ -7,15 +7,15 @@ import '../../core/widgets/member_avatar.dart';
 import '../../state/app_state.dart';
 import 'auth_validation.dart';
 
-/// Email/password sign-up with Firebase Auth.
+/// Email/password sign-up with local auth (lock.json).
 ///
 /// The user picks which household member they are, a name, an email
 /// and a password (at least 6 characters, shown as a rule before
-/// typing). On submit the account is created, a verification email
-/// is sent, and the app routes to the verification screen — the
-/// AuthGate blocks app access until the email is verified. All
-/// validation errors are local; Firebase errors arrive via
-/// AppState.errorMessage and are already plain text.
+/// typing). On submit the account is created locally (salted hash)
+/// and the user signs in directly — there is no verification email,
+/// because there is no mail backend. All validation errors are
+/// local; auth errors arrive via AppState.errorMessage and are
+/// already plain text.
 class SignUpScreen extends StatefulWidget {
   const SignUpScreen({super.key});
 
@@ -64,8 +64,9 @@ class _SignUpScreenState extends State<SignUpScreen> {
                   ),
                   const SizedBox(height: 8),
                   Text(
-                    'We will send a verification email. '
-                    'You can use the app once your email is verified.',
+                    'Your account lives only on this device. '
+                    'You can use the app right away — no email '
+                    'verification, because no email is ever sent.',
                     style: SplitNestTheme.supportingStyle,
                     textAlign: TextAlign.center,
                   ),
@@ -246,15 +247,15 @@ class _SignUpScreenState extends State<SignUpScreen> {
       return;
     }
     setState(() => _formError = null);
-    final ok = await state.signUpWithFirebaseEmail(
+    final ok = await state.signUpWithEmail(
       displayName: _name.text.trim(),
       email: _email.text.trim(),
       password: _password.text,
       memberId: _selectedMemberId!,
     );
-    // On success the AuthGate shows the verification screen; this
-    // pushed route just pops away. On failure the error banner
-    // above already shows the plain Firebase message.
+    // On success the AuthGate shows Home; this pushed route just
+    // pops away. On failure the error banner above already shows
+    // the plain auth message.
     if (ok && mounted) Navigator.of(context).pop();
   }
 }

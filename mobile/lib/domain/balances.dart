@@ -1,8 +1,8 @@
-/// Ledger maths — pure functions, no widgets, no Firestore, no HTTP.
+/// Ledger maths — pure functions, no widgets, no storage, no HTTP.
 ///
 /// These are the exact rules the old Node backend enforced in
 /// `backend/src/app.js` (computeBalances / monthSummary / settle
-/// validation), now computed client-side from the Firestore data:
+/// validation), now computed client-side from the local data:
 ///
 /// - All money is integer paisa; display strings are two-decimal.
 /// - Net = Paid − Share + Sent − Received (worked-example formula).

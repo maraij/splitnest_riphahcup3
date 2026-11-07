@@ -7,43 +7,48 @@ import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/money.dart';
-import '../data/firebase_auth_service.dart';
-import '../data/google_auth_service.dart';
+import '../core/services/app_logger.dart';
+import '../data/demo_accounts.dart';
+import '../data/local_auth_service.dart';
+import '../data/local_json_repository.dart';
 import '../data/receipt_service.dart';
 import '../data/repository.dart';
 import '../domain/balances.dart';
+import '../domain/chat_message.dart';
 import '../domain/expense_auth.dart';
 import '../domain/insights.dart';
 import '../domain/invitations.dart';
 import '../domain/models.dart';
 import '../domain/payment_tracking.dart';
+import '../features/chatbot/data/chat_context.dart';
 
 /// AppState — the SINGLE source of truth for the whole app.
 ///
 /// One store holds members, budget (via balances), shopping, expenses,
 /// payments, balances and the logged-in member. Widgets read from
 /// Provider and call these store methods only — they never call
-/// Firestore, never hold app data in their own setState, and never
+/// lock.json, never hold app data in their own setState, and never
 /// refresh per-screen. Every mutation refreshes this store once and
 /// all screens rebuild from it.
 ///
-/// Data flow (Phase 3): Firebase Auth identity → [ensureGroup] in
+/// Data flow (Phase 6): local auth identity → [ensureGroup] in
 /// the [SplitNestRepository] (a per-user household group, seeded with
 /// the 3-member roster and the PKR 5,000 budget) → the repository's
-/// typed Firestore reads → [computeBalances] here → the screens.
-/// There is no Node backend any more: no API base URL, no HTTP, no
-/// backend session token. The repository interface is the seam tests
-/// substitute fakes through.
+/// typed lock.json reads → [computeBalances] here → the screens.
+/// There is no backend of any kind any more: no API base URL, no
+/// HTTP, no backend session token, no cloud service. The repository
+/// interface is the seam tests substitute fakes through.
 class AppState extends ChangeNotifier {
   AppState({
     SplitNestRepository? repository,
-    GoogleAuthService? googleAuth,
-    this.firebaseAuth,
+    LocalAuthService? localAuth,
     bool? initialDarkMode,
     ReceiptService? receiptService,
+    AppLogger? logger,
   })  : _repository = repository ?? const UnavailableSplitNestRepository(),
         receiptService = receiptService ?? ReceiptService(),
-        googleAuth = googleAuth ?? RealGoogleAuthService() {
+        logger = logger ?? AppLogger.inMemory(),
+        localAuth = localAuth ?? RealLocalAuthService() {
     _isDarkMode = initialDarkMode ?? false;
     // When the caller did not preload the saved theme (tests), load
     // it here; main() preloads it before first paint instead.
@@ -54,34 +59,54 @@ class AppState extends ChangeNotifier {
     unawaited(_ensurePrefs());
     _loadCaps();
     _loadProfileImages();
-    // Phase 2 (Auth): when a Firebase auth service is wired in
-    // (production, Firebase initialised), the AuthGate listens to
-    // FirebaseAuth.authStateChanges(). Without one (tests, or
-    // Firebase init failed) the app runs on a local demo/Google
-    // identity instead — the data still comes from the repository,
-    // which is the Unavailable one when Firebase never initialised,
-    // so the app shows the cloud-unavailable state honestly.
-    final firebaseService = firebaseAuth;
-    if (firebaseService != null) {
-      firebaseSession = firebaseService.currentSession;
-      _updateFirebaseStatus();
-      _firebaseSub =
-          firebaseService.authStateChanges.listen(_onFirebaseSession);
-      _restoreFirebaseSession();
-    }
+    // Phase 6 (Auth): the AuthGate listens to the local auth
+    // service's session stream, and the persisted session is
+    // restored in the background — a signed-in user re-enters the
+    // app without signing in again, and their household loads from
+    // lock.json. Without a session the app runs signed out; demo
+    // login creates a local demo session (see [loginWithDemo]).
+    localSession = this.localAuth.currentSession;
+    _localAuthSub =
+        this.localAuth.authStateChanges.listen(_onLocalSession);
+    unawaited(_restoreLocalSession());
   }
 
   SplitNestRepository _repository;
 
-  /// Receipt capture / OCR / Storage upload (Phase 5). Injectable
+  /// Receipt capture / OCR / local file save (Phase 5). Injectable
   /// so tests can substitute a stub; the default is the real
-  /// service (Storage is resolved lazily inside it, so building
-  /// AppState never touches Firebase).
+  /// service (the file save is resolved lazily inside the
+  /// repository, so building AppState never touches lock.json).
   final ReceiptService receiptService;
 
-  /// Swaps the data source (used by main.dart when a Firebase retry
-  /// succeeds after the app started on the Unavailable repository).
-  /// Reloads the household when a user is already signed in.
+  /// Structured log (Phase 7): app start, auth, repository errors,
+  /// chatbot calls and invitation actions go here (see
+  /// core/services/app_logger.dart). Defaults to a memory-only
+  /// logger; main.dart wires the file-backed one. Never carries
+  /// passwords, tokens or API keys — the logger redacts them.
+  final AppLogger logger;
+
+  /// Loads the store notice (web in-memory warning, recovery note)
+  /// without logging in — used by main.dart so the banner can show
+  /// on the login screen too. Loading the store also performs the
+  /// first-run seed. Never throws; a failure leaves the notice null
+  /// and the household load reports failures itself.
+  Future<void> loadStoreNotice() async {
+    try {
+      final repo = _repository;
+      if (repo is LocalJsonRepository) {
+        await repo.store.load();
+        dataNotice = repo.storeNotice;
+        notifyListeners();
+      }
+    } catch (_) {
+      // No notice then; the household load reports failures itself.
+    }
+  }
+
+  /// Swaps the data source. Reloads the household when a user is
+  /// already signed in. (Kept for tests; production always uses the
+  /// local repository built in main.dart.)
   void useRepository(SplitNestRepository repository) {
     _repository = repository;
     groupId = null;
@@ -92,37 +117,25 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// Google sign-in service (real in production, fake in widget
-  /// tests). The login screen calls it; the store never talks to
-  /// Google directly.
-  final GoogleAuthService googleAuth;
+  /// Local auth service (real in production, fake in auth tests).
+  /// The login / sign-up / reset screens call it through this
+  /// store; the store never talks to lock.json users directly.
+  final LocalAuthService localAuth;
+  StreamSubscription<LocalSession?>? _localAuthSub;
 
-  /// Firebase Auth service (real in production when Firebase
-  /// initialised, fake in auth tests, null in the older widget
-  /// tests and when Firebase init failed). Null means the Firebase
-  /// auth flows are unavailable — demo and Google fall back to a
-  /// local identity (see [loginWithDemo] / [loginWithGoogle]) and
-  /// the login screen hides the email mode.
-  final FirebaseAuthService? firebaseAuth;
-  StreamSubscription<FirebaseSession?>? _firebaseSub;
-
-  /// The current Firebase session, if any. Null when signed out or
-  /// when no Firebase auth service is wired in and no local demo /
-  /// Google identity has been created yet.
-  FirebaseSession? firebaseSession;
-
-  /// Gate state from the Firebase session (see [FirebaseAuthStatus]).
-  /// Meaningless when [firebaseAuth] is null — the login state
-  /// decides then.
-  FirebaseAuthStatus firebaseStatus = FirebaseAuthStatus.signedOut;
-
-  bool get firebaseAuthEnabled => firebaseAuth != null;
+  /// The current local session, if any. Null when signed out.
+  LocalSession? localSession;
 
   /// True only for the seeded demo identities
-  /// (`*.demo@splitnest.app`, or a local demo session when Firebase
-  /// is not wired in). Demo users may load the demo benchmark; real
-  /// users never see that action.
-  bool get isDemoUser => firebaseSession?.isDemo ?? false;
+  /// (`*.demo@splitnest.app`). Demo users may load the demo
+  /// benchmark; real users never see that action.
+  bool get isDemoUser => localSession?.isDemo ?? false;
+
+  /// Plain notice from the local store's last load (web in-memory
+  /// warning, corrupt-file recovery, …), or null on a normal load.
+  /// main.dart shows it as a dismissible banner; null means there
+  /// is nothing to warn about.
+  String? dataNotice;
 
   /// True only when the popup may be shown: logged in, balances loaded
   /// (so the balance line is never a wrong/zero guess), and not yet
@@ -135,67 +148,56 @@ class AppState extends ChangeNotifier {
       !_welcomeDialogPending;
 
   /// The UID the repository records as the actor of writes: the
-  /// Firebase UID when signed in through Firebase, otherwise a
-  /// stable local identity for the logged-in member.
+  /// local account uid when signed in, otherwise a stable local
+  /// identity for the logged-in member.
   String get currentUid =>
-      firebaseSession?.uid ?? 'local-${loggedInMemberId ?? 'unknown'}';
-
-  /// True only when a Google sign-in happened this session, so logout
-  /// knows to sign out of Google too. (Widget tests that only use
-  /// demo login never touch the Google plugin this way.)
-  bool _usedGoogleSignIn = false;
+      localSession?.uid ?? 'local-${loggedInMemberId ?? 'unknown'}';
 
   @override
   void dispose() {
-    _firebaseSub?.cancel();
+    _localAuthSub?.cancel();
     super.dispose();
   }
 
-  /// A Firebase session changed underneath us (sign-in, sign-out,
-  /// token refresh, verification). The gate state follows it; an
-  /// external sign-out also clears the app login, so Home is
-  /// unreachable without a Firebase session when Firebase auth is
-  /// enabled. Token refresh / expiry is the SDK's job — nothing here
-  /// handles tokens manually.
-  void _onFirebaseSession(FirebaseSession? session) {
-    firebaseSession = session;
-    _updateFirebaseStatus();
+  /// A local session changed underneath us (sign-in, sign-out).
+  /// An external sign-out also clears the app login, so Home is
+  /// unreachable without a local session.
+  void _onLocalSession(LocalSession? session) {
+    localSession = session;
     if (session == null && isLoggedIn) _clearLocalSession();
     notifyListeners();
   }
 
-  void _updateFirebaseStatus() {
-    final session = firebaseSession;
-    if (session == null) {
-      firebaseStatus = FirebaseAuthStatus.signedOut;
-    } else if (session.emailVerified || session.isDemo) {
-      firebaseStatus = FirebaseAuthStatus.signedIn;
-    } else {
-      firebaseStatus = FirebaseAuthStatus.needsVerification;
-    }
-  }
-
-  /// Restores a persisted Firebase session on launch: a verified (or
-  /// demo) user with a saved member link re-enters the app without
-  /// signing in again, and their Firestore household loads — this is
-  /// the path that makes email-only users work end-to-end now that
-  /// data lives in Firestore instead of behind a backend token.
-  Future<void> _restoreFirebaseSession() async {
-    final service = firebaseAuth;
-    final session = service?.currentSession;
-    if (service == null || session == null) return;
-    firebaseSession = session;
-    _updateFirebaseStatus();
-    if (firebaseStatus != FirebaseAuthStatus.signedIn) {
-      notifyListeners();
-      return;
-    }
-    final memberId = await service.memberIdFor(session.uid);
+  /// Restores a persisted local session on launch: a signed-in user
+  /// with a saved member link re-enters the app without signing in
+  /// again, and their lock.json household loads.
+  Future<void> _restoreLocalSession() async {
+    final session = await localAuth.restoreSession();
+    if (session == null) return;
+    // A sign-in that landed while this restore was in flight wins.
+    // Without this guard a stale launch-time restore can overwrite
+    // an explicit login: two AppStates sharing one persisted uid
+    // hit it in tests (the second AppState's restore re-applied
+    // the first user's session after the second login), and a
+    // slow restore could do the same on a real device. Guard on
+    // loggedInMemberId, not localSession: the constructor seeds
+    // localSession from the auth service's current session, so it
+    // can already be set on a fresh AppState sharing a live
+    // service — loggedInMemberId is only set once a login has
+    // actually been applied (synchronously, at the start of
+    // _applyLocalSession).
+    if (loggedInMemberId != null) return;
+    localSession = session;
+    final memberId = session.memberId ??
+        await localAuth.memberIdFor(session.uid);
     if (memberId == null) {
       notifyListeners();
       return;
     }
-    await _applyFirebaseSession(session, memberId);
+    // Re-check after the member lookup: a login for a different
+    // user may have landed while we waited.
+    if (loggedInMemberId != null) return;
+    await _applyLocalSession(session, memberId);
   }
 
   // ---- Theme (light / dark) — one state, AppBar + drawer toggles ----
@@ -284,8 +286,8 @@ class AppState extends ChangeNotifier {
 
   /// Members to offer in the sign-up / member-pick lists. Normally
   /// the group roster; when it is empty (not logged in yet) the
-  /// three seeded household members stand in, so sign-up and the
-  /// Firebase-session member pick still work.
+  /// three seeded household members stand in, so sign-up still
+  /// works before any household has loaded.
   List<Member> get memberOptions =>
       members.isEmpty ? _fallbackHouseholdMembers : members;
 
@@ -297,7 +299,7 @@ class AppState extends ChangeNotifier {
   List<ShoppingItem> shopping = [];
   Balances? balances;
 
-  /// All expenses in the group, newest first — the full Firestore
+  /// All expenses in the group, newest first — the full lock.json
   /// history, not a session-only list. (There was no GET /api/expenses
   /// endpoint on the old backend, so this used to be session-only;
   /// the migration makes the history persist across reloads.)
@@ -306,7 +308,7 @@ class AppState extends ChangeNotifier {
   /// All recorded payments (settlements) in the group, newest first.
   List<PaymentRecord> payments = [];
 
-  /// Fixed monthly expense templates (persisted in Firestore).
+  /// Fixed monthly expense templates (persisted in lock.json).
   List<FixedExpense> fixedExpenses = [];
 
   /// Whether any loaded expense is clearly-labelled demo benchmark
@@ -315,16 +317,15 @@ class AppState extends ChangeNotifier {
 
   /// Activity log (Timeline screen): every successful checkout,
   /// expense post and settlement this session, newest last. The app
-  /// also persists each entry to the cloud log (best-effort — the
-  /// rules make cloud activity Functions-written until they deploy),
-  /// but this session log is the Timeline source of truth.
+  /// also persists each entry to the local log in lock.json, but
+  /// this session log is the Timeline source of truth.
   List<ActivityEntry> activityLog = [];
 
   /// Profile pictures, picked by the user, keyed by member id.
   /// Kept in memory; also persisted as base64 in SharedPreferences
   /// when small enough (best effort — a huge photo stays
-  /// session-only rather than breaking storage). Local for now —
-  /// Storage upload is a later phase.
+  /// session-only rather than breaking storage). The bytes are also
+  /// saved to a local file by the repository (see [setProfileImage]).
   Map<String, Uint8List> profileImages = {};
 
   /// Per-category budget caps in paisa, keyed by cap category.
@@ -435,8 +436,8 @@ class AppState extends ChangeNotifier {
       timestamp: DateTime.now(),
     );
     activityLog.add(entry);
-    // Persist to the cloud log too (best-effort — see
-    // SplitNestRepository.logActivity; a rules denial there never
+    // Persist to the local log too (best-effort — see
+    // SplitNestRepository.logActivity; a failure there never
     // fails the mutation this entry describes).
     final gid = groupId;
     if (gid != null) {
@@ -453,10 +454,9 @@ class AppState extends ChangeNotifier {
   // ---- Profile picture ----
   Uint8List? profileImageFor(String memberId) => profileImages[memberId];
 
-  /// Profile-photo download URLs (Storage), keyed by member id,
-  /// persisted in SharedPreferences. The local bytes in
-  /// [profileImages] win when both exist; the URL is what other
-  /// members' devices show.
+  /// Profile-photo local paths, keyed by member id, persisted in
+  /// SharedPreferences. The local bytes in [profileImages] win when
+  /// both exist; the path is what the roster shows.
   Map<String, String> profilePhotoUrls = {};
 
   String? profilePhotoUrlFor(String memberId) =>
@@ -466,12 +466,13 @@ class AppState extends ChangeNotifier {
           .firstOrNull
           ?.photoUrl;
 
-  /// Saves the picked photo locally AND uploads it to Storage
-  /// (`profile-photos/{uid}/photo.jpg`), storing the URL on the
-  /// user's profile. Returns true when the cloud upload + URL
-  /// store succeeded; false when only the local copy was saved
-  /// (Storage unavailable / upload failed) — the local photo still
-  /// shows, and nothing here ever throws.
+  /// Saves the picked photo locally AND saves its bytes to a local
+  /// file (`profile-photos/{uid}/photo.jpg` under the app documents
+  /// directory), storing the path on the user's profile. Returns
+  /// true when the file save + path store succeeded; false when only
+  /// the in-memory copy was saved (file save failed, or web, where
+  /// there is nowhere to write it) — the local photo still shows,
+  /// and nothing here ever throws.
   Future<bool> setProfileImage(Uint8List bytes) async {
     final id = loggedInMemberId;
     if (id == null) return false;
@@ -486,9 +487,10 @@ class AppState extends ChangeNotifier {
     } catch (_) {
       // Session-only then; the picture still shows until reload.
     }
-    // Cloud upload (Phase 5): through the repository interface
-    // only (never Storage directly from here) — the URL is stored
-    // on the profile. Any failure leaves the local photo in place.
+    // Local file save (Phase 5, now local-only): through the
+    // repository interface only (never files directly from here) —
+    // the path is stored on the profile. Any failure leaves the
+    // local photo in place.
     try {
       final url = await _repository.uploadProfilePhoto(
         uid: currentUid,
@@ -582,41 +584,18 @@ class AppState extends ChangeNotifier {
     await _persistCaps();
   }
 
-  // ---- Firebase Auth (identity) + Firestore (data) ----
+  // ---- Local auth (identity) + lock.json (data) ----
 
-  /// The member id linked to the current Firebase session, if any.
-  /// Null when signed out or never linked (then the login screen
-  /// shows the member pick).
-  Future<String?> firebaseMemberId() async {
-    final service = firebaseAuth;
-    final session = firebaseSession;
-    if (service == null || session == null) return null;
-    return service.memberIdFor(session.uid);
-  }
-
-  /// Picks up the Firebase session after a Google sign-in (the
-  /// credential sign-in already happened in RealGoogleAuthService)
-  /// so the gate state is current before the member pick.
-  void syncFirebaseSession() {
-    final session = firebaseAuth?.currentSession;
-    if (session == null) return;
-    firebaseSession = session;
-    _updateFirebaseStatus();
-    notifyListeners();
-  }
-
-  /// Remembers which household member this Firebase user is, and
-  /// syncs the Firestore profile (best-effort, inside the service).
-  Future<void> saveFirebaseMember(String memberId) async {
-    final service = firebaseAuth;
-    final session = firebaseSession;
-    if (service == null || session == null) return;
-    await service.saveMemberId(session.uid, memberId);
-    await service.syncProfile(memberId: memberId);
+  /// The member id linked to the current local session, if any.
+  /// Null when signed out or never linked.
+  Future<String?> localMemberId() async {
+    final session = localSession;
+    if (session == null) return null;
+    return session.memberId ?? localAuth.memberIdFor(session.uid);
   }
 
   String _displayNameFor(String memberId) {
-    final session = firebaseSession;
+    final session = localSession;
     if (session?.displayName != null && session!.displayName!.isNotEmpty) {
       return session.displayName!;
     }
@@ -631,58 +610,66 @@ class AppState extends ChangeNotifier {
 
   /// Applies a signed-in session to the app: the member becomes
   /// logged-in + active, the welcome popup is armed, and the
-  /// Firestore household loads. This is the same path for demo,
-  /// Google and email sign-ins — data no longer needs any backend
-  /// token, so email-only users now load their household here too
-  /// (the Phase 2 limit this migration fixes).
-  Future<void> _applyFirebaseSession(
-    FirebaseSession session,
+  /// lock.json household loads. This is the same path for demo and
+  /// email sign-ins — data lives in lock.json, so every signed-in
+  /// user loads their household here.
+  Future<void> _applyLocalSession(
+    LocalSession session,
     String memberId,
   ) async {
     loggedInMemberId = memberId;
     activeMemberId = memberId;
     _welcomeShownForMemberId = null;
     _welcomeDialogPending = false;
-    await firebaseAuth?.saveMemberId(session.uid, memberId);
+    await localAuth.saveMemberId(session.uid, memberId);
     await refresh();
     notifyListeners();
   }
 
-  /// Email/password sign-in via Firebase. Returns false with
-  /// [errorMessage] set on failure. On success the AuthGate state
-  /// decides what the user sees next: unverified → verification
-  /// screen; verified with a saved member link → Home; verified
-  /// without one → the login screen's member pick.
-  Future<bool> signInWithFirebaseEmail({
+  /// Email/password sign-in against the local accounts in
+  /// lock.json. Returns false with [errorMessage] set on failure.
+  /// On success the member link decides what happens next: a saved
+  /// link → Home; no link → stays on login with a plain message
+  /// (sign-up always links a member, so this is defensive only).
+  Future<bool> signInWithEmail({
     required String email,
     required String password,
   }) async {
-    final service = firebaseAuth;
-    if (service == null || isBusy) return false;
+    if (isBusy) return false;
     isBusy = true;
     errorMessage = null;
     notifyListeners();
     try {
-      final result =
-          await service.signInWithEmail(email: email, password: password);
+      final result = await localAuth.signInWithEmail(
+        email: email,
+        password: password,
+      );
       switch (result) {
-        case FirebaseAuthFailure(:final message):
+        case LocalAuthFailure(:final message):
+          logger.warn(
+            'auth',
+            'Sign-in failed',
+            data: {'method': 'email'},
+          );
           errorMessage = message;
           return false;
-        case FirebaseAuthSuccess(:final session):
+        case LocalAuthSuccess(:final session):
           final s = session;
           if (s == null) {
             errorMessage = 'Something went wrong. Please try again.';
             return false;
           }
-          firebaseSession = s;
-          _updateFirebaseStatus();
-          if (firebaseStatus == FirebaseAuthStatus.needsVerification) {
-            return true;
+          localSession = s;
+          final memberId = s.memberId ??
+              await localAuth.memberIdFor(s.uid);
+          if (memberId == null) {
+            errorMessage =
+                'This account is not linked to a household member. '
+                'Create a new account and pick your member.';
+            return false;
           }
-          final memberId = await service.memberIdFor(s.uid);
-          if (memberId == null) return true;
-          await _applyFirebaseSession(s, memberId);
+          await _applyLocalSession(s, memberId);
+          logger.info('auth', 'Signed in', data: {'method': 'email'});
           return true;
       }
     } finally {
@@ -691,43 +678,45 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// Email/password sign-up via Firebase: creates the account, sends
-  /// the verification email, links the picked household member, and
-  /// routes the user to the verification screen (the gate blocks app
-  /// access until the email is verified). Returns false with
-  /// [errorMessage] set on failure.
-  Future<bool> signUpWithFirebaseEmail({
+  /// Email/password sign-up against the local accounts in lock.json:
+  /// creates the account (salted hash) and signs in immediately —
+  /// there is no email verification, because there is no mail
+  /// backend. Returns false with [errorMessage] set on failure.
+  Future<bool> signUpWithEmail({
     required String displayName,
     required String email,
     required String password,
     required String memberId,
   }) async {
-    final service = firebaseAuth;
-    if (service == null || isBusy) return false;
+    if (isBusy) return false;
     isBusy = true;
     errorMessage = null;
     notifyListeners();
     try {
-      final result = await service.signUpWithEmail(
+      final result = await localAuth.signUpWithEmail(
         email: email,
         password: password,
         displayName: displayName,
+        memberId: memberId,
       );
       switch (result) {
-        case FirebaseAuthFailure(:final message):
+        case LocalAuthFailure(:final message):
+          logger.warn(
+            'auth',
+            'Sign-up failed',
+            data: {'method': 'email'},
+          );
           errorMessage = message;
           return false;
-        case FirebaseAuthSuccess(:final session):
+        case LocalAuthSuccess(:final session):
           final s = session;
           if (s == null) {
             errorMessage = 'Something went wrong. Please try again.';
             return false;
           }
-          firebaseSession = s;
-          _updateFirebaseStatus();
-          await service.saveMemberId(s.uid, memberId);
-          await service.syncProfile(
-              displayName: displayName, memberId: memberId);
+          localSession = s;
+          await _applyLocalSession(s, memberId);
+          logger.info('auth', 'Signed up', data: {'method': 'email'});
           return true;
       }
     } finally {
@@ -736,60 +725,39 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// Demo login: create-or-sign-in the demo user
-  /// (ali.demo@splitnest.app etc.) through Firebase Auth, then load
-  /// their Firestore household. Demo sessions bypass the verification
-  /// gate. Without a Firebase service wired in (tests, Firebase init
-  /// failed) the demo identity is local — the data still comes from
-  /// the repository, which is the Unavailable one when Firebase
-  /// never initialised, so the app shows the cloud-unavailable state
-  /// instead of fake data.
+  /// Demo login: signs in the demo user (ali/ayesha/bilal) from the
+  /// seeded local accounts, then loads their lock.json household.
+  /// Demo sessions are local — no network, no cloud account.
   Future<bool> loginWithDemo({required String memberId}) async {
     final demo = demoForMember(memberId);
-    if (demo == null) return false;
-    final service = firebaseAuth;
-    if (service == null) {
-      if (isBusy) return false;
-      isBusy = true;
-      errorMessage = null;
-      notifyListeners();
-      try {
-        firebaseSession = FirebaseSession(
-          uid: 'demo-$memberId',
-          email: demo.email,
-          displayName: demo.name,
-          emailVerified: false,
-          isDemo: true,
-        );
-        _updateFirebaseStatus();
-        await _applyFirebaseSession(firebaseSession!, memberId);
-        return true;
-      } finally {
-        isBusy = false;
-        notifyListeners();
-      }
-    }
-    if (isBusy) return false;
+    if (demo == null || isBusy) return false;
     isBusy = true;
     errorMessage = null;
     notifyListeners();
     try {
-      final result = await service.signInDemo(demo);
+      final result = await localAuth.signInDemo(demo);
       switch (result) {
-        case FirebaseAuthFailure(:final message):
+        case LocalAuthFailure(:final message):
+          logger.warn(
+            'auth',
+            'Demo sign-in failed',
+            data: {'memberId': memberId},
+          );
           errorMessage = message;
           return false;
-        case FirebaseAuthSuccess(:final session):
+        case LocalAuthSuccess(:final session):
           final s = session;
           if (s == null) {
             errorMessage = 'Something went wrong. Please try again.';
             return false;
           }
-          firebaseSession = s;
-          _updateFirebaseStatus();
-          await service.syncProfile(
-              displayName: demo.name, memberId: memberId);
-          await _applyFirebaseSession(s, memberId);
+          localSession = s;
+          await _applyLocalSession(s, memberId);
+          logger.info(
+            'auth',
+            'Signed in',
+            data: {'method': 'demo', 'memberId': memberId},
+          );
           return true;
       }
     } finally {
@@ -798,165 +766,81 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// Google login: the Google account chooser and the Firebase
-  /// credential sign-in already happened inside GoogleAuthService —
-  /// this only links the picked household member to that Firebase
-  /// identity and loads the Firestore household. There is no backend
-  /// token exchange any more. Without a Firebase service wired in
-  /// (tests, Firebase init failed) the identity is local; the data
-  /// still comes from the repository (Unavailable when Firebase
-  /// never initialised, so the cloud-unavailable state shows).
-  Future<bool> loginWithGoogle({
-    required String idToken,
-    required String memberId,
+  /// Starts a device-local password reset. Returns the reset code
+  /// to SHOW ON THIS DEVICE (the forgot-password screen displays
+  /// it — no email is sent), or null with [errorMessage] set when
+  /// no account exists for that email.
+  Future<String?> requestPasswordReset(String email) async {
+    final code = await localAuth.requestPasswordReset(email: email);
+    if (code == null) {
+      errorMessage = 'No account exists for that email. '
+          'Check the email or create an account.';
+      notifyListeners();
+      return null;
+    }
+    return code;
+  }
+
+  /// Completes a device-local password reset with the on-device
+  /// code. On success the user is signed in with the new password
+  /// and their household loads. Returns false with [errorMessage]
+  /// set on a wrong/expired code or a bad new password.
+  Future<bool> resetPasswordWithCode({
+    required String email,
+    required String code,
+    required String newPassword,
   }) async {
     if (isBusy) return false;
-    _usedGoogleSignIn = true;
     isBusy = true;
     errorMessage = null;
     notifyListeners();
     try {
-      final service = firebaseAuth;
-      if (service == null) {
-        firebaseSession = const FirebaseSession(
-          uid: 'local-google',
-          email: null,
-          displayName: null,
-          emailVerified: true,
-          isDemo: false,
-        );
-        _updateFirebaseStatus();
-        await _applyFirebaseSession(firebaseSession!, memberId);
-        return true;
-      }
-      var session = service.currentSession;
-      if (session == null) {
-        final result =
-            await service.signInWithGoogle(idToken: idToken);
-        switch (result) {
-          case FirebaseAuthFailure(:final message):
-            errorMessage = message;
+      final result = await localAuth.resetPasswordWithCode(
+        email: email,
+        code: code,
+        newPassword: newPassword,
+      );
+      switch (result) {
+        case LocalAuthFailure(:final message):
+          errorMessage = message;
+          return false;
+        case LocalAuthSuccess(:final session):
+          final s = session;
+          if (s == null) {
+            errorMessage = 'Something went wrong. Please try again.';
             return false;
-          case FirebaseAuthSuccess(session: final s):
-            session = s;
-        }
+          }
+          localSession = s;
+          final memberId = s.memberId ??
+              await localAuth.memberIdFor(s.uid);
+          if (memberId == null) {
+            errorMessage =
+                'This account is not linked to a household member. '
+                'Create a new account and pick your member.';
+            return false;
+          }
+          await _applyLocalSession(s, memberId);
+          return true;
       }
-      if (session == null) {
-        errorMessage ??= 'Something went wrong. Please try again.';
-        return false;
-      }
-      firebaseSession = session;
-      _updateFirebaseStatus();
-      await _applyFirebaseSession(session, memberId);
-      return true;
     } finally {
       isBusy = false;
       notifyListeners();
     }
   }
 
-  /// Completes a Firebase sign-in that has no member link yet (the
-  /// login screen's member pick): links the member and enters Home.
-  Future<bool> completeFirebaseMemberPick(String memberId) async {
-    final session = firebaseSession;
-    final service = firebaseAuth;
-    if (service == null || session == null || isBusy) return false;
-    isBusy = true;
-    errorMessage = null;
-    notifyListeners();
-    try {
-      await service.saveMemberId(session.uid, memberId);
-      await service.syncProfile(memberId: memberId);
-      await _applyFirebaseSession(session, memberId);
-      return true;
-    } finally {
-      isBusy = false;
-      notifyListeners();
-    }
-  }
-
-  /// Re-checks whether the signed-in user's email is verified (after
-  /// they clicked the link). True when verified — the member link is
-  /// applied and Home opens. False keeps the user on the
-  /// verification screen.
-  Future<bool> refreshVerificationStatus() async {
-    final service = firebaseAuth;
-    if (service == null) return false;
-    final session = await service.reloadCurrentUser();
-    if (session == null) {
-      errorMessage = 'You are signed out. Please sign in again.';
-      notifyListeners();
-      return false;
-    }
-    firebaseSession = session;
-    _updateFirebaseStatus();
-    if (firebaseStatus != FirebaseAuthStatus.signedIn) {
-      notifyListeners();
-      return false;
-    }
-    final memberId = await service.memberIdFor(session.uid);
-    if (memberId == null) {
-      notifyListeners();
-      return true;
-    }
-    await _applyFirebaseSession(session, memberId);
-    return true;
-  }
-
-  /// Re-sends the verification email to the current user.
-  Future<bool> resendVerificationEmail() async {
-    final service = firebaseAuth;
-    if (service == null) return false;
-    final sent = await service.sendEmailVerification();
-    if (!sent) {
-      errorMessage =
-          'Could not send the verification email. Try again in a bit.';
-      notifyListeners();
-    }
-    return sent;
-  }
-
-  /// Sends the password-reset email. True means accepted for
-  /// sending (it does not reveal whether the address has an
-  /// account). False sets [errorMessage].
-  Future<bool> sendFirebasePasswordReset(String email) async {
-    final service = firebaseAuth;
-    if (service == null) return false;
-    final result = await service.sendPasswordReset(email: email);
-    switch (result) {
-      case FirebaseAuthFailure(:final message):
-        errorMessage = message;
-        notifyListeners();
-        return false;
-      case FirebaseAuthSuccess():
-        return true;
-    }
-  }
-
-  /// Logout: signs out of Firebase AND Google, clears all local
+  /// Logout: signs out of the local auth service, clears all local
   /// session state and the loaded household data, and returns to
-  /// login. Each provider sign-out is best-effort — a provider
-  /// failure never blocks the local logout. Callers need not await it.
+  /// login. The sign-out is best-effort — a failure never blocks the
+  /// local logout. Callers need not await it.
   Future<void> logout() async {
-    final firebaseService = firebaseAuth;
-    if (firebaseService != null && firebaseSession != null) {
-      try {
-        await firebaseService.signOut();
-      } catch (_) {
-        // Local logout continues regardless of a provider hiccup.
-      }
+    try {
+      await localAuth.signOut();
+    } catch (_) {
+      // Local logout continues regardless.
     }
-    if (_usedGoogleSignIn) {
-      _usedGoogleSignIn = false;
-      try {
-        await googleAuth.signOut();
-      } catch (_) {
-        // Local logout continues regardless.
-      }
-    }
+    logger.info('auth', 'Signed out');
     _clearLocalSession();
-    firebaseSession = null;
-    firebaseStatus = FirebaseAuthStatus.signedOut;
+    localSession = null;
     notifyListeners();
   }
 
@@ -981,6 +865,7 @@ class AppState extends ChangeNotifier {
     payments = [];
     fixedExpenses = [];
     demoDataLoaded = false;
+    dataNotice = null;
     _welcomeShownForMemberId = null;
     _welcomeDialogPending = false;
     _celebrationShownForMemberId = null;
@@ -1059,11 +944,10 @@ class AppState extends ChangeNotifier {
   /// resolves (or creates) the group, reads members, shopping,
   /// expenses, payments and fixed templates, and computes balances
   /// from that history. Before login this is a no-op — there is no
-  /// household to load and no error to show. When Firestore is
-  /// unavailable (database not created yet, offline, rules not
-  /// deployed) [errorMessage] carries the plain cloud-unavailable
-  /// text and every data list stays as it was — the app never shows
-  /// fake data.
+  /// household to load and no error to show. When the local store
+  /// is unavailable (lock.json unreadable) [errorMessage] carries
+  /// the plain local-unavailable text and every data list stays as
+  /// it was — the app never shows fake data.
   Future<void> refresh() async {
     if (!isLoggedIn) {
       isLoading = false;
@@ -1077,7 +961,7 @@ class AppState extends ChangeNotifier {
       final info = await _repository.ensureGroup(
         uid: currentUid,
         displayName: _displayNameFor(memberId),
-        email: firebaseSession?.email,
+        email: localSession?.email,
         legacyMemberId: memberId,
         isDemo: isDemoUser,
       );
@@ -1092,7 +976,7 @@ class AppState extends ChangeNotifier {
       try {
         groups = await _repository.listUserGroups(
           uid: currentUid,
-          email: firebaseSession?.email,
+          email: localSession?.email,
         );
       } catch (_) {
         groups = [];
@@ -1155,11 +1039,17 @@ class AppState extends ChangeNotifier {
           members.every((m) => m.id != activeMemberId)) {
         activeMemberId = members.first.id;
       }
+      // The store notice (web in-memory warning, corrupt-file
+      // recovery, …) is surfaced once the household has loaded, so
+      // main.dart can show it as a dismissible banner.
+      if (_repository is LocalJsonRepository) {
+        dataNotice = (_repository as LocalJsonRepository).storeNotice;
+      }
       // Role + invitations load after the household data, and each
       // in its own try/catch: an invitation read must never break
       // the household load (e.g. a plain member may not list the
-      // group's sent invitations — the rules deny it, so the list
-      // is simply empty for them).
+      // group's sent invitations, so the list is simply empty for
+      // them).
       try {
         currentRole = await _repository.getMyRole(
           groupId: gid,
@@ -1169,10 +1059,16 @@ class AppState extends ChangeNotifier {
         currentRole = null;
       }
       await _loadInvitations();
-    } on CloudDataException catch (e) {
+    } on LocalDataException catch (e) {
       errorMessage = e.message;
+      logger.error(
+        'app_state',
+        'Household refresh failed',
+        data: {'error': e.message},
+      );
     } catch (_) {
       errorMessage = 'Something went wrong. Please try again.';
+      logger.error('app_state', 'Household refresh failed');
     } finally {
       isLoading = false;
       notifyListeners();
@@ -1181,8 +1077,8 @@ class AppState extends ChangeNotifier {
 
   /// Runs a mutation with the submit lock held; refreshes the single
   /// store once on success so every screen rebuilds from fresh data.
-  /// A cloud failure sets the plain error message and returns false;
-  /// nothing is ever shown as succeeding when it did not.
+  /// A local-store failure sets the plain error message and returns
+  /// false; nothing is ever shown as succeeding when it did not.
   Future<bool> _runMutation(Future<dynamic> Function() fn) async {
     if (isBusy) return false;
     isBusy = true;
@@ -1192,7 +1088,7 @@ class AppState extends ChangeNotifier {
       await fn();
       await refresh();
       return true;
-    } on CloudDataException catch (e) {
+    } on LocalDataException catch (e) {
       errorMessage = e.message;
       return false;
     } catch (_) {
@@ -1206,7 +1102,7 @@ class AppState extends ChangeNotifier {
 
   String get _groupOrUnavailable {
     final gid = groupId;
-    if (gid == null) throw const CloudDataException(cloudUnavailableMessage);
+    if (gid == null) throw const LocalDataException(localDataUnavailableMessage);
     return gid;
   }
 
@@ -1380,7 +1276,7 @@ class AppState extends ChangeNotifier {
         notifyListeners();
       }
       return true;
-    } on CloudDataException catch (e) {
+    } on LocalDataException catch (e) {
       errorMessage = e.message;
       return false;
     } catch (_) {
@@ -1513,7 +1409,7 @@ class AppState extends ChangeNotifier {
       }
       await refresh();
       return applied;
-    } on CloudDataException catch (e) {
+    } on LocalDataException catch (e) {
       errorMessage = e.message;
       return applied;
     } catch (_) {
@@ -1575,8 +1471,8 @@ class AppState extends ChangeNotifier {
   }
 
   /// Verifies a recorded payment (recorded → verified). Only an
-  /// owner/admin can do this — on the real database the rules
-  /// enforce it and a rejection surfaces as the plain cloud message.
+  /// owner/admin can do this — the repository enforces it and a
+  /// rejection surfaces as the plain local message.
   /// Writes an activity entry on success.
   Future<bool> verifyPayment(String paymentId) async {
     final ok = await _runMutation(
@@ -1704,7 +1600,7 @@ class AppState extends ChangeNotifier {
     myInvitations = [];
     final gid = groupId;
     if (gid == null) return;
-    final email = firebaseSession?.email;
+    final email = localSession?.email;
     if (email != null && email.isNotEmpty) {
       try {
         myInvitations = await _repository.getMyInvitations(email);
@@ -1771,7 +1667,7 @@ class AppState extends ChangeNotifier {
         invitedEmail: email,
         role: role,
         actorUid: currentUid,
-        actorEmail: firebaseSession?.email,
+        actorEmail: localSession?.email,
         actorName: _displayNameFor(loggedInMemberId!),
       );
       await _loadInvitations();
@@ -1782,12 +1678,19 @@ class AppState extends ChangeNotifier {
         memberId: loggedInMemberId!,
         detail: _currentGroupName,
       );
+      logger.info('invitations', 'Invitation sent');
       return invite;
-    } on CloudDataException catch (e) {
+    } on LocalDataException catch (e) {
       errorMessage = e.message;
+      logger.warn(
+        'invitations',
+        'Invitation failed',
+        data: {'error': e.message},
+      );
       return null;
     } catch (_) {
       errorMessage = 'Something went wrong. Please try again.';
+      logger.warn('invitations', 'Invitation failed');
       return null;
     } finally {
       isBusy = false;
@@ -1818,11 +1721,17 @@ class AppState extends ChangeNotifier {
       );
       await _loadInvitations();
       return true;
-    } on CloudDataException catch (e) {
+    } on LocalDataException catch (e) {
       errorMessage = e.message;
+      logger.warn(
+        'invitations',
+        'Invitation revoke failed',
+        data: {'error': e.message},
+      );
       return false;
     } catch (_) {
       errorMessage = 'Something went wrong. Please try again.';
+      logger.warn('invitations', 'Invitation revoke failed');
       return false;
     } finally {
       isBusy = false;
@@ -1851,7 +1760,7 @@ class AppState extends ChangeNotifier {
   /// and logs the join.
   Future<Invitation?> acceptInvitation(String invitationId) async {
     if (isBusy) return null;
-    final email = firebaseSession?.email;
+    final email = localSession?.email;
     if (email == null || email.isEmpty) {
       errorMessage =
           'Sign in with an email address to accept an invitation.';
@@ -1878,12 +1787,19 @@ class AppState extends ChangeNotifier {
         memberId: loggedInMemberId!,
         detail: accepted.groupName,
       );
+      logger.info('invitations', 'Invitation accepted');
       return accepted;
-    } on CloudDataException catch (e) {
+    } on LocalDataException catch (e) {
       errorMessage = e.message;
+      logger.warn(
+        'invitations',
+        'Invitation accept failed',
+        data: {'error': e.message},
+      );
       return null;
     } catch (_) {
       errorMessage = 'Something went wrong. Please try again.';
+      logger.warn('invitations', 'Invitation accept failed');
       return null;
     } finally {
       isBusy = false;
@@ -1915,7 +1831,7 @@ class AppState extends ChangeNotifier {
       );
       await refresh();
       return n;
-    } on CloudDataException catch (e) {
+    } on LocalDataException catch (e) {
       errorMessage = e.message;
       return 0;
     } catch (_) {
@@ -1927,11 +1843,50 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// Shows a message on the login page (e.g. a cancelled Google
-  /// sign-in). The login screen's error banner displays it.
+  /// Shows a message on the login page. The login screen's error
+  /// banner displays it.
   void showError(String message) {
     errorMessage = message;
     notifyListeners();
+  }
+
+  // ---- AI chatbot (Phase 7) ----
+
+  /// The household summary handed to the AI with every message:
+  /// live totals, per-member balances, budget usage and recent
+  /// expenses (see features/chatbot/data/chat_context.dart). The
+  /// bot answers from this only and never invents figures.
+  String householdSummaryForChat() => buildHouseholdContext(
+        memberName: loggedInMember?.name ?? 'Member',
+        balances: balances,
+        recentExpenses: recentExpenses,
+      );
+
+  /// The persisted chat history for the signed-in user, oldest
+  /// first. A failure returns an empty list — the chat still
+  /// opens, it just starts fresh for this session.
+  Future<List<ChatMessage>> loadChatHistory() async {
+    try {
+      return await _repository.getChatMessages(currentUid);
+    } catch (e) {
+      logger.error(
+        'chatbot',
+        'Chat history load failed',
+        data: {'error': AppLogger.redact(e.toString())},
+      );
+      return [];
+    }
+  }
+
+  /// Persists one chat message (user question or assistant reply)
+  /// to the signed-in user's history in lock.json.
+  Future<void> saveChatMessage(ChatMessage message) async {
+    await _repository.addChatMessage(uid: currentUid, message: message);
+  }
+
+  /// Deletes the signed-in user's chat history from lock.json.
+  Future<void> clearChatHistory() async {
+    await _repository.clearChatMessages(currentUid);
   }
 
   void clearError() {

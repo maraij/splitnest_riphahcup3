@@ -1,4 +1,4 @@
-/// Percentage-based splits — pure functions, no widgets, no Firestore.
+/// Percentage-based splits — pure functions, no widgets, no storage.
 ///
 /// A percentage is stored as **hundredths of a percent** (an int):
 /// 40% = 4000, 33.33% = 3333. Integers keep the "percentages sum to

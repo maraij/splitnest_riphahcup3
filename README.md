@@ -1,276 +1,456 @@
-# SplitNest 
+# SplitNest
 
-> **This app must never be submitted as an RC³ competition**
+> **This app must never be submitted as an RC³ competition — PRACTICE ONLY.**
 
-SplitNest is a shared-living expense tracker for three roommates in Lahore:
-Ali (M01), Ayesha (M02) and Bilal (M03). Shopping list, multi-item checkout
-that posts exactly one shared expense, manual expenses with equal/custom
-splits, exact paisa accounting, settlements, and a monthly budget.
+SplitNest is a shared-living expense tracker for three roommates:
+Ali (M01), Ayesha (M02) and Bilal (M03). Shopping list, multi-item
+checkout that posts exactly one shared expense, manual expenses
+with equal/custom/percentage splits, exact paisa accounting,
+settlements with owner/admin verification, a monthly budget, an
+AI household assistant, and structured local logging. Everything
+runs on the device — there is no server and no cloud service.
 
-## Production rebuild — status (2026-11-07)
+## Key features
 
-A full production rebuild is underway (Firebase backend, real auth,
-invitations, redesign, light/dark themes). Work lands incrementally;
-this section tracks what is done so far.
+- **Shopping & checkout** — shared shopping list; checkout posts
+  exactly one equal-split expense and marks the items Bought,
+  atomically.
+- **Expenses** — equal, custom and percentage splits with exact
+  integer-paisa accounting (splits always sum to the amount);
+  edit/delete guarded to the payer/creator or an owner/admin.
+- **Settle Up** — balances (Net = Paid − Share + Sent − Received),
+  Smart Settle suggestions, settlements recorded then verified or
+  rejected by an owner/admin.
+- **Monthly view, Timeline, insights** — per-member month totals,
+  category breakdowns, weekly trends, recurring bills, category
+  caps, and an activity log.
+- **Fixed monthly expenses** — templates that post at most once
+  per month.
+- **Receipts & QR** — receipt photos stored locally, on-device
+  text recognition to pre-fill an expense, QR entry for pasting
+  a receipt.
+- **Profile photos** — stored as local files, referenced from
+  lock.json.
+- **Invitations & shared households** — local-only invite codes;
+  join on the same device, switch between households.
+- **AI Assistant** — a household expense chatbot (drawer entry)
+  that answers from the live household data. See
+  [AI integration](#ai-integration-gemini).
+- **Structured logging** — bounded, redacted JSON log
+  (`logs.json`). See [Logging](#logging).
+- **Light/dark themes** — toggled from the AppBar or the drawer,
+  persisted across restarts.
+- **Demo benchmark** — demo users can load the labelled PKR 5,000
+  benchmark (4 expenses, 2 fixed templates, 2 shopping items)
+  from Home, exactly once.
 
-**Phase 1 — Firebase foundation (done, 2026-11-07):** Firebase packages
-added (`firebase_core`, `firebase_auth`, `cloud_firestore`,
-`firebase_storage`, `firebase_messaging`, `fl_chart`, `pdf`, `csv`,
-`share_plus`, `url_launcher`, `google_mlkit_text_recognition`);
-`Firebase.initializeApp()` wired with a graceful fallback banner if cloud
-init fails; Firestore data model documented in
-[docs/FIRESTORE_STRUCTURE.md](docs/FIRESTORE_STRUCTURE.md); production
-security rules in `firestore.rules` / `storage.rules`; Cloud Functions
-skeleton in `functions/` (not deployed); setup steps in
-[docs/FIREBASE_SETUP.md](docs/FIREBASE_SETUP.md). Gates green:
-`flutter analyze` no issues, `flutter test` 65/65, `flutter build web`
-succeeds. The app still runs on the Node backend in this phase; no
-screen behaviour changed.
+## Tech stack
 
-**Phase 2 — Firebase Authentication (done, 2026-11-07):** real Firebase
-Auth email/password sign-up + sign-in, email verification gate
-(verification screen with resend/reload), forgot/reset password, real
-Google Sign-In through Firebase Auth (google_sign_in v7 API), AuthGate
-session handling via `authStateChanges()`, secure logout. Demo accounts
-(ali/ayesha/bilal.demo@splitnest.app) now create-or-sign-in via Firebase
-Auth on first use and bypass the verification gate as seeded demo
-identities. Gates green: `flutter analyze` no issues, `flutter test`
-89/89 (65 baseline + 24 new auth tests), `flutter build web` succeeds.
-**Known limit:** an email-only Firebase user has identity but no Node
-backend token, so data calls 401 until Phase 3 moves data to Firestore;
-the app shows a plain notice instead of failing silently. Demo and
-Google users are unaffected.
+| Layer | Technology |
+|---|---|
+| App | Flutter 3.47.9, Dart 3.13.7, Provider (single `AppState`) |
+| Data | Local `lock.json` (version 1) in the app documents directory via `path_provider`; `crypto` for SHA-256 password hashing; `shared_preferences` for session, theme and household choice |
+| AI | Google Gemini REST API (v1beta `generateContent`, model `gemini-2.5-flash`) via the `http` package — key only via `--dart-define`, not configured in this build |
+| On-device ML | `google_mlkit_text_recognition` (receipt OCR, no cloud), `mobile_scanner` (QR entry) |
+| Charts / export | `fl_chart`, `pdf`, `csv`, `share_plus`, `url_launcher` |
+| Backend | None. The Node.js + Express + SQLite backend is retired (see `backend/LEGACY.md`); nothing in `mobile/` connects to it |
 
-**Phase 3 — Firestore data migration (done, 2026-11-07):** Firestore
-is now the app's **only** data source; the Node backend is retired
-(see `backend/LEGACY.md`). `FirestoreSplitNestRepository`
-(`mobile/lib/data/firestore_repository.dart`) implements the
-`SplitNestRepository` interface (`mobile/lib/data/repository.dart`);
-`AppState` reads/writes through it exclusively — no `API_BASE_URL`,
-no HTTP calls, no backend token/session anywhere in the app (the
-`http` package and `mobile/lib/data/api_client.dart` are gone).
-What changed under the hood: expenses/payments/shopping/fixed
-templates all live in `groups/{gid}/…` subcollections (integer
-paisa, `splits` map sums to amount, payments `recorded` → `verified`,
-checkout and fixed-apply are transactions); balances are computed
-client-side in `mobile/lib/domain/balances.dart`; Firestore offline
-persistence is enabled, and a missing/unreachable database shows a
-plain "Cloud data unavailable — check setup/connection" state instead
-of crashing or faking data. Seeding: `ensureGroup` creates the group
-(`household-<uid>`, PKR 5,000 budget, 3-member roster) on first
-sign-in; the benchmark loads only as clearly-labelled DEMO data via a
-**Load demo benchmark** card shown to demo users only, never
-auto-seeded. This also fixes the Phase 2 limit: email-only Firebase
-users now work end-to-end (identity + Firestore data, no backend
-token). Gates green: `flutter analyze` no issues, `flutter test`
-**117/117** (89 + 28 new Firestore tests, incl. the real repository
-against `FakeFirebaseFirestore` and atomic-checkout tests),
-`flutter build web` succeeds. **Not verified live:** the Firestore
-database does not exist yet and the rules are not deployed, so no
-live-DB verification was possible; the first live pass is a Phase 4
-console step. **Known limitation:** each Firebase user gets their
-own household group (`household-<uid>`) until the invite-accept
-Cloud Function lands — true shared households need Phase 4. See
-[docs/FIRESTORE_STRUCTURE.md](docs/FIRESTORE_STRUCTURE.md) for the
-as-built schema and the divergence notes.
+## Architecture / folder structure
 
-**Phase 4 — Invitations & shared households (done, 2026-11-07):**
-Firestore-backed invitations, fully client-side — no deployed
-Function needed. The invitation document id IS the invite code (12
-secure-random characters); shareable link
-`https://splitnest.app/join?code=<CODE>` (plain text — no App
-Links / deep-link auto-join wired); expiry 7 days with derived
-expired status + admin sweep; no duplicate active invite per
-email + group; owner/admin-only invite/revoke, admin grant by
-owner only. Accepting runs one Firestore transaction (members map
-+ mirror + accepted status) and the joined group becomes current;
-`AppState` switches between the user's households with the choice
-persisted per UID. The `onInvitationAccepted` Function is now a
-redundant notification path once deployed, not a requirement.
-Invite UI: drawer / Home → Invite & households (send, share via
-system sheet / WhatsApp / copy link & code, revoke, accept from
-list or by code). Gates green: `flutter analyze` no issues,
-`flutter test` **143/143** (117 + 26 new invitation tests, incl.
-the real repository against `FakeFirebaseFirestore` and an
-AppState invite → accept → switch end-to-end test),
-`flutter build web` succeeds. **Not verified live:** the
-Firestore database still does not exist, the rules (which gained
-a narrow invitation self-join branch) are not deployed, and no
-real two-device accept has been run. See
-[docs/INVITATIONS.md](docs/INVITATIONS.md) for the full write-up.
+```
+splitnest-practice/
+├── README.md                  # this file
+├── STRUCTURE.md               # detailed file-by-file map
+├── .env.example               # placeholder variable names only
+├── docs/
+│   ├── LOCK_JSON.md           # lock.json schema, atomicity, backup/restore
+│   ├── LOGGING.md             # logs.json format, redaction, bounds
+│   ├── logs-template.json     # empty logs.json structure (no real entries)
+│   └── INVITATIONS.md        # local-only invites & shared households
+├── backend/                   # LEGACY — retired, reference only
+├── mobile/
+│   ├── pubspec.yaml
+│   ├── assets/lock-seed.json  # reference first-run seed (fixed salts)
+│   ├── lib/
+│   │   ├── main.dart          # splash → login → logged-in shell
+│   │   ├── core/              # theme, money, formatting, AppLogger, widgets
+│   │   ├── domain/            # pure models & rules (balances, splits, invites)
+│   │   ├── data/              # SplitNestRepository + LocalJsonRepository
+│   │   ├── state/             # AppState — the single source of truth
+│   │   └── features/          # one folder per screen
+│   │       ├── auth/ home/ shopping/ expenses/ settle/
+│   │       ├── monthly/ timeline/ profile/ invite/ splash/
+│   │       └── chatbot/       # AI Assistant (provider, controller, screen)
+│   └── test/                  # unit + widget tests (see below)
+└── .github/workflows/android-apk.yml   # debug APK build
+```
 
-**Still pending (needs a console step, not code):** create the Firestore
-database (production mode, `asia-south1`), deploy `firestore.rules` /
-`storage.rules`, enable Storage. See
-[docs/FIREBASE_SETUP.md](docs/FIREBASE_SETUP.md) for exact steps.
-Cloud Functions are written but **not deployed** (scheduled function
-needs the Blaze plan). **Also pending:** enable the Email/Password
-sign-in provider in the console (only Google is confirmed enabled) —
-until then email/demo sign-in fails with `operation-not-allowed` and
-the app says so plainly; see `docs/FIREBASE_SETUP.md` §(g). No live
-sign-up/sign-in has been attempted yet — the real auth code paths need
-one live pass on a device/emulator after the console steps.
+Design rules: one `AppState` holds all app data and every
+mutation refreshes it once; screens read from it and never touch
+storage directly. The repository interface
+(`SplitNestRepository`) is the seam tests substitute fakes
+through. Money is integer paisa everywhere; amounts cross
+boundaries as two-decimal strings. Full detail:
+[STRUCTURE.md](STRUCTURE.md).
 
-## Stack
+## Installation + setup
 
-- **Backend:** Cloud Firestore (Firebase project `splitnest-b8071`,
-  Spark plan) via `cloud_firestore` — integer paisa, expenses /
-  payments / shopping / fixed templates under `groups/{gid}/…`; see
-  [docs/FIRESTORE_STRUCTURE.md](docs/FIRESTORE_STRUCTURE.md). The
-  Node.js + Express + SQLite backend is retired (see
-  `backend/LEGACY.md`); it is kept only as a reference implementation
-  and for its benchmark tests.
-- **Mobile:** Flutter 3.47.9 (Dart 3.13.7) + Provider, bottom navigation
-  Home / Shopping / Expenses & Settle.
-- **Database:** Firestore — created on first sign-in by `ensureGroup`
-  (members M01/M02/M03, budget PKR 5,000.00). Benchmark expenses are
-  **not** preloaded; a demo user loads them from Home via **Load demo
-  benchmark** (labelled DEMO).
-
-## Run the mobile app (no backend needed any more)
+Requirements: Flutter SDK 3.47.9 (Dart 3.13.7), Android SDK
+(for the APK) or Chrome (for the web preview).
 
 ```sh
 cd mobile
 flutter pub get
-flutter run
 ```
 
-The app talks to Cloud Firestore directly (Firebase config from
-`firebase_options.dart` / `google-services.json`); there is no
-`API_BASE_URL` and no local server to start. If the Firestore
-database has not been created yet (pending console step), the app
-shows a plain "Cloud data unavailable" state instead of crashing.
+No accounts, console steps, or external services are needed to
+run the app. The first launch seeds the three demo accounts
+(hashed passwords, fresh random salts) and creates the household
+on first sign-in.
 
-## Benchmark (reproduce exactly)
+Demo sign-in (seeded on first run):
 
-Sign in as a demo user and tap **Load demo benchmark** on Home (or
-run `flutter test` in `mobile/` — `firestore_test.dart` reproduces
-it against the Firestore repository). The legacy backend reproduces
-it from a fresh database (delete `backend/splitnest.db` first, then
-start the backend), or run `npm test` in `backend/`:
+| Member | Email | Password |
+|---|---|---|
+| Ali (M01) | `ali.demo@splitnest.app` | `ali123` |
+| Ayesha (M02) | `ayesha.demo@splitnest.app` | `ayesha123` |
+| Bilal (M03) | `bilal.demo@splitnest.app` | `bilal123` |
 
-1. Checkout Milk + Rice: total `780.00`, payer Ali, equal split → 260.00 each.
-2. Cleaning Supplies: `900.00`, payer Ayesha, equal Ali + Ayesha → 450.00 each.
-3. Internet Bill: `1500.00`, payer Bilal, custom Ali 500 / Ayesha 300 / Bilal 700.
-4. Electricity Bill: `1020.00`, payer Ali, equal → 340.00 each.
+Or sign up with any email — the account lives only on this
+device. Forgot password shows a 6-digit code on the device
+(valid 15 minutes, single-use); no email is sent, and the
+screen says plainly that anyone holding the device can reset a
+password that way.
 
-Expected: total spending **4200.00**, budget 5000.00, remaining **800.00**,
-**84%** used, status **Near Limit**, balances Ali **+250.00**, Ayesha
-**-450.00**, Bilal **+200.00** (sum 0.00). Then settle Ayesha → Ali 250.00
-(balances 0.00 / -200.00 / +200.00) and Ayesha → Bilal 200.00 (all 0.00);
-spending stays **4200.00**.
+## Environment variables
+
+The app reads **one** variable, and only from a Dart define at
+build/run time — it never reads a `.env` file:
+
+| Variable | Purpose | Required? |
+|---|---|---|
+| `GEMINI_API_KEY` | Google Gemini API key for the AI Assistant | No — without it the chat shows the not-configured state |
+
+```sh
+flutter run --dart-define=GEMINI_API_KEY=YOUR_KEY
+```
+
+`.env.example` at the repo root lists the placeholder name only.
+Never commit a real `.env` or a real key; `.env` is git-ignored.
+
+## API / database setup (local lock.json)
+
+There is no API and no database server. The whole household —
+users, groups, expenses, payments, shopping, fixed templates,
+invitations, activity, chat history, settings — lives in one
+JSON file, `lock.json`, in the app documents directory:
+
+- Android: `/data/data/com.practice.splitnest.splitnest/app_flutter/lock.json`
+- Web preview: no file — the store is in-memory only and does
+  not persist across reloads; the app shows a banner saying so.
+- Tests: `LockJsonStore.inMemory()` or
+  `LockJsonStore.inDirectory(<temp dir>)`.
+
+Writes are atomic (`lock.json.tmp` → rename, with a
+`lock.json.bak` of the last good state). A corrupt file falls
+back to the backup, then to a fresh seed, always with a plain
+in-app notice — never silent data loss.
+
+- **Back up** by copying `lock.json` (plus `logs.json`,
+  `receipts/` and `profile-photos/` if they matter) off the
+  device before uninstalling — **uninstalling deletes the
+  documents directory and lock.json with it**.
+- **Restore** by putting a saved `lock.json` back before launch.
+- **Seed reference:** `mobile/assets/lock-seed.json` is the
+  first-run content with fixed salts, for reference only — a real
+  first run generates fresh random salts.
+
+Full schema, atomicity, backup/restore and auth storage:
+[docs/LOCK_JSON.md](docs/LOCK_JSON.md).
+
+## AI integration (Gemini)
+
+The AI Assistant lives in the drawer. It answers questions
+about the household — spending, balances, budget usage, recent
+expenses — from a summary built from the **live** AppState data
+and sent with every message. The system prompt forbids inventing
+figures: when the data does not contain the answer, the bot says
+so instead of guessing. Chat history is stored per user in
+lock.json (`chatMessages`) and loads on open.
+
+**Current state: NOT configured.** No Gemini API key was
+supplied for this build, so the chat screen shows an "AI not
+configured" card with the setup steps and sending is disabled.
+Nothing is sent anywhere in that state, and the live Gemini call
+has not been tested against Google's servers.
+
+To enable it:
+
+1. Get a free key at Google AI Studio
+   (<https://aistudio.google.com/apikey>).
+2. Run or build with the key:
+   `flutter run --dart-define=GEMINI_API_KEY=YOUR_KEY`
+3. In CI, add `GEMINI_API_KEY` as a GitHub Actions secret and
+   pass the same `--dart-define` flag in the build step.
+
+The key is never hardcoded, never stored in the app, in
+lock.json, or in any file in this repo, and never logged —
+provider failures are logged with the HTTP status code only.
+Implementation: `mobile/lib/features/chatbot/` (provider,
+context, controller, screen).
+
+## Logging
+
+Structured logs go to `logs.json`, next to `lock.json` in the
+app documents directory (in-memory only on web). Each entry is
+`{timestamp, level, tag, message, data?}`; levels are
+`debug` / `info` / `warn` / `error`; tags are `app`, `auth`,
+`repository`, `chatbot`, `invitations`. Logged flows: app start,
+auth sign-in/sign-up/demo, repository errors, household refresh
+failures, chatbot calls and failures, invitation actions.
+
+- **Secrets are never logged.** The logger redacts Gemini keys
+  (`AIza…`), `api_key` / `password` / `token` / `secret` pairs,
+  `Authorization: Bearer` headers, and `?key=` URL parameters
+  to `[REDACTED]` (tested).
+- **Bounded.** Max 500 entries / 256 KB; oldest entries are
+  trimmed first, so the file cannot grow without limit.
+- **Template.** `docs/logs-template.json` is the empty structure
+  (`{"version": 1, "entries": []}`) — no real entries.
+
+Full detail: [docs/LOGGING.md](docs/LOGGING.md).
+
+## How to run
+
+```sh
+cd mobile
+flutter pub get
+flutter run                 # device / emulator
+flutter run -d chrome       # web preview (data does not persist)
+flutter run --dart-define=GEMINI_API_KEY=YOUR_KEY   # with the AI Assistant enabled
+```
+
+## Build instructions
+
+```sh
+cd mobile
+flutter analyze   # must report no issues
+flutter test      # full suite, see below
+flutter build web # web preview build
+```
+
+### Debug APK (GitHub Actions)
+
+Debug APKs are built by `.github/workflows/android-apk.yml` on
+every push to `main` (and on manual dispatch): it runs
+`flutter pub get`, `flutter analyze`, `flutter test`, then
+`flutter build apk --debug` and uploads `app-debug.apk` as the
+`splitnest-debug-apk` artifact. Local Gradle builds fail on the
+development VM, so Actions is the debug-APK route.
+
+### Release APK (blocked — no signing config)
+
+There is **no release signing configuration** in this repo: no
+keystore, no key alias, no passwords. A release APK is blocked
+until the user supplies or creates signing credentials. Do not
+invent any credential. The steps, when credentials exist:
+
+1. **Generate a keystore** (once, on a trusted machine):
+   ```sh
+   keytool -genkeypair -v -keystore splitnest-release.keystore \
+     -alias splitnest -keyalg RSA -keysize 2048 -validity 10000
+   ```
+   Keep the keystore file and its passwords safe — losing the
+   keystore means the app can never be updated under the same
+   signing identity.
+2. **Add the signing config** to
+   `mobile/android/app/build.gradle.kts` (release block
+   referencing `keyAlias`, `keyPassword`, `storeFile`,
+   `storePassword` from a `key.properties` file that is never
+   committed — `key.properties`, `*.jks` and `*.keystore` are
+   git-ignored).
+3. **Store the secrets in GitHub Actions**: upload the keystore
+   as a secret file (or base64-encode it into a secret), and add
+   `KEY_ALIAS`, `KEY_PASSWORD`, `STORE_PASSWORD` as repository
+   secrets.
+4. **Extend the workflow** (`.github/workflows/android-apk.yml`)
+   with a release job that restores the keystore and
+   `key.properties` from the secrets, runs
+   `flutter build apk --release`, and uploads the release APK
+   artifact.
+5. Verify the release APK installs, signs in, and keeps the
+   household across a restart before distributing it.
 
 ## Money rules (the important ones)
 
-- Equal split: base share floored, remainder paisa handed out 1-by-1 in
-  ascending member-ID order. `1000.00 / 3 = 333.34 / 333.33 / 333.33`;
-  `0.01 / 3 = 0.01 / 0.00 / 0.00`.
-- Custom splits must sum exactly to the amount, with unique known members.
-- Balance formula used (TESTING.md worked example): **Net = Paid − Share
-  + Sent − Received**. The task document prints the opposite sign for
-  settlements (`+ Received − Sent`), which would make Ali's balance +500
-  after receiving 250 instead of the official 0.00 — the worked example
-  governs here, and the discrepancy is flagged in the code comments.
-- Settlements never change total spending. Rejected: self-settlement,
-  zero/negative amounts, unknown members, non-debtor sender, non-creditor
-  recipient, over-settlement.
-- Checkout is atomic (one transaction): items become Bought and exactly
-  one expense is posted, or nothing changes. A second checkout of the
-  same items fails with 409.
+- Equal split: base share floored, remainder paisa handed out
+  1-by-1 in ascending member-ID order. `1000.00 / 3 = 333.34 /
+  333.33 / 333.33`; `0.01 / 3 = 0.01 / 0.00 / 0.00`.
+- Custom splits must sum exactly to the amount, with unique
+  known members.
+- Balance formula: **Net = Paid − Share + Sent − Received**.
+- Settlements never change total spending. Rejected:
+  self-settlement, zero/negative amounts, unknown members,
+  non-debtor sender, non-creditor recipient, over-settlement.
+- Checkout is atomic (one save): items become Bought and exactly
+  one expense is posted, or nothing changes.
 
-## Verified results (2026-11-05, professional upgrade)
+## Benchmark (reproduce exactly)
 
-- Backend: `npm test` — **11/11 tests pass** (4 money unit tests, 7 API
-  tests incl. persistence after restart, atomic checkout, and the exact
-  benchmark above). Live server + live benchmark re-run verified by curl.
-- Flutter: `flutter analyze` — **no issues found**; `flutter test` —
-  **17/17 pass** (6 money unit tests incl. Smart Settle plan, 11 widget
-  tests incl. splash → login → Home, login as Ayesha showing her
-  balance, logout returning to login, 4-tab navigation, Current/History
-  shopping tabs, Add Expense sheet with live preview, Smart Settle plan,
-  checkout bottom sheet with live split preview, settle suggestions);
-  `flutter build web` — **succeeded** (see note below).
+Sign in as a demo user and tap **Load demo benchmark** on Home
+(or run `flutter test` in `mobile/` — the tests reproduce it
+against the local repository):
 
-## Professional UI (2026-11-05)
+1. Checkout Milk + Rice: total `780.00`, payer Ali, equal split
+   → 260.00 each.
+2. Cleaning Supplies: `900.00`, payer Ayesha, equal Ali + Ayesha
+   → 450.00 each.
+3. Internet Bill: `1500.00`, payer Bilal, custom Ali 500 /
+   Ayesha 300 / Bilal 700.
+4. Electricity Bill: `1020.00`, payer Ali, equal → 340.00 each.
 
-- **Theme: light only, white + navy #1D2D44** (user decision; supersedes
-  the old teal #155E75 — no teal remains in the app). Gold #EEC558 from
-  the logo coins is a sparing accent. No dark theme, no toggle; the app
-  always renders light (`ThemeMode.light`), including on devices set to
-  dark mode. Full design system in `mobile/lib/src/theme.dart` (DESIGN.md
-  type scale 24/18/16/14, 16pt padding, 12pt radius, 48pt touch targets).
-- **Logo:** `assets/media-generation-splitnest-logo-0-…webp` (navy rounded
-  square, white nest, three gold coins). Copied to
-  `mobile/assets/splitnest-logo.webp` and declared in `pubspec.yaml`;
-  converted to PNG for Android launcher icons (all `mipmap-*`, plus
-  adaptive-icon foreground/background), web icons, and favicon.
-- **Flow: Splash → Login → Home.** Splash shows the logo centred on
-  white with the SplitNest wordmark, then auto-advances after ~1.8s.
-  Login is three tappable member cards (Ali M01, Ayesha M02, Bilal M03,
-  initials avatars) — **no password**, client-side member selection
-  only, clearly labelled "not verified identity". Home shows a
-  "Logged in as" card instead of the old free member switcher; the
-  AppBar has a Log out button that returns to login, and Home is
-  unreachable without picking a member again. No backend auth added;
-  the 7 endpoints are unchanged.
-- **Navigation: 4 tabs** — Home, Shopping, Expenses, Settle Up (the old
-  combined "Expenses & Settle" tab was split in two).
-- **Home:** branded navy header with the logo, centred Monthly Budget
-  ring (animated to its value; PKR total, % used, PKR remaining, status
-  pill), active-member balance card ("You are owed / You owe / Settled
-  up" + Paid/Share breakdown), Active Members card with owed/owe labels
-  + icons, Pending Shopping card (count + item names, tap opens
-  Shopping), pull-to-refresh, loading/empty/error states.
-- **Shopping:** Current List / History tabs (pending vs bought), item
-  rows with checkboxes for multi-select, unit + quantity, status pills,
-  quantity stepper in the add-item form, inline validation, a
-  "Checkout · N selected" bar, checkout as a bottom sheet with live
-  per-person split preview, double-tap protection, success snackbar.
-- **Expenses:** expense list (session-only) + an Add New Expense bottom
-  sheet with Title, Amount, category chips with Material icons
-  (Groceries, Utilities, Cleaning, Entertainment, General), date
-  picker, payer selector, and Split Strategy Equal / Exact / Custom —
-  Equal splits evenly across all members, Exact takes exact PKR amounts
-  per member that must sum to the total, Custom picks which members
-  share and splits evenly among them. Live split preview before submit.
-- **Settle Up:** balances table (Paid / Share / Net + owed/owe label),
-  a Smart Settle card computed from LIVE balances (greedy
-  largest-debtor → largest-creditor; on the benchmark it reads "Ayesha
-  pays Ali PKR 250.00 and Bilal PKR 200.00"), and a Settle Debt dialog
-  with debtor→creditor suggestions, max-settleable hint and explicit
-  confirmation. Settlements never change total spending.
-- **Animations (subtle):** splash logo fades + scales in, then one soft
-  pulse swell; AnimatedSwitcher fade/slide between splash, login, Home
-  and across bottom-nav tabs; cards fade + slide up on entrance with a
-  light stagger; the budget ring animates to its value. All 200–400ms
-  (ring 700ms), smooth easing, no flashing or bouncing. Reduced motion
-  is respected via `MediaQuery.disableAnimations`. Press feedback is
-  built-in Material ink ripple. The three gold coins are baked into the
-  single logo WebP, so they cannot animate separately — the whole logo
-  animates instead (no overlaid dots).
+Expected: total spending **4200.00**, budget 5000.00, remaining
+**800.00**, **84%** used, status **Near Limit**, balances Ali
+**+250.00**, Ayesha **-450.00**, Bilal **+200.00** (sum 0.00).
+Then settle Ayesha → Ali 250.00 (balances 0.00 / -200.00 /
++200.00) and Ayesha → Bilal 200.00 (all 0.00); spending stays
+**4200.00**.
 
-## Web build note (2026-11-05)
+## Tests
 
-`flutter build web` compiles both the JS and WASM targets and takes
-~60–90s on this VM. Two earlier attempts looked "aborted" but the
-build was in fact still compiling; the failure in the log was the
-dart2js worker being killed (exit -15) by a cleanup `pkill` that
-matched it. The successful run was started detached (`nohup`) and left
-alone until the log showed completion — do not `pkill` Dart/Flutter
-processes while it runs.
+```sh
+cd mobile
+flutter test
+```
+
+Test files in `mobile/test/`:
+
+- `money_test.dart`, `insights_test.dart` — money maths, insights.
+- `widget_test.dart` — login, demo, welcome, tabs, shopping,
+  expenses, settle, caps, receipt parser, timeline, monthly
+  view, drawer, celebration, profile photo.
+- `lock_json_test.dart` — the real local repository against a
+  temp-directory store and the in-memory store (persistence,
+  atomic write + corrupt-file recovery, split math, balances,
+  auth hashing, invitation codes, demo benchmark, payment verify
+  flow, fixed-expense apply, uploads).
+- `auth_test.dart` — password hashing + local auth service
+  (demo sign-in, sign-up validation, duplicate rejection, reset
+  flow, session restore) + AppState auth flows + login/forgot
+  widget tests.
+- `invitations_test.dart` — invite codes/links, the repository
+  contract, AppState invite → accept → switch end-to-end,
+  Invite screen widget test.
+- `phase5_test.dart` — percentage splits, expense auth,
+  payments, receipt OCR verify, QR, profile photos.
+- `chatbot_test.dart` — household-context grounding, the Gemini
+  provider against a fake HTTP client (the live call is NOT
+  tested — no key was supplied), the chat controller, and
+  history persistence round-trip through the real repository.
+- `logger_test.dart` — secret redaction, rotation bounds, JSON
+  validity, round-trip, corrupt-file recovery.
+- `chatbot_widget_test.dart` — the chatbot opens from the drawer
+  in the not-configured state; configured send/reply bubbles;
+  empty-message and clear-history behaviour.
+
+Verified results (Phase 7, 2026-11-07): `flutter analyze` — no
+issues; `flutter test` — **206/206 pass** (171 baseline + 35
+new: 16 chatbot + 14 logger + 5 chatbot widget);
+`flutter build web` — succeeds.
+
+## Honest lists
+
+### (a) Fully implemented and tested
+
+- Local `lock.json` store: seed, atomic writes, backup, corrupt
+  recovery, web in-memory fallback — `mobile/test/lock_json_test.dart`.
+- Local-only auth: sign-up, sign-in, demo sign-in (all three),
+  sign-out, session restore across restarts, device-local
+  6-digit-code password reset — `mobile/test/auth_test.dart`.
+- Percentage splits, expense CRUD + auth, record/verify/reject
+  payments, receipt OCR verify flow, QR entry, profile photos,
+  invitations UI, demo benchmark card, welcome popup, light/dark
+  theme toggles.
+- Invitations local-only (same-device code/link accept, group
+  switching, persisted household choice) —
+  `mobile/test/invitations_test.dart`.
+- AI chatbot: provider abstraction + Gemini REST implementation,
+  household-context grounding, per-user history persisted in
+  lock.json, not-configured state, chat UI — implemented and
+  tested except the live call (see (c)) —
+  `mobile/test/chatbot_test.dart`,
+  `mobile/test/chatbot_widget_test.dart`.
+- Structured logging: bounded, redacted `logs.json`, wired into
+  app start, auth, repository errors, chatbot and invitations —
+  `mobile/test/logger_test.dart`.
+
+### (b) Needs external deployment
+
+**NOTHING.** Firebase was dropped by user decision on 2026-11-07.
+There is no console step, no database to create, no rules to
+deploy, no provider to enable, no Cloud Function to publish.
+The app runs entirely on the device. (The only optional external
+step is obtaining a free Gemini API key if the AI Assistant is
+wanted — see [AI integration](#ai-integration-gemini).)
+
+### (c) Incomplete / not possible in this build
+
+- **Cloud sync:** none — data lives in one file on one device.
+- **Real Google Sign-In:** removed, no fake replacement.
+- **Cross-device invites / shared households across devices:**
+  invites work on the same device only.
+- **Push notifications:** none (no FCM, no server).
+- **Email sending:** none — no verification emails, no reset
+  emails, no invite emails. The password reset is an on-device
+  code, and the UI says plainly that anyone holding the device
+  can reset a password that way.
+- **Live AI call untested:** the Gemini provider is implemented
+  and tested against a fake HTTP client, but the live call
+  against Google's servers has not been run — no API key was
+  supplied. The chat screen shows the not-configured state until
+  a key is provided.
+- **Release APK:** blocked until signing credentials are
+  supplied/created — see [Release APK](#release-apk-blocked--no-signing-config).
+- **On-device lock.json persistence:** verified in tests
+  (temp-directory round-trips) and by the web build, but **not
+  yet verified live on a real Android device** — that needs one
+  live pass (install, sign in, kill the app, reopen, confirm the
+  household is still there).
+
+## Security considerations
+
+- **Passwords** are stored as salted SHA-256 hashes in
+  lock.json — never plaintext. One round of SHA-256 is not a
+  slow KDF (no bcrypt/Argon2); that is an accepted limit for a
+  device-local practice app, not a claim of server-grade
+  password storage.
+- **The Gemini API key** is supplied only via
+  `--dart-define`, never hardcoded, never stored in the app, in
+  lock.json, or in any committed file, and never logged. The
+  logger redacts anything that looks like a key or token.
+- **No server enforcement:** whoever holds the device holds the
+  data. The repository enforces the app rules (owner/admin-only
+  invite and verify, member-only edits of their own expenses) in
+  code — there is no server to enforce them.
+- **Device-local password reset:** the forgot-password flow
+  displays a code on the device, so anyone holding the device
+  can reset a password. The UI says so plainly.
+- **No secrets in the repo:** `.env`, keystores and
+  `key.properties` are git-ignored; `.env.example` carries
+  placeholder names only. No Firebase config remains (dropped
+  2026-11-07).
 
 ## Known limitations
 
-- **APK:** debug APKs are built by GitHub Actions
-  (`.github/workflows/android-apk.yml`) — local Gradle builds fail on
-  this VM. The Nov 5 phone-variant APK (real Google Sign-In) was
-  delivered; see the rebuild status above for the current state.
-- **Auth:** real Firebase Auth (email/password + Google + demo
-  accounts) since Phase 2; identity is the Firebase UID, there is no
-  backend token. Email-only users work end-to-end since Phase 3.
-- **Expense history:** persisted in Firestore since Phase 3
-  (`groups/{gid}/expenses`, newest first) — no longer session-only.
-- **Month scope:** budget totals count the current month's expenses;
-  balances are computed over all recorded expenses and settlements.
-- Pushed to GitHub: https://github.com/maraij/splitnest_riphahcup3
-  (main). The Nov 7 rebuild lands there incrementally, phase by phase.
+- **APK:** debug APKs are built by GitHub Actions — local Gradle
+  builds fail on the development VM. Release APKs are blocked
+  on signing credentials (see above).
+- **Auth:** local only (see above). Identity is the local account
+  uid; there is no backend token and no Google account.
+- **Expense history:** persisted in `lock.json` (`expenses`,
+  newest first).
+- **Month scope:** budget totals count the current month's
+  expenses; balances are computed over all recorded expenses and
+  settlements.
+- **Web preview does not persist** — reload and the household
+  starts fresh; the app shows a banner saying so.

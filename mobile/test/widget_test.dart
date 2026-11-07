@@ -6,28 +6,13 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:image_picker_platform_interface/image_picker_platform_interface.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:splitnest/data/google_auth_service.dart';
 import 'package:splitnest/data/repository.dart';
 import 'package:splitnest/main.dart';
 import 'package:splitnest/state/app_state.dart';
 
 import 'fake_repository.dart';
 
-/// Fake Google sign-in returning a scripted result, so the login
-/// screen's Google flow can be tested without a device or Google.
-class FakeGoogleAuthService implements GoogleAuthService {
-  FakeGoogleAuthService(this.result);
-  final GoogleSignInResult result;
-  bool signOutCalled = false;
-  @override
-  Future<GoogleSignInResult> signIn() async => result;
-  @override
-  Future<void> signOut() async {
-    signOutCalled = true;
-  }
-}
-
-/// Repository that always fails, for the cloud-unavailable test.
+/// Repository that always fails, for the local-unavailable test.
 class ThrowingRepository extends FakeSplitNestRepository {
   ThrowingRepository() : super.empty();
   @override
@@ -38,16 +23,15 @@ class ThrowingRepository extends FakeSplitNestRepository {
     required String legacyMemberId,
     required bool isDemo,
   }) async =>
-      throw const CloudDataException(cloudUnavailableMessage);
+      throw const LocalDataException(localDataUnavailableMessage);
 }
 
 Future<void> pumpApp(WidgetTester tester,
-    {SplitNestRepository? repository, GoogleAuthService? googleAuth}) async {
+    {SplitNestRepository? repository}) async {
   await tester.pumpWidget(
     ChangeNotifierProvider(
       create: (_) => AppState(
         repository: repository ?? FakeSplitNestRepository.benchmark(),
-        googleAuth: googleAuth,
       )..refresh(),
       child: const SplitNestApp(),
     ),
@@ -252,7 +236,7 @@ void main() {
 
   testWidgets('expenses tab shows add button and recent expenses',
       (tester) async {
-    // Fresh group: the history is the persisted Firestore list, so
+    // Fresh group: the history is the persisted lock.json list, so
     // it starts empty here and fills as expenses are posted.
     await loginAs(tester, 'Ali',
         repository: FakeSplitNestRepository.empty());
@@ -367,24 +351,24 @@ void main() {
         findsOneWidget);
   });
 
-  testWidgets('login shows error with retry when the cloud is down',
+  testWidgets('login shows error with retry when the store is down',
       (tester) async {
     await pumpApp(tester, repository: ThrowingRepository());
     await tester.pumpAndSettle();
-    // Logged out, nothing has been asked of the cloud yet: no error.
-    expect(find.textContaining('Cloud data unavailable'), findsNothing);
-    // Demo login asks the cloud for the household and fails honestly.
+    // Logged out, nothing has been asked of the store yet: no error.
+    expect(find.textContaining('Local data unavailable'), findsNothing);
+    // Demo login asks the store for the household and fails honestly.
     await tester.ensureVisible(find.text('Demo'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Demo'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Ali • M01'));
     await tester.pumpAndSettle();
-    expect(find.textContaining('Cloud data unavailable'), findsOneWidget);
+    expect(find.textContaining('Local data unavailable'), findsOneWidget);
     expect(find.text('Retry'), findsOneWidget);
     await tester.tap(find.text('Retry'));
     await tester.pumpAndSettle();
-    expect(find.textContaining('Cloud data unavailable'), findsOneWidget);
+    expect(find.textContaining('Local data unavailable'), findsOneWidget);
     // No fake data leaked in: no budget, no balances, no members.
     expect(find.text('Monthly Budget'), findsNothing);
   });
@@ -410,12 +394,14 @@ void main() {
 
   testWidgets('login page has no member-password form any more',
       (tester) async {
-    // Phase 3 retired the member-password login with the backend:
-    // the only ways in are Demo, Google and (with Firebase) email.
+    // Phase 3 retired the member-password login with the backend;
+    // Phase 6 dropped the cloud backend and third-party sign-in:
+    // the only ways in are Demo and email.
     await pumpApp(tester);
     expect(find.text('Log in'), findsOneWidget);
     expect(find.text('Demo'), findsOneWidget);
-    expect(find.text('Continue with Google'), findsOneWidget);
+    expect(find.text('Continue with Google'), findsNothing);
+    expect(find.text('Sign in with email instead'), findsOneWidget);
     expect(find.widgetWithText(TextField, 'Password'), findsNothing);
     expect(find.text('Monthly Budget'), findsNothing);
   });
@@ -514,65 +500,37 @@ void main() {
     expect(find.text('Log in'), findsOneWidget);
   });
 
-  testWidgets('Continue with Google signs in and asks for the member',
+  testWidgets('wrong email password stays on login with a message',
       (tester) async {
-    await pumpApp(tester,
-        googleAuth: FakeGoogleAuthService(const GoogleSignedIn(
-          idToken: 'fake-id-token',
-          email: 'test.user@gmail.com',
-        )));
-    // One Google button on the login page.
-    expect(find.text('Continue with Google'), findsOneWidget);
-    // Tapping it runs the Google flow, then asks which member this
-    // Google account is — no password, no fake session.
-    await tester.ensureVisible(find.text('Continue with Google'));
+    await pumpApp(tester);
+    await tester.tap(find.text('Sign in with email instead'));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Continue with Google'));
-    await tester.pumpAndSettle();
-    expect(find.text('Choose your account'), findsOneWidget);
-    expect(find.textContaining('test.user@gmail.com'), findsOneWidget);
-    await tester.tap(find.text('Ali • M01'));
-    await tester.pumpAndSettle();
-    // Logged in as Ali: the welcome popup, then Home.
-    if (find.text('Got it').evaluate().isNotEmpty) {
-      await tester.tap(find.text('Got it'));
-      await tester.pumpAndSettle();
-      if (find.text('Dismiss').evaluate().isNotEmpty) {
-        await tester.tap(find.text('Dismiss'));
-        await tester.pumpAndSettle();
-      }
-    }
-    expect(find.text('Log in'), findsNothing);
-    expect(find.text('Home'), findsOneWidget);
-  });
-
-  testWidgets('cancelling Google sign-in stays on login with a message',
-      (tester) async {
-    await pumpApp(tester,
-        googleAuth: FakeGoogleAuthService(const GoogleSignInCancelled()));
-    await tester.ensureVisible(find.text('Continue with Google'));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Continue with Google'));
-    await tester.pumpAndSettle();
-    expect(find.text('Google sign-in was cancelled.'), findsOneWidget);
-    expect(find.text('Log in'), findsOneWidget);
-  });
-
-  testWidgets('a failed Google sign-in stays on login with a message',
-      (tester) async {
-    await pumpApp(tester,
-        googleAuth: FakeGoogleAuthService(const GoogleSignInFailed(
-          'Google sign-in failed. Please try again or use member login.',
-        )));
-    await tester.ensureVisible(find.text('Continue with Google'));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Continue with Google'));
+    await tester.enterText(find.widgetWithText(TextField, 'Email'),
+        'ali.demo@splitnest.app');
+    await tester.enterText(
+        find.widgetWithText(TextField, 'Password'), 'not-the-password');
+    await tester.tap(find.text('Sign in'));
     await tester.pumpAndSettle();
     expect(
-        find.text(
-            'Google sign-in failed. Please try again or use member login.'),
+        find.text('That email or password is not correct. '
+            'Try again or reset your password.'),
         findsOneWidget);
     expect(find.text('Log in'), findsOneWidget);
+  });
+
+  testWidgets('email sign-in with a demo account enters Home',
+      (tester) async {
+    await pumpApp(tester);
+    await tester.tap(find.text('Sign in with email instead'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.widgetWithText(TextField, 'Email'),
+        'ayesha.demo@splitnest.app');
+    await tester.enterText(
+        find.widgetWithText(TextField, 'Password'), 'ayesha123');
+    await tester.tap(find.text('Sign in'));
+    await tester.pumpAndSettle();
+    expect(find.text('You are using SplitNest as Ayesha (M02)'),
+        findsOneWidget);
   });
 
 
@@ -1169,12 +1127,14 @@ void main() {
     addTearDown(() => SharedPreferences.setMockInitialValues({}));
     await loginAs(tester, 'Ali');
     await _openDrawer(tester);
-    expect(find.text('Dark theme'), findsOneWidget);
     // The switch sits below the 600px test fold — scroll the drawer
-    // list into view before tapping (harness, not an app bug).
+    // list into view before asserting or tapping (harness, not an
+    // app bug). It fell outside the ListView cache extent once the
+    // Phase 7 AI Assistant tile was added above it.
     await tester.scrollUntilVisible(find.text('Dark theme'), 200,
         scrollable: find.byType(Scrollable).last);
     await tester.pumpAndSettle();
+    expect(find.text('Dark theme'), findsOneWidget);
     await tester.tap(find.text('Dark theme'));
     await tester.pumpAndSettle();
     expect(Theme.of(tester.element(find.text('Monthly Budget'))).brightness,

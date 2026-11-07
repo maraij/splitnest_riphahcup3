@@ -1,7 +1,5 @@
 plugins {
     id("com.android.application")
-    // Reads mobile/android/app/google-services.json (Firebase config).
-    id("com.google.gms.google-services")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
 }
@@ -21,7 +19,6 @@ android {
         applicationId = "com.practice.splitnest.splitnest"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        // google_sign_in_android requires minSdk 24 (its own minSdk).
         minSdk = 24
         targetSdk = flutter.targetSdkVersion
         // Uses the version code from pubspec.yaml. When using split APKs, 1000 * ABI_VERSION
@@ -33,10 +30,9 @@ android {
     }
 
     // Debug builds sign with the committed debug keystore
-    // (mobile/android/app/debug.keystore, android/androiddebugkey) —
-    // its SHA-1 is the one registered in Firebase, so Google sign-in
-    // works in CI-built debug APKs. This is a debug key with the
-    // public default password; never use it for release builds.
+    // (mobile/android/app/debug.keystore, android/androiddebugkey).
+    // This is a debug key with the public default password; never
+    // use it for release builds.
     signingConfigs {
         getByName("debug") {
             storeFile = file("debug.keystore")

@@ -1,10 +1,10 @@
 // Phase 4 — invitations + shared households.
 // Covers, in three layers:
-//   1. the pure helpers (code/link/email/expiry) — no Firestore;
+//   1. the pure helpers (code/link/email/expiry) — no storage;
 //   2. the repository contract twice: the in-memory fake (fast,
-//      same validators) and the real FirestoreSplitNestRepository
-//      against FakeFirebaseFirestore (the transaction, the dotted
-//      members-map update, the duplicate/expired sweeps);
+//      same validators) and the real LocalJsonRepository against an
+//      in-memory lock.json store (the atomic accept, the roster
+//      update, the duplicate/expired sweeps);
 //   3. AppState end-to-end with the real repository: one user
 //      invites another, the invitee accepts by code, joins, and
 //      switches households — the demo benchmark is untouched.
@@ -12,12 +12,10 @@ library;
 
 import 'dart:math';
 
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:fake_cloud_firestore/fake_cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:splitnest/data/firestore_repository.dart';
+import 'package:splitnest/data/local_json_repository.dart';
 import 'package:splitnest/data/repository.dart';
 import 'package:splitnest/domain/invitations.dart';
 import 'package:splitnest/domain/models.dart';
@@ -116,13 +114,13 @@ void main() {
   });
 
   // The same invitation scenarios run against both repository
-  // implementations, so the fake and the real Firestore code cannot
+  // implementations, so the fake and the real local code cannot
   // drift apart on the contract.
   for (final (name, makeRepo) in <(String, SplitNestRepository Function())>[
     ('FakeSplitNestRepository', () => FakeSplitNestRepository.empty()),
     (
-      'FirestoreSplitNestRepository',
-      () => FirestoreSplitNestRepository(firestore: FakeFirebaseFirestore())
+      'LocalJsonRepository',
+      () => LocalJsonRepository(store: LockJsonStore.inMemory())
     ),
   ]) {
     group('invitations on $name', () {
@@ -163,7 +161,7 @@ void main() {
             actorName: 'Ali',
           );
 
-      test('create: code is the doc id, 7-day expiry, pending', () async {
+      test('create: code is the record id, 7-day expiry, pending', () async {
         final inv = await invite();
         expect(inv.id.length, 12);
         expect(inv.status, 'pending');
@@ -185,15 +183,15 @@ void main() {
       test('create rejects bad email, self-invite, bad role', () async {
         await expectLater(
           invite(email: 'not-an-email'),
-          throwsA(isA<CloudDataException>()),
+          throwsA(isA<LocalDataException>()),
         );
         await expectLater(
           invite(email: '  ALI.DEMO@splitnest.app '),
-          throwsA(isA<CloudDataException>()),
+          throwsA(isA<LocalDataException>()),
         );
         await expectLater(
           invite(role: 'superuser'),
-          throwsA(isA<CloudDataException>()),
+          throwsA(isA<LocalDataException>()),
         );
         expect(await repo.getGroupInvitations(gid), isEmpty);
       });
@@ -203,7 +201,7 @@ void main() {
         final first = await invite();
         await expectLater(
           invite(email: ' AYESHA.demo@splitnest.app '),
-          throwsA(isA<CloudDataException>()),
+          throwsA(isA<LocalDataException>()),
         );
         // A different email is fine.
         await invite(email: otherEmail);
@@ -227,7 +225,7 @@ void main() {
         // A stranger (not a group member at all) cannot invite.
         await expectLater(
           invite(actorUid: 'uid-stranger', actorEmail: 's@x.com'),
-          throwsA(isA<CloudDataException>()),
+          throwsA(isA<LocalDataException>()),
         );
         // The owner CAN grant admin.
         final adminInvite = await invite(email: otherEmail, role: 'admin');
@@ -259,7 +257,7 @@ void main() {
             actorEmail: otherEmail,
             actorName: 'Bilal',
           ),
-          throwsA(isA<CloudDataException>()),
+          throwsA(isA<LocalDataException>()),
         );
       });
 
@@ -280,7 +278,7 @@ void main() {
             invitationId: inv.id,
             actorUid: 'uid-bilal',
           ),
-          throwsA(isA<CloudDataException>()),
+          throwsA(isA<LocalDataException>()),
         );
         // The owner can.
         await repo.revokeInvitation(
@@ -301,7 +299,7 @@ void main() {
             invitationId: inv.id,
             actorUid: ownerUid,
           ),
-          throwsA(isA<CloudDataException>()),
+          throwsA(isA<LocalDataException>()),
         );
         // A revoked invite cannot be accepted.
         await expectLater(
@@ -311,7 +309,7 @@ void main() {
             email: inviteeEmail,
             displayName: 'Ayesha',
           ),
-          throwsA(isA<CloudDataException>()),
+          throwsA(isA<LocalDataException>()),
         );
       });
 
@@ -346,7 +344,7 @@ void main() {
             email: inviteeEmail,
             displayName: 'Ayesha',
           ),
-          throwsA(isA<CloudDataException>()),
+          throwsA(isA<LocalDataException>()),
         );
         // And the membership is unchanged (no duplicate join).
         expect(
@@ -366,7 +364,7 @@ void main() {
             email: 'intruder@example.com',
             displayName: 'Intruder',
           ),
-          throwsA(isA<CloudDataException>()),
+          throwsA(isA<LocalDataException>()),
         );
         // The invite is still pending for the right person.
         expect(
@@ -380,7 +378,7 @@ void main() {
             email: inviteeEmail,
             displayName: 'Ayesha',
           ),
-          throwsA(isA<CloudDataException>()),
+          throwsA(isA<LocalDataException>()),
         );
         // Grouped / lower-case code entry resolves to the same doc.
         final accepted = await repo.acceptInvitation(
@@ -404,11 +402,12 @@ void main() {
     });
   }
 
-  group('expiry (Firestore repo, stale doc written directly)', () {
+  group('expiry (local repo, stale record written directly)', () {
     test('accept rejects expired; listing derives it; admin sweep stores it',
         () async {
-      final fake = FakeFirebaseFirestore();
-      final repo = FirestoreSplitNestRepository(firestore: fake);
+      final repo =
+          LocalJsonRepository(store: LockJsonStore.inMemory());
+      final store = repo.store;
       final info = await repo.ensureGroup(
         uid: 'uid-ali',
         displayName: 'Ali',
@@ -418,7 +417,10 @@ void main() {
       );
       final gid = info.groupId;
       const code = 'STALE1234ABC';
-      await fake.collection('invitations').doc(code).set({
+      // A stale invitation, written straight into lock.json.
+      final doc = await store.load();
+      (doc['invitations'] as List).add({
+        'id': code,
         'groupId': gid,
         'groupName': 'SplitNest Household',
         'invitedEmail': 'ayesha.demo@splitnest.app',
@@ -426,11 +428,14 @@ void main() {
         'inviterName': 'Ali',
         'role': 'member',
         'status': 'pending',
-        'createdAt': Timestamp.fromDate(
-            DateTime.now().subtract(const Duration(days: 8))),
-        'expiresAt': Timestamp.fromDate(
-            DateTime.now().subtract(const Duration(days: 1))),
+        'createdAt': DateTime.now()
+            .subtract(const Duration(days: 8))
+            .toIso8601String(),
+        'expiresAt': DateTime.now()
+            .subtract(const Duration(days: 1))
+            .toIso8601String(),
       });
+      await store.save(doc);
       // The invitee's list derives the expiry (no sweep write —
       // the invitee cannot write that transition).
       final mine =
@@ -446,13 +451,15 @@ void main() {
           email: 'ayesha.demo@splitnest.app',
           displayName: 'Ayesha',
         ),
-        throwsA(isA<CloudDataException>()),
+        throwsA(isA<LocalDataException>()),
       );
       // The admin listing sweeps it to stored `expired`.
       await repo.getGroupInvitations(gid);
-      final doc =
-          await fake.collection('invitations').doc(code).get();
-      expect(doc.data()?['status'], 'expired');
+      final after = await store.load();
+      final stored = ((after['invitations'] as List)
+              .cast<Map<String, dynamic>>())
+          .single;
+      expect(stored['status'], 'expired');
       // And the sweep is visible to the invitee as stored-expired.
       final mineAfter =
           await repo.getMyInvitations('ayesha.demo@splitnest.app');
@@ -460,11 +467,11 @@ void main() {
     });
   });
 
-  group('AppState end-to-end (real Firestore repo, fake Firestore)', () {
+  group('AppState end-to-end (real local repo, in-memory store)', () {
     test('invite → accept by code → join → switch households', () async {
       SharedPreferences.setMockInitialValues({});
-      final fake = FakeFirebaseFirestore();
-      final repo = FirestoreSplitNestRepository(firestore: fake);
+      final repo =
+          LocalJsonRepository(store: LockJsonStore.inMemory());
 
       // Ali signs in (demo) and invites Ayesha by email.
       final ali = AppState(repository: repo);
@@ -526,8 +533,8 @@ void main() {
 
     test('accept by pasted link works; demo benchmark untouched', () async {
       SharedPreferences.setMockInitialValues({});
-      final fake = FakeFirebaseFirestore();
-      final repo = FirestoreSplitNestRepository(firestore: fake);
+      final repo =
+          LocalJsonRepository(store: LockJsonStore.inMemory());
       final ali = AppState(repository: repo);
       await ali.loginWithDemo(memberId: 'M01');
       // Ali loads the demo benchmark in his own household first.
@@ -560,8 +567,8 @@ void main() {
 
     test('wrong-email accept fails with a plain message', () async {
       SharedPreferences.setMockInitialValues({});
-      final fake = FakeFirebaseFirestore();
-      final repo = FirestoreSplitNestRepository(firestore: fake);
+      final repo =
+          LocalJsonRepository(store: LockJsonStore.inMemory());
       final ali = AppState(repository: repo);
       await ali.loginWithDemo(memberId: 'M01');
       final invite = await ali.sendInvitation(
@@ -581,6 +588,9 @@ void main() {
   group('Invite screen (widget)', () {
     testWidgets('drawer opens it; send shows code + pending invite; '
         'revoke removes it', (tester) async {
+      // The e2e tests above persist a local session in the mock
+      // prefs; clear it so this test starts on the login screen.
+      SharedPreferences.setMockInitialValues({});
       await widget_helpers.loginAs(
         tester,
         'Ali',

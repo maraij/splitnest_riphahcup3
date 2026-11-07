@@ -1,9 +1,9 @@
 // Shared in-memory fake of [SplitNestRepository] for widget, auth and
-// Firestore-migration tests. It implements the exact same contract as
-// the Firestore repository (same validators, same messages, same
+// local-store tests. It implements the exact same contract as
+// the local repository (same validators, same messages, same
 // atomicity rules) over plain Dart lists, so tests never touch a real
-// database — and the production Firestore behaviour is covered
-// separately in firestore_test.dart against FakeFirebaseFirestore.
+// file — and the production local behaviour is covered
+// separately in lock_json_test.dart against a temp-directory store.
 //
 // Factories:
 // - [FakeSplitNestRepository.benchmark] (default): the household as
@@ -22,6 +22,7 @@ import 'dart:typed_data';
 
 import 'package:splitnest/core/money.dart';
 import 'package:splitnest/data/demo_benchmark.dart';
+import 'package:splitnest/domain/chat_message.dart';
 import 'package:splitnest/domain/expense_auth.dart';
 import 'package:splitnest/domain/invitations.dart';
 import 'package:splitnest/data/repository.dart';
@@ -94,6 +95,7 @@ class FakeSplitNestRepository implements SplitNestRepository {
   final List<PaymentRecord> _payments = [];
   List<FixedExpense> _fixed = [];
   final List<ActivityEntry> _activity = [];
+  final List<ChatMessage> _chatMessages = [];
   final Map<String, String> _appliedFixed = {};
   bool _benchmarkLoaded;
   int _seq = 0;
@@ -119,6 +121,7 @@ class FakeSplitNestRepository implements SplitNestRepository {
   List<ShoppingItem> get allShopping => List.of(_shopping);
   List<FixedExpense> get allFixed => List.of(_fixed);
   List<ActivityEntry> get allActivity => List.of(_activity);
+  List<ChatMessage> get allChatMessages => List.of(_chatMessages);
   List<Invitation> get allInvitations => List.of(_invitations);
   bool get benchmarkLoaded => _benchmarkLoaded;
 
@@ -177,8 +180,9 @@ class FakeSplitNestRepository implements SplitNestRepository {
   /// photo URLs on the right member.
   String? _uidForMember(String memberId) {
     // Roles are keyed by UID; the fake's demo logins use
-    // 'demo-M01' style UIDs (see AppState.loginWithDemo without a
-    // Firebase service) and 'local-M01' for Google-without-Firebase.
+    // 'demo-M01' style UIDs (see AppState.loginWithDemo, which
+    // signs demo users in locally) and 'local-M01' for a signed-in
+    // user with no session uid yet.
     for (final uid in _roles[groupId]?.keys ?? <String>[]) {
       if (uid.endsWith('-$memberId')) return uid;
     }
@@ -217,14 +221,14 @@ class FakeSplitNestRepository implements SplitNestRepository {
     required String actorUid,
   }) async {
     if (title.trim().isEmpty) {
-      throw const CloudDataException('Title is required.');
+      throw const LocalDataException('Title is required.');
     }
     if (!shoppingUnits.contains(unit)) {
-      throw CloudDataException(
+      throw LocalDataException(
           'Unit must be one of: ${shoppingUnits.join(', ')}.');
     }
     if (qty <= 0) {
-      throw const CloudDataException(
+      throw const LocalDataException(
           'Quantity must be a positive whole number.');
     }
     final item = ShoppingItem(
@@ -249,7 +253,7 @@ class FakeSplitNestRepository implements SplitNestRepository {
   }) async {
     final totalPaisa = parsePaisa(totalPaid);
     if (totalPaisa == null) {
-      throw const CloudDataException('Total paid must be a positive amount.');
+      throw const LocalDataException('Total paid must be a positive amount.');
     }
     // Validate everything BEFORE mutating anything (atomicity).
     validateCheckout(
@@ -268,7 +272,7 @@ class FakeSplitNestRepository implements SplitNestRepository {
     );
     if (failNextCheckout) {
       failNextCheckout = false;
-      throw const CloudDataException(
+      throw const LocalDataException(
           'Checkout failed; nothing was changed.');
     }
     final titles = itemIds
@@ -320,17 +324,17 @@ class FakeSplitNestRepository implements SplitNestRepository {
     required String actorUid,
   }) async {
     if (title.trim().isEmpty) {
-      throw const CloudDataException('Title is required.');
+      throw const LocalDataException('Title is required.');
     }
     final amountPaisa = parsePaisa(amount);
     if (amountPaisa == null || amountPaisa <= 0) {
-      throw const CloudDataException('Amount must be a positive amount.');
+      throw const LocalDataException('Amount must be a positive amount.');
     }
     if (!RegExp(r'^\d{4}-\d{2}-\d{2}$').hasMatch(date)) {
-      throw const CloudDataException('Date must be YYYY-MM-DD.');
+      throw const LocalDataException('Date must be YYYY-MM-DD.');
     }
     if (!_knownIds.contains(payerId)) {
-      throw CloudDataException('Payer $payerId does not exist.');
+      throw LocalDataException('Payer $payerId does not exist.');
     }
     final shares = validatedShares(
       amountPaisa: amountPaisa,
@@ -372,7 +376,7 @@ class FakeSplitNestRepository implements SplitNestRepository {
   }
 
   /// The member id for a fake UID (`demo-M01` / `local-M01` style),
-  /// or null for a real Firebase UID the fake never linked.
+  /// or null for a uid the fake never linked.
   String? _memberIdForUid(String uid) {
     final m = RegExp(r'-(M\d+)$').firstMatch(uid);
     return m?.group(1);
@@ -396,30 +400,30 @@ class FakeSplitNestRepository implements SplitNestRepository {
     required String actorUid,
   }) async {
     final i = _expenses.indexWhere((e) => e.id == id);
-    if (i < 0) throw const CloudDataException('Expense not found.');
+    if (i < 0) throw const LocalDataException('Expense not found.');
     final old = _expenses[i];
     if (!_mayEditExpense(old, actorUid)) {
-      throw const CloudDataException(
+      throw const LocalDataException(
           'Only the member who added this expense (or the household '
           'owner/admin) can change or delete it.');
     }
     final newTitle = title?.trim() ?? old.title;
     if (newTitle.isEmpty) {
-      throw const CloudDataException('Title is required.');
+      throw const LocalDataException('Title is required.');
     }
     final newAmountPaisa =
         amount == null ? parsePaisa(old.amount) : parsePaisa(amount);
     if (newAmountPaisa == null || newAmountPaisa <= 0) {
-      throw const CloudDataException('Amount must be a positive amount.');
+      throw const LocalDataException('Amount must be a positive amount.');
     }
     final newDate = date ?? old.date;
     if (newDate == null ||
         !RegExp(r'^\d{4}-\d{2}-\d{2}$').hasMatch(newDate)) {
-      throw const CloudDataException('Date must be YYYY-MM-DD.');
+      throw const LocalDataException('Date must be YYYY-MM-DD.');
     }
     final newPayerId = payerId ?? old.payerId;
     if (!_knownIds.contains(newPayerId)) {
-      throw CloudDataException('Payer $newPayerId does not exist.');
+      throw LocalDataException('Payer $newPayerId does not exist.');
     }
     final newSplitType = splitType ?? old.splitType ?? 'equal';
     List<({String memberId, int amountPaisa})> shares;
@@ -453,7 +457,7 @@ class FakeSplitNestRepository implements SplitNestRepository {
       final sum = old.shares.fold(
           0, (s, sh) => s + (parsePaisa(sh.amount) ?? 0));
       if (sum != newAmountPaisa) {
-        throw CloudDataException(
+        throw LocalDataException(
             'Stored shares sum to ${formatPaisa(sum)} but the amount is '
             '${formatPaisa(newAmountPaisa)} — re-enter the split.');
       }
@@ -495,9 +499,9 @@ class FakeSplitNestRepository implements SplitNestRepository {
     required String actorUid,
   }) async {
     final i = _expenses.indexWhere((e) => e.id == id);
-    if (i < 0) throw const CloudDataException('Expense not found.');
+    if (i < 0) throw const LocalDataException('Expense not found.');
     if (!_mayEditExpense(_expenses[i], actorUid)) {
-      throw const CloudDataException(
+      throw const LocalDataException(
           'Only the member who added this expense (or the household '
           'owner/admin) can change or delete it.');
     }
@@ -543,7 +547,7 @@ class FakeSplitNestRepository implements SplitNestRepository {
   }) async {
     final amountPaisa = parsePaisa(amount);
     if (amountPaisa == null) {
-      throw const CloudDataException('Settlement amount must be positive.');
+      throw const LocalDataException('Settlement amount must be positive.');
     }
     final balances = _balances();
     final error = settlementError(
@@ -554,7 +558,7 @@ class FakeSplitNestRepository implements SplitNestRepository {
       recipientId: recipientId,
       amountPaisa: amountPaisa,
     );
-    if (error != null) throw CloudDataException(error);
+    if (error != null) throw LocalDataException(error);
     final payment = PaymentRecord(
       id: 'P-fake-${++_seq}',
       senderId: senderId,
@@ -574,7 +578,7 @@ class FakeSplitNestRepository implements SplitNestRepository {
     required String actorUid,
   }) async {
     final i = _payments.indexWhere((p) => p.id == paymentId);
-    if (i < 0) throw const CloudDataException('Payment not found.');
+    if (i < 0) throw const LocalDataException('Payment not found.');
     final old = _payments[i];
     final role = _roles[groupId]?[actorUid];
     final error = paymentStatusTransitionError(
@@ -582,7 +586,7 @@ class FakeSplitNestRepository implements SplitNestRepository {
       target: 'verified',
       isAdmin: role == 'owner' || role == 'admin',
     );
-    if (error != null) throw CloudDataException(error);
+    if (error != null) throw LocalDataException(error);
     final verified = PaymentRecord(
       id: old.id,
       senderId: old.senderId,
@@ -604,7 +608,7 @@ class FakeSplitNestRepository implements SplitNestRepository {
     required String actorUid,
   }) async {
     final i = _payments.indexWhere((p) => p.id == paymentId);
-    if (i < 0) throw const CloudDataException('Payment not found.');
+    if (i < 0) throw const LocalDataException('Payment not found.');
     final old = _payments[i];
     final role = _roles[groupId]?[actorUid];
     final error = paymentStatusTransitionError(
@@ -612,7 +616,7 @@ class FakeSplitNestRepository implements SplitNestRepository {
       target: 'rejected',
       isAdmin: role == 'owner' || role == 'admin',
     );
-    if (error != null) throw CloudDataException(error);
+    if (error != null) throw LocalDataException(error);
     final rejected = PaymentRecord(
       id: old.id,
       senderId: old.senderId,
@@ -638,21 +642,21 @@ class FakeSplitNestRepository implements SplitNestRepository {
     required String actorUid,
   }) async {
     if (title.trim().isEmpty) {
-      throw const CloudDataException('Title is required.');
+      throw const LocalDataException('Title is required.');
     }
     final amountPaisa = parsePaisa(amount);
     if (amountPaisa == null || amountPaisa <= 0) {
-      throw const CloudDataException('Amount must be a positive amount.');
+      throw const LocalDataException('Amount must be a positive amount.');
     }
     if (!_knownIds.contains(payerId)) {
-      throw CloudDataException('Payer $payerId does not exist.');
+      throw LocalDataException('Payer $payerId does not exist.');
     }
     final splitIds = (splitMemberIds != null && splitMemberIds.isNotEmpty)
         ? splitMemberIds
         : _knownIds;
     if (splitIds.toSet().length != splitIds.length ||
         splitIds.any((m) => !_knownIds.contains(m))) {
-      throw const CloudDataException(
+      throw const LocalDataException(
           'Split members must be known members, listed once.');
     }
     final fixed = FixedExpense(
@@ -678,7 +682,7 @@ class FakeSplitNestRepository implements SplitNestRepository {
     List<String>? splitMemberIds,
   }) async {
     final i = _fixed.indexWhere((f) => f.id == id);
-    if (i < 0) throw const CloudDataException('Fixed expense not found.');
+    if (i < 0) throw const LocalDataException('Fixed expense not found.');
     final old = _fixed[i];
     final updated = FixedExpense(
       id: old.id,
@@ -712,7 +716,7 @@ class FakeSplitNestRepository implements SplitNestRepository {
     }
     final fixed = _fixed.where((f) => f.id == id).firstOrNull;
     if (fixed == null) {
-      throw const CloudDataException('Fixed expense not found.');
+      throw const LocalDataException('Fixed expense not found.');
     }
     _appliedFixed[key] = _monthKey();
     final shares = validatedShares(
@@ -758,12 +762,12 @@ class FakeSplitNestRepository implements SplitNestRepository {
   }
 
   // ---- Invitations + shared households (Phase 4) ----
-  // Same contract as FirestoreSplitNestRepository, over plain lists.
+  // Same contract as LocalJsonRepository, over plain lists.
 
   String _roleOf(String groupId, String uid) {
     final role = _roles[groupId]?[uid];
     if (role == null) {
-      throw const CloudDataException(
+      throw const LocalDataException(
           'Only the household owner or an admin can do that.');
     }
     return role;
@@ -789,24 +793,24 @@ class FakeSplitNestRepository implements SplitNestRepository {
   }) async {
     final email = normalizeInviteEmail(invitedEmail);
     if (!isValidInviteEmail(email)) {
-      throw const CloudDataException(
+      throw const LocalDataException(
           'Enter a valid email address, like name@example.com.');
     }
     if (actorEmail != null && email == normalizeInviteEmail(actorEmail)) {
-      throw const CloudDataException(
+      throw const LocalDataException(
           'You cannot invite yourself — that email is already in '
           'this household.');
     }
     if (role != 'member' && role != 'admin') {
-      throw const CloudDataException('Role must be member or admin.');
+      throw const LocalDataException('Role must be member or admin.');
     }
     final actorRole = _roleOf(groupId, actorUid);
     if (actorRole != 'owner' && actorRole != 'admin') {
-      throw const CloudDataException(
+      throw const LocalDataException(
           'Only the household owner or an admin can invite.');
     }
     if (role == 'admin' && actorRole != 'owner') {
-      throw const CloudDataException(
+      throw const LocalDataException(
           'Only the household owner can grant the admin role.');
     }
     _sweepExpiredFake();
@@ -814,7 +818,7 @@ class FakeSplitNestRepository implements SplitNestRepository {
         i.groupId == groupId &&
         i.invitedEmail == email &&
         i.isPending)) {
-      throw CloudDataException(
+      throw LocalDataException(
           'An invitation is already pending for $email in this '
           'household.');
     }
@@ -823,7 +827,7 @@ class FakeSplitNestRepository implements SplitNestRepository {
       code = generateInviteCode();
       if (!_invitations.any((i) => i.id == code)) break;
       if (attempt == 4) {
-        throw const CloudDataException(
+        throw const LocalDataException(
             'Could not create the invitation. Please try again.');
       }
     }
@@ -870,14 +874,14 @@ class FakeSplitNestRepository implements SplitNestRepository {
   }) async {
     final role = _roleOf(groupId, actorUid);
     if (role != 'owner' && role != 'admin') {
-      throw const CloudDataException(
+      throw const LocalDataException(
           'Only the household owner or an admin can revoke an '
           'invitation.');
     }
     final i = _invitations.indexWhere((v) => v.id == invitationId);
-    if (i < 0) throw const CloudDataException('Invitation not found.');
+    if (i < 0) throw const LocalDataException('Invitation not found.');
     if (_invitations[i].status != 'pending') {
-      throw const CloudDataException(
+      throw const LocalDataException(
           'This invitation is no longer pending.');
     }
     _invitations[i] = _invitations[i].copyWith(status: 'revoked');
@@ -892,37 +896,37 @@ class FakeSplitNestRepository implements SplitNestRepository {
   }) async {
     final cleanEmail = normalizeInviteEmail(email);
     if (cleanEmail.isEmpty || !isValidInviteEmail(cleanEmail)) {
-      throw const CloudDataException(
+      throw const LocalDataException(
           'Sign in with an email address to accept an invitation.');
     }
     final code = normalizeInviteCode(invitationId);
     if (code.isEmpty) {
-      throw const CloudDataException(
+      throw const LocalDataException(
           'Enter an invite code to join a household.');
     }
     final i = _invitations.indexWhere((v) => v.id == code);
-    if (i < 0) throw const CloudDataException('Invitation not found.');
+    if (i < 0) throw const LocalDataException('Invitation not found.');
     final inv = _invitations[i];
     if (inv.status == 'accepted') {
-      throw const CloudDataException(
+      throw const LocalDataException(
           'This invitation has already been accepted.');
     }
     if (inv.status != 'pending') {
-      throw const CloudDataException(
+      throw const LocalDataException(
           'This invitation is no longer pending.');
     }
     if (inv.isExpired) {
-      throw const CloudDataException(
+      throw const LocalDataException(
           'This invitation has expired. Ask for a new one.');
     }
     if (inv.invitedEmail != cleanEmail) {
-      throw const CloudDataException(
+      throw const LocalDataException(
           'This invitation was sent to a different email address. '
           'Sign in with that email to accept it.');
     }
     // Atomic in the fake: every mutation below happens only after
-    // every check above passed, mirroring the Firestore
-    // transaction (members map + mirror + invite + activity).
+    // every check above passed, mirroring the local repository's
+    // single-save accept (roster + invite + activity).
     final accepted = inv.copyWith(status: 'accepted', acceptedBy: actorUid);
     _invitations[i] = accepted;
     final grantedRole = inv.role == 'admin' ? 'admin' : 'member';
@@ -971,6 +975,27 @@ class FakeSplitNestRepository implements SplitNestRepository {
     required String uid,
   }) async =>
       _roles[groupId]?[uid];
+
+  @override
+  Future<List<ChatMessage>> getChatMessages(String uid) async {
+    final messages =
+        _chatMessages.where((m) => m.userId == uid).toList();
+    messages.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+    return messages;
+  }
+
+  @override
+  Future<void> addChatMessage({
+    required String uid,
+    required ChatMessage message,
+  }) async {
+    _chatMessages.add(message);
+  }
+
+  @override
+  Future<void> clearChatMessages(String uid) async {
+    _chatMessages.removeWhere((m) => m.userId == uid);
+  }
 
   @override
   Future<void> logActivity({

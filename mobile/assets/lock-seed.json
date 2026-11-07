@@ -1,0 +1,50 @@
+{
+  "_note": "Reference snapshot of the first-run lock.json seed (see docs/LOCK_JSON.md). A real first run generates fresh random salts; the demo passwords here are the public demo credentials (ali123 / ayesha123 / bilal123). Copy to the app documents directory as lock.json to start from this seed.",
+  "version": 1,
+  "users": [
+    {
+      "id": "demo-M01",
+      "email": "ali.demo@splitnest.app",
+      "displayName": "Ali",
+      "memberId": "M01",
+      "passwordSalt": "f17cfbb820925a8ba7ec18d8020128fd",
+      "passwordHash": "895fb3efd80d8f027beb07affb5288ce6fad3968ff7c33d3c5c37c9fa2c5ae86",
+      "isDemo": true,
+      "photoUrl": null,
+      "createdAt": "2026-11-07T09:53:30.356292Z"
+    },
+    {
+      "id": "demo-M02",
+      "email": "ayesha.demo@splitnest.app",
+      "displayName": "Ayesha",
+      "memberId": "M02",
+      "passwordSalt": "49589c5afcf6094ed0734165636a0d3f",
+      "passwordHash": "bcfc51af2baeaf654a8e4b5e641bbda93d7a8e3660c9bd1ef4ae0110fabd5983",
+      "isDemo": true,
+      "photoUrl": null,
+      "createdAt": "2026-11-07T09:53:30.356292Z"
+    },
+    {
+      "id": "demo-M03",
+      "email": "bilal.demo@splitnest.app",
+      "displayName": "Bilal",
+      "memberId": "M03",
+      "passwordSalt": "7201fc4822f23448b18943dac561fe6a",
+      "passwordHash": "aa73fbab2b4ccb4357bdfa555bcd3b931c445ba6dd08b92b713bc9884c0502d5",
+      "isDemo": true,
+      "photoUrl": null,
+      "createdAt": "2026-11-07T09:53:30.356292Z"
+    }
+  ],
+  "groups": [],
+  "expenses": [],
+  "payments": [],
+  "shopping": [],
+  "fixedExpenses": [],
+  "invitations": [],
+  "activity": [],
+  "settings": {
+    "budgetPaisa": 500000,
+    "theme": "light"
+  }
+}

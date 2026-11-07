@@ -5,11 +5,12 @@
 /// the caller shows a verify-before-save screen with the extracted
 /// fields editable — nothing is ever saved straight from OCR.
 ///
-/// Uploading is deliberately NOT here: the bytes go to the backend
-/// through the repository interface only
+/// Uploading is deliberately NOT here: the bytes go to the local
+/// store through the repository interface only
 /// (`SplitNestRepository.uploadReceipt` / `uploadProfilePhoto`), so
-/// the store can be swapped (Firebase Storage today, local files
-/// tomorrow) without touching this service or any screen.
+/// the store can be swapped without touching this service or any
+/// screen. The local implementation writes them to files under
+/// the app documents directory (see local_json_repository.dart).
 ///
 /// Honest failure modes, never faked results:
 /// - ML Kit has NO web implementation: on web OCR is skipped outright

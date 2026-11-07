@@ -2,7 +2,7 @@
 /// templates and two shopping items from the old backend benchmark
 /// (README "Benchmark (reproduce exactly)"), as pure data.
 ///
-/// Both the Firestore repository and the in-memory test fake seed
+/// Both the local repository and the in-memory test fake seed
 /// from here, so the benchmark is identical everywhere. Benchmark
 /// expenses are dated "today" (the old backend dated every benchmark
 /// expense today), so they count towards the current month's total
@@ -13,7 +13,7 @@
 /// taps "Load demo benchmark" ([SplitNestRepository.loadDemoBenchmark]).
 /// Seeded docs carry deterministic ids (`demo-benchmark-*`,
 /// `demo-fixed-*`, `demo-shopping-*`) so a second load is a no-op,
-/// and seeded expenses carry `isDemoData: true` in Firestore
+/// and seeded expenses carry `isDemo: true` in lock.json
 /// (`isDemo` on [ExpenseRecord]) so the UI can label them.
 library;
 

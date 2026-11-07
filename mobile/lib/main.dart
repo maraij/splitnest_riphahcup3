@@ -1,13 +1,12 @@
-import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import 'data/firebase_auth_service.dart';
-import 'data/firestore_repository.dart';
-import 'data/repository.dart';
+import 'data/local_auth_service.dart';
+import 'data/local_json_repository.dart';
+import 'core/services/app_logger.dart';
 import 'features/auth/login_screen.dart';
-import 'features/auth/verification_screen.dart';
+import 'features/chatbot/chatbot_screen.dart';
 import 'features/expenses/expenses_screen.dart';
 import 'features/home/home_screen.dart';
 import 'features/invite/invite_screen.dart';
@@ -24,41 +23,28 @@ import 'core/widgets/entrance.dart';
 /// SplitNest — practice-only shared-living expense app.
 /// PRACTICE ONLY — NOT FOR SUBMISSION.
 /// Flow: Splash (logo, auto-advances after ~2.5s, no tap) →
-/// AuthGate: Firebase auth state decides — signed-out → login,
-/// signed-in but email-unverified → verification screen,
-/// signed-in + verified (or demo) → Home as the linked member.
-/// Sign-in is Firebase Auth only (email/password, Google, demo);
-/// there is no member-password login and no backend session any
-/// more. Household data lives in Cloud Firestore
-/// (FirestoreSplitNestRepository); the Node backend is retired (see
-/// backend/LEGACY.md). Log out returns to the login page; Home is
+/// AuthGate: the local auth session decides — signed-out → login,
+/// signed-in → Home as the linked member. Sign-in is local-only
+/// (email/password, demo); there is no member-password login, no
+/// third-party sign-in, and no backend session any more. Household
+/// data lives in one local file, lock.json (LocalJsonRepository);
+/// the Node backend is retired (see backend/LEGACY.md) and the
+/// cloud backend was dropped by user decision on 2026-11-07 (see
+/// docs/LOCK_JSON.md). Log out returns to the login page; Home is
 /// unreachable without logging in. Tabs:
 /// Home, Shopping, Expenses, Settle Up. Drawer: the same four tabs
-/// plus Monthly view, Timeline and Profile.
+/// plus Monthly view, Timeline, Profile and the AI Assistant
+/// (Phase 7 — not configured in this build: no Gemini key was
+/// supplied, so the chat screen explains the setup instead of
+/// sending anything).
 /// Theme: light (Hisaab Kitaab teal) or dark (Coolors plum palette),
 /// one shared AppState flag; toggled from the AppBar or the drawer,
 /// persisted in SharedPreferences and applied before first paint.
-/// Phase 3 (Firestore data): Firebase is initialised here and
-/// Firestore offline persistence is enabled. If initialisation fails
-/// (no Firestore database yet, no network, no native config for this
-/// platform — e.g. web has no FirebaseOptions until a web app is
-/// registered), the app still launches and shows a clear,
-/// dismissible error banner instead of crashing — and AppState runs
-/// on the Unavailable repository, so every data read shows the plain
-/// "Cloud data unavailable" state instead of fake data.
-Future<({bool ready, String? error})> _initFirebase() async {
-  try {
-    // No options: Android/iOS read google-services.json /
-    // GoogleService-Info.plist. Web has no options yet, so this throws
-    // there until a web app is registered (see docs/FIREBASE_SETUP.md).
-    await Firebase.initializeApp();
-    configureFirestorePersistence();
-    return (ready: true, error: null);
-  } catch (e) {
-    return (ready: false, error: e.toString());
-  }
-}
-
+/// Phase 6 (lock.json data): one LockJsonStore is shared between the
+/// repository and the auth service, so accounts and household data
+/// are the same document. On web the store is in-memory only and
+/// AppState surfaces a plain banner saying so — the app still
+/// launches and works for the session instead of crashing.
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   var initialDark = false;
@@ -68,44 +54,36 @@ void main() async {
   } catch (_) {
     // Storage unavailable: start light; the toggle still works.
   }
-  final firebase = await _initFirebase();
+  final store = LockJsonStore();
+  // Structured log (Phase 7): logs.json next to lock.json in the
+  // app documents directory (in-memory only on web — see
+  // core/services/app_logger.dart and docs/LOGGING.md). The same
+  // logger is wired into the repository and AppState, so app start,
+  // auth, repository errors, chatbot calls and invitation actions
+  // are all logged. It never carries passwords, tokens or API keys.
+  final logger = AppLogger(accessLoader: () => store.fileAccess);
+  await logger.load();
+  logger.info('app', 'SplitNest started');
   runApp(
     ChangeNotifierProvider(
       create: (_) => AppState(
         initialDarkMode: initialDark,
-        // Firestore is the only data source when Firebase
-        // initialised; otherwise the Unavailable repository makes
-        // every data call report cloud-unavailable honestly.
-        repository: firebase.ready
-            ? FirestoreSplitNestRepository()
-            : const UnavailableSplitNestRepository(),
-        // Only wire real Firebase Auth when initialisation
-        // succeeded; otherwise demo/Google use a local identity and
-        // the login screen hides the email mode.
-        firebaseAuth:
-            firebase.ready ? RealFirebaseAuthService() : null,
-      )..refresh(),
-      child: SplitNestApp(
-        firebaseReady: firebase.ready,
-        firebaseError: firebase.error,
-      ),
+        // lock.json is the only data source; the auth service shares
+        // the same store, so accounts and household data stay in
+        // one document.
+        repository: LocalJsonRepository(store: store, logger: logger),
+        localAuth: RealLocalAuthService(store: store),
+        logger: logger,
+      )
+        ..refresh()
+        ..loadStoreNotice(),
+      child: const SplitNestApp(),
     ),
   );
 }
 
 class SplitNestApp extends StatefulWidget {
-  const SplitNestApp({
-    super.key,
-    this.firebaseReady = true,
-    this.firebaseError,
-  });
-
-  /// True when Firebase.initializeApp() succeeded. False means the app
-  /// is running on the Node backend only (see the banner in build).
-  final bool firebaseReady;
-
-  /// Human-readable init failure, null when [firebaseReady] is true.
-  final String? firebaseError;
+  const SplitNestApp({super.key});
 
   @override
   State<SplitNestApp> createState() => _SplitNestAppState();
@@ -114,8 +92,6 @@ class SplitNestApp extends StatefulWidget {
 class _SplitNestAppState extends State<SplitNestApp> {
   int _index = 0;
   bool _showSplash = true;
-  late bool _firebaseReady;
-  late String? _firebaseError;
   bool _bannerDismissed = false;
 
   static const titles = ['SplitNest', 'Shopping', 'Expenses', 'Settle Up'];
@@ -123,8 +99,6 @@ class _SplitNestAppState extends State<SplitNestApp> {
   @override
   void initState() {
     super.initState();
-    _firebaseReady = widget.firebaseReady;
-    _firebaseError = widget.firebaseError;
     // Splash auto-advances on its own after ~2.5s. There is no tap
     // handler and no "tap to continue" — it never waits for a tap.
     Future.delayed(const Duration(milliseconds: 2500), () {
@@ -132,31 +106,11 @@ class _SplitNestAppState extends State<SplitNestApp> {
     });
   }
 
-  /// Re-attempt Firebase init from the error banner (e.g. after the
-  /// Firestore database is created or the network comes back). On
-  /// success the AppState swaps from the Unavailable repository to
-  /// the Firestore one, so the household can load.
-  Future<void> _retryFirebase() async {
-    final result = await _initFirebase();
-    if (mounted) {
-      setState(() {
-        _firebaseReady = result.ready;
-        _firebaseError = result.error;
-        _bannerDismissed = false;
-      });
-      if (result.ready) {
-        context.read<AppState>().useRepository(
-              FirestoreSplitNestRepository(),
-            );
-      }
-    }
-  }
-
-  /// Shown only when Firebase init failed. The app keeps launching
-  /// and shows this banner; sign-in and household data stay
-  /// unavailable (plain cloud-unavailable states) until init
-  /// succeeds — nothing runs on a local backend any more.
-  Widget _firebaseErrorBanner() {
+  /// Shown only when the local store has something plain to say —
+  /// the web in-memory warning, or a corrupt-file recovery note
+  /// (see AppState.dataNotice). Dismissible; the app keeps working
+  /// underneath it.
+  Widget _storeNoticeBanner(String notice) {
     return Material(
       color: Colors.amber.shade100,
       child: SafeArea(
@@ -165,18 +119,13 @@ class _SplitNestAppState extends State<SplitNestApp> {
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
           child: Row(
             children: [
-              const Icon(Icons.cloud_off, size: 20),
+              const Icon(Icons.storage_outlined, size: 20),
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
-                  'Cloud services unavailable — sign-in and household '
-                  'data need Firebase. (${_firebaseError ?? 'Firebase init failed'})',
+                  notice,
                   style: const TextStyle(fontSize: 12),
                 ),
-              ),
-              TextButton(
-                onPressed: _retryFirebase,
-                child: const Text('Retry'),
               ),
               IconButton(
                 icon: const Icon(Icons.close, size: 18),
@@ -199,16 +148,12 @@ class _SplitNestAppState extends State<SplitNestApp> {
     return Consumer<AppState>(
       builder: (context, state, _) {
         // Smooth fade/slide between splash, login and home.
-        // AuthGate: a signed-in but unverified Firebase user sees
-        // the verification screen, never Home. A signed-in verified
-        // (or demo) user without a linked member yet still sees the
-        // login page, which shows the member pick for their session.
+        // AuthGate: a signed-in local user sees Home; anyone else
+        // sees the login page. There is no verification step any
+        // more — local accounts sign in directly.
         final Widget child;
         if (_showSplash) {
           child = const SplashScreen(key: ValueKey('splash'));
-        } else if (state.firebaseAuthEnabled &&
-            state.firebaseStatus == FirebaseAuthStatus.needsVerification) {
-          child = const VerificationScreen(key: ValueKey('verify'));
         } else if (!state.isLoggedIn) {
           child = const LoginScreen(key: ValueKey('login'));
         } else {
@@ -218,20 +163,17 @@ class _SplitNestAppState extends State<SplitNestApp> {
             onIndexChanged: (i) => setState(() => _index = i),
           );
         }
+        final notice = state.dataNotice;
+        final showBanner = notice != null && !_bannerDismissed;
         return MaterialApp(
           title: 'SplitNest',
           theme: SplitNestTheme.light(),
           darkTheme: SplitNestTheme.dark(),
           themeMode: state.themeMode,
-          home: _firebaseReady || _bannerDismissed
-              ? AnimatedSwitcher(
-                  duration: const Duration(milliseconds: 300),
-                  transitionBuilder: fadeSlideTransition,
-                  child: child,
-                )
-              : Column(
+          home: showBanner
+              ? Column(
                   children: [
-                    _firebaseErrorBanner(),
+                    _storeNoticeBanner(notice),
                     Expanded(
                       child: AnimatedSwitcher(
                         duration: const Duration(milliseconds: 300),
@@ -240,6 +182,11 @@ class _SplitNestAppState extends State<SplitNestApp> {
                       ),
                     ),
                   ],
+                )
+              : AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 300),
+                  transitionBuilder: fadeSlideTransition,
+                  child: child,
                 ),
         );
       },
@@ -426,6 +373,14 @@ class _HomeScaffoldState extends State<_HomeScaffold> {
               onTap: () {
                 Navigator.of(context).pop();
                 _openScreen(context, const ProfileScreen());
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.chat_bubble_outline),
+              title: const Text('AI Assistant'),
+              onTap: () {
+                Navigator.of(context).pop();
+                _openScreen(context, const ChatbotScreen());
               },
             ),
             const Divider(),

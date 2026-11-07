@@ -1,14 +1,13 @@
 /// Invitation codes, links and email handling (Phase 4) — pure
-/// Dart, no Firestore, no Flutter, so unit tests cover it directly.
+/// Dart, no storage, no Flutter, so unit tests cover it directly.
 ///
 /// Code format (see docs/INVITATIONS.md):
 /// - The code is 12 characters from an unambiguous alphabet (no
 ///   `0`/`O`, `1`/`I`/`l`), generated with a cryptographically secure
 ///   random source — never sequential, never derived from an email,
 ///   a timestamp or a counter.
-/// - The invitation document's id IS the code, so "enter invite
-///   code" is a direct document read and the security rules can
-///   authorise a self-join by reading the invitation by id.
+/// - The invitation record's id IS the code, so "enter invite
+///   code" is a direct record lookup in lock.json.
 /// - Shown to humans grouped as `XXXX-XXXX-XXXX`; the link carries
 ///   the ungrouped code.
 /// - The shareable link is plain text:

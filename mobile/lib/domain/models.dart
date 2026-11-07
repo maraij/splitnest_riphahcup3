@@ -1,5 +1,5 @@
-/// Domain models — pure data, no Firestore, no Flutter.
-/// Firestore mapping lives in data/firestore_repository.dart.
+/// Domain models — pure data, no storage, no Flutter.
+/// lock.json mapping lives in data/local_json_repository.dart.
 library;
 
 import 'invitations.dart';
@@ -9,8 +9,8 @@ class Member {
   final String id;
   final String name;
 
-  /// Download URL of the member's profile photo (Storage), when one
-  /// was uploaded; null means initials avatar.
+  /// Local file path of the member's profile photo, when one
+  /// was saved; null means initials avatar.
   final String? photoUrl;
   factory Member.fromJson(Map<String, dynamic> j) => Member(
         id: j['id'] as String,
@@ -194,12 +194,13 @@ class ExpenseRecord {
   /// mixed silently into a real user's history.
   final bool isDemo;
 
-  /// Firebase UID that recorded the expense (the edit/delete
+  /// Local account uid that recorded the expense (the edit/delete
   /// authorisation key — see domain/expense_auth.dart).
   final String? createdByUid;
 
-  /// Receipt image: Storage download URL / path, when a receipt
-  /// photo was attached (see storage.rules `receipts/{gid}/{eid}/`).
+  /// Receipt image: local file path, when a receipt photo was
+  /// attached (`receipts/{gid}/{eid}/receipt.jpg` under the app
+  /// documents directory).
   final String? receiptUrl;
   final String? receiptPath;
   factory ExpenseRecord.fromJson(Map<String, dynamic> j) => ExpenseRecord(

@@ -1,24 +1,25 @@
 import 'dart:typed_data';
 
+import '../domain/chat_message.dart';
 import '../core/money.dart';
 import '../domain/balances.dart';
 import '../domain/models.dart';
 import '../domain/percentage_split.dart';
 
-/// The one plain message the app shows whenever the cloud data
-/// source is unreachable, the Firestore database does not exist yet,
-/// or the device is offline. Repositories must surface failures as a
-/// [CloudDataException] carrying a plain message — never raw SDK
-/// text, and never fake data.
-const String cloudUnavailableMessage =
-    'Cloud data unavailable — check setup/connection.';
+/// The one plain message the app shows whenever the local data
+/// source cannot serve a call (lock.json unreadable, storage
+/// unavailable, or any other failure). Repositories must surface
+/// failures as a [LocalDataException] carrying a plain message —
+/// never raw error text, and never fake data.
+const String localDataUnavailableMessage =
+    'Local data unavailable — the household file could not be read.';
 
-/// Thrown by a [SplitNestRepository] when the cloud data source
-/// cannot serve a call (offline, Firestore database missing, rules
-/// rejection, or any other failure). [message] is safe to show on
+/// Thrown by a [SplitNestRepository] when the local data source
+/// cannot serve a call (lock.json unreadable, storage unavailable,
+/// or any other failure). [message] is safe to show on
 /// screen verbatim.
-class CloudDataException implements Exception {
-  const CloudDataException(this.message);
+class LocalDataException implements Exception {
+  const LocalDataException(this.message);
   final String message;
   @override
   String toString() => message;
@@ -45,26 +46,26 @@ const List<({String id, String name})> householdMembers = [
   (id: 'M03', name: 'Bilal'),
 ];
 
-/// SplitNestRepository — the ONLY place that talks to the cloud data
+/// SplitNestRepository — the ONLY place that talks to the data
 /// source. The single store ([AppState]) talks to this repository,
-/// never to Firestore (or HTTP) directly.
+/// never to lock.json (or HTTP) directly.
 ///
-/// The production implementation is [FirestoreSplitNestRepository]
-/// (Cloud Firestore); tests substitute an in-memory fake implementing
-/// this same interface. All money is integer paisa inside the data
-/// layer; amounts cross this interface as two-decimal strings
-/// ('780.00'), exactly as the screens already pass them.
+/// The production implementation is [LocalJsonRepository] (one local
+/// JSON file, lock.json — see docs/LOCK_JSON.md); tests substitute
+/// an in-memory fake implementing this same interface. All money is
+/// integer paisa inside the data layer; amounts cross this interface
+/// as two-decimal strings ('780.00'), exactly as the screens already
+/// pass them.
 ///
-/// Identity: [actorUid] is the signed-in Firebase UID (or the local
-/// demo/Google identity when Firebase is not wired in). It is stored
-/// as `createdBy` / `recordedBy` on the documents the security rules
-/// check — the repository never invents an actor.
+/// Identity: [actorUid] is the signed-in local account uid (or the
+/// demo uid). It is stored as `createdBy` / `recordedBy` on the
+/// records — the repository never invents an actor.
 abstract class SplitNestRepository {
   /// Resolves the household group for one signed-in user, creating
   /// it (with the 3-member roster and the PKR 5,000 budget) when it
   /// does not exist yet. The group id is deterministic per user
   /// (`household-<uid>`) until the invite flow (a later phase) can
-  /// move users between groups — see docs/FIRESTORE_STRUCTURE.md.
+  /// move users between groups — see docs/LOCK_JSON.md.
   /// Never seeds benchmark expenses: those load only through
   /// [loadDemoBenchmark], on an explicit demo-user action.
   Future<GroupInfo> ensureGroup({
@@ -88,7 +89,7 @@ abstract class SplitNestRepository {
   Future<List<FixedExpense>> getFixedExpenses(String groupId);
 
   /// Persisted activity entries (newest last, as stored). May be
-  /// empty when the cloud activity log has no entries yet — the app
+  /// empty when the local activity log has no entries yet — the app
   /// keeps its own session log as well, so Timeline never goes blank
   /// because of this.
   Future<List<ActivityEntry>> getActivity(String groupId);
@@ -133,7 +134,7 @@ abstract class SplitNestRepository {
   /// integer-paisa invariant (splits sum == amount) always holds
   /// after an edit. Only the expense's payer/creator or a group
   /// owner/admin may edit (see domain/expense_auth.dart); anyone
-  /// else gets a [CloudDataException] and nothing is written.
+  /// else gets a [LocalDataException] and nothing is written.
   /// [receiptUrl]/[receiptPath] attach (or replace) a receipt image
   /// without touching the money fields.
   Future<ExpenseRecord> updateExpense({
@@ -155,43 +156,44 @@ abstract class SplitNestRepository {
 
   /// Deletes one expense. Only the expense's payer/creator or a
   /// group owner/admin may delete; anyone else gets a
-  /// [CloudDataException] and nothing is written.
+  /// [LocalDataException] and nothing is written.
   Future<void> deleteExpense({
     required String groupId,
     required String id,
     required String actorUid,
   });
 
-  /// Stores a profile-photo download URL on the user's profile doc
-  /// (and the group members mirror, best-effort). The photo bytes
-  /// themselves live in the backend's photo store (see
-  /// [uploadProfilePhoto]); this only records the URL.
+  /// Stores a profile-photo local path on the user's record (and
+  /// the group roster mirror, best-effort). The photo bytes
+  /// themselves live in local files (see [uploadProfilePhoto]);
+  /// this only records the path.
   Future<void> setUserPhotoUrl({
     required String groupId,
     required String uid,
     required String photoUrl,
   });
 
-  /// Uploads a receipt image for an expense and returns the
-  /// (download URL, storage path) to store on the expense.
-  /// Backend-dependent seam: the Firestore implementation stores it
-  /// in Firebase Storage at
-  /// `receipts/{groupId}/{expenseId}/receipt.jpg` (images only,
-  /// 10 MB cap); a local-store implementation would keep the bytes
-  /// locally and return a local path instead. Returns null when the
-  /// image is over the cap or the upload fails — never throws for an
-  /// upload failure, so the caller can save the expense without the
-  /// receipt and say so.
+  /// Saves a receipt image for an expense and returns the
+  /// (local path, local path) to store on the expense. The local
+  /// implementation writes the bytes to
+  /// `receipts/{groupId}/{expenseId}/receipt.jpg` under the app
+  /// documents directory (images only, 10 MB cap) — the `url`
+  /// field now holds that local path, never a download URL.
+  /// Returns null when the image is over the cap or the save fails
+  /// (including on web, where there is nowhere to write the bytes)
+  /// — never throws for a save failure, so the caller can save the
+  /// expense without the receipt and say so.
   Future<({String url, String path})?> uploadReceipt({
     required String groupId,
     required String expenseId,
     required Uint8List bytes,
   });
 
-  /// Uploads a profile photo and returns its download URL (or local
-  /// reference for a local implementation), or null when the image
-  /// is over the cap (5 MB) or the upload fails. The caller stores
-  /// the returned value via [setUserPhotoUrl].
+  /// Saves a profile photo and returns its local file path
+  /// (`profile-photos/{uid}/photo.jpg` under the app documents
+  /// directory), or null when the image is over the cap (5 MB) or
+  /// the save fails (including on web). The caller stores the
+  /// returned value via [setUserPhotoUrl].
   Future<String?> uploadProfilePhoto({
     required String uid,
     required Uint8List bytes,
@@ -210,8 +212,8 @@ abstract class SplitNestRepository {
   });
 
   /// Flips a `recorded` payment to `verified`, stamping who verified
-  /// it. Only an owner/admin may do this (enforced by the security
-  /// rules on the real database); a verified payment can never be
+  /// it. Only an owner/admin may do this (enforced by the
+  /// repository); a verified payment can never be
   /// un-verified.
   Future<PaymentRecord> verifyPayment({
     required String groupId,
@@ -279,19 +281,20 @@ abstract class SplitNestRepository {
   });
 
   // ---- Invitations + shared households (Phase 4) ----
-  // See docs/INVITATIONS.md. The invitation document id IS the
+  // See docs/INVITATIONS.md. The invitation id IS the
   // invite code (12 secure-random characters); expiry is 7 days
   // from creation; a stored-`pending` invitation past its expiry
   // counts as expired everywhere (derived status, accept guard,
-  // admin-side sweep).
+  // admin-side sweep). Invitations are local-only: codes are
+  // generated and redeemed on the SAME device.
 
   /// Sends an invitation to join [groupId]. Only a group owner or
-  /// admin may invite (enforced here and by the security rules);
-  /// granting the `admin` role additionally requires the actor to be
-  /// the group owner. Rejects an invalid or own email, an unknown
-  /// role, and a second ACTIVE (pending, unexpired) invitation for
-  /// the same email + group. Returns the created invitation — its
-  /// [Invitation.id] is the shareable code.
+  /// admin may invite (enforced here); granting the `admin` role
+  /// additionally requires the actor to be the group owner. Rejects
+  /// an invalid or own email, an unknown role, and a second ACTIVE
+  /// (pending, unexpired) invitation for the same email + group.
+  /// Returns the created invitation — its [Invitation.id] is the
+  /// shareable code.
   Future<Invitation> createInvitation({
     required String groupId,
     required String groupName,
@@ -303,10 +306,9 @@ abstract class SplitNestRepository {
   });
 
   /// All invitations for one group, newest first. Expired pending
-  /// invitations are swept to stored status `expired` by this call
-  /// (admin path — the rules only let an owner/admin write that).
-  /// Callers must be owner/admin; a plain member listing them is
-  /// denied by the rules.
+  /// invitations are swept to stored status `expired` by this call.
+  /// Callers must be owner/admin; a plain member listing them gets
+  /// an empty list from the store (see AppState).
   Future<List<Invitation>> getGroupInvitations(String groupId);
 
   /// All invitations addressed to one email (any status), newest
@@ -325,13 +327,8 @@ abstract class SplitNestRepository {
 
   /// Accepts an invitation, atomically: verifies status pending +
   /// not expired + [email] matches the invited email, then adds the
-  /// user to the group's members map AND the members subcollection
-  /// mirror AND marks the invitation accepted (with `acceptedBy`).
-  /// This runs entirely client-side in a Firestore transaction — it
-  /// does NOT depend on the (undeployed) `onInvitationAccepted`
-  /// Cloud Function; that Function is only a redundant notification
-  /// path once deployed. The activity entry is best-effort (the
-  /// rules make activity Functions-written until they deploy).
+  /// user to the group's roster AND marks the invitation accepted
+  /// (with `acceptedBy`) — one save, or nothing changes.
   /// Returns the accepted invitation.
   Future<Invitation> acceptInvitation({
     required String invitationId,
@@ -357,29 +354,45 @@ abstract class SplitNestRepository {
     required String uid,
   });
 
-  /// Persists one activity entry to the cloud log. Best-effort on
-  /// the real database: the security rules make activity
-  /// Functions-written only, so a client write is denied until the
-  /// Functions deploy — the implementation must swallow that
-  /// denial (and log it) rather than failing the mutation it
-  /// describes. The app's session activity log is the Timeline
-  /// source of truth in this phase.
+  /// Persists one activity entry to the local log (lock.json).
+  /// Best-effort: a failure is swallowed (and logged) rather than
+  /// failing the mutation it describes. The app's session activity
+  /// log is the Timeline source of truth in this phase.
   Future<void> logActivity({
     required String groupId,
     required ActivityEntry entry,
     required String actorUid,
   });
+
+  // ---- AI chatbot history (Phase 7) ----
+  // Chat messages live in the top-level `chatMessages` collection
+  // of lock.json, keyed by the owning account uid — history is per
+  // user, so two accounts on one device never see each other's
+  // chats. See docs/LOCK_JSON.md.
+
+  /// All chat messages for one account uid, oldest first.
+  Future<List<ChatMessage>> getChatMessages(String uid);
+
+  /// Appends one chat message (user question or assistant reply)
+  /// to the account's history.
+  Future<void> addChatMessage({
+    required String uid,
+    required ChatMessage message,
+  });
+
+  /// Deletes all chat messages for one account uid.
+  Future<void> clearChatMessages(String uid);
 }
 
-/// A repository that can never serve data: used when Firebase never
-/// initialised, so the app shows the honest cloud-unavailable state
-/// instead of crashing or inventing data. Every method throws the
-/// same [CloudDataException].
+/// A repository that can never serve data: used when the local
+/// store never initialised, so the app shows the honest
+/// local-unavailable state instead of crashing or inventing data.
+/// Every method throws the same [LocalDataException].
 class UnavailableSplitNestRepository implements SplitNestRepository {
   const UnavailableSplitNestRepository();
 
   Never _unavailable() =>
-      throw const CloudDataException(cloudUnavailableMessage);
+      throw const LocalDataException(localDataUnavailableMessage);
 
   @override
   Future<GroupInfo> ensureGroup({
@@ -627,12 +640,25 @@ class UnavailableSplitNestRepository implements SplitNestRepository {
     required String actorUid,
   }) =>
       _unavailable();
+
+  @override
+  Future<List<ChatMessage>> getChatMessages(String uid) => _unavailable();
+
+  @override
+  Future<void> addChatMessage({
+    required String uid,
+    required ChatMessage message,
+  }) =>
+      _unavailable();
+
+  @override
+  Future<void> clearChatMessages(String uid) => _unavailable();
 }
 
 // ---------------------------------------------------------------------------
 // Shared input validation (used by every implementation, so the fake
-// and the Firestore repository reject exactly the same bad input).
-// These throw [CloudDataException] with the same plain messages the
+// and the local repository reject exactly the same bad input).
+// These throw [LocalDataException] with the same plain messages the
 // old backend returned — the app shows them verbatim.
 // ---------------------------------------------------------------------------
 
@@ -657,14 +683,14 @@ List<({String memberId, int amountPaisa})> validatedShares({
   bool known(String id) => knownMembers.contains(id);
   if (splitType == 'percentage') {
     if (percentageSplits == null || percentageSplits.isEmpty) {
-      throw const CloudDataException(
+      throw const LocalDataException(
           'Percentage split needs at least one share.');
     }
     final parsed = <({String memberId, int percentHundredths})>[];
     for (final s in percentageSplits) {
       final pct = parsePercentHundredths(s['percent'] ?? '');
       if (pct == null) {
-        throw const CloudDataException(
+        throw const LocalDataException(
             'Each percentage must be a number between 0 and 100.');
       }
       parsed.add(
@@ -675,17 +701,17 @@ List<({String memberId, int amountPaisa})> validatedShares({
       shares: parsed,
       knownMembers: knownMembers,
     );
-    if (error != null) throw CloudDataException(error);
+    if (error != null) throw LocalDataException(error);
     return percentageSplit(amountPaisa, parsed);
   }
   if (splitType == 'custom') {
     if (splits == null || splits.isEmpty) {
-      throw const CloudDataException(
+      throw const LocalDataException(
           'Custom split needs at least one share.');
     }
     final ids = splits.map((s) => s['member_id']!).toList();
     if (ids.toSet().length != ids.length || ids.any((m) => !known(m))) {
-      throw const CloudDataException(
+      throw const LocalDataException(
           'Split members must be known members, listed once.');
     }
     var sum = 0;
@@ -693,21 +719,21 @@ List<({String memberId, int amountPaisa})> validatedShares({
     for (final s in splits) {
       final p = parsePaisa(s['amount']!);
       if (p == null || p < 0) {
-        throw const CloudDataException(
+        throw const LocalDataException(
             'Each share must be a non-negative amount.');
       }
       sum += p;
       out.add((memberId: s['member_id']!, amountPaisa: p));
     }
     if (sum != amountPaisa) {
-      throw CloudDataException(
+      throw LocalDataException(
           'Custom shares sum to ${formatPaisa(sum)} but the amount is '
           '${formatPaisa(amountPaisa)}.');
     }
     return out;
   }
   if (splitType != 'equal' && splitType != 'percentage') {
-    throw const CloudDataException(
+    throw const LocalDataException(
         'split_type must be "equal", "custom" or "percentage".');
   }
   final members = (splitMembers != null && splitMembers.isNotEmpty)
@@ -715,12 +741,12 @@ List<({String memberId, int amountPaisa})> validatedShares({
       : knownMembers;
   if (members.toSet().length != members.length ||
       members.any((m) => !known(m))) {
-    throw const CloudDataException(
+    throw const LocalDataException(
         'Split members must be known members, listed once.');
   }
   // Remainder paisa 1-by-1 in ascending member-ID order (M01, M02,
   // M03) — the preserved rule from the old backend, applied here in
-  // member-ID order before the Firestore keys are derived.
+  // member-ID order before the stored keys are derived.
   return equalSplit(amountPaisa, members);
 }
 
@@ -736,30 +762,30 @@ void validateCheckout({
   required List<String> knownMembers,
 }) {
   if (itemIds.isEmpty) {
-    throw const CloudDataException('Select at least one item to check out.');
+    throw const LocalDataException('Select at least one item to check out.');
   }
   if (itemIds.toSet().length != itemIds.length) {
-    throw const CloudDataException('An item was selected more than once.');
+    throw const LocalDataException('An item was selected more than once.');
   }
   if (totalPaisa <= 0) {
-    throw const CloudDataException('Total paid must be a positive amount.');
+    throw const LocalDataException('Total paid must be a positive amount.');
   }
   if (!knownMembers.contains(payerId)) {
-    throw CloudDataException('Payer $payerId does not exist.');
+    throw LocalDataException('Payer $payerId does not exist.');
   }
   if (splitMembers.toSet().length != splitMembers.length ||
       splitMembers.any((m) => !knownMembers.contains(m))) {
-    throw const CloudDataException(
+    throw const LocalDataException(
         'Split members must be known members, listed once.');
   }
   for (final id in itemIds) {
     final item = items.where((i) => i.id == id).firstOrNull;
     if (item == null) {
-      throw const CloudDataException(
+      throw const LocalDataException(
           'One of the selected items does not exist.');
     }
     if (!item.isPending) {
-      throw const CloudDataException(
+      throw const LocalDataException(
           'One of the selected items is already bought.');
     }
   }

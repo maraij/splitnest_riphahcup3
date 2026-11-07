@@ -1,34 +1,32 @@
-# SplitNest — Invitations & Shared Households (Phase 4)
+# SplitNest — Invitations & Shared Households (Phase 4, local since Phase 6)
 
 **PRACTICE ONLY — NOT FOR SUBMISSION.** How invitations work in
-the practice app, as built in Phase 4 (2026-11-07).
+the practice app, as built in Phase 4 (2026-11-07) and moved to
+the local `lock.json` store in Phase 6 (2026-11-07, Firebase
+dropped by user decision).
 
-**Status: implemented client-side, verified against
-`FakeFirebaseFirestore` + the in-memory fake.** The Firestore
-database itself still does not exist yet and the rules are not
-deployed (see `docs/FIREBASE_SETUP.md`), so nothing has been
-verified against a live Firestore DB or a second real device.
-Real multi-user accept across two devices needs the Firestore DB
-to exist and `firestore.rules` deployed.
+**Status: implemented, verified against the real
+`LocalJsonRepository` (in-memory lock.json store) + the
+in-memory fake.** Invitations are **local-only**: codes are
+generated and redeemed on the **same device**. There is no
+server, no email delivery, and no cross-device join — a second
+device cannot accept an invite from this device. See
+[docs/LOCK_JSON.md](LOCK_JSON.md) for the store.
 
 ## The short version
 
 - An owner/admin invites someone **by email**. The invitee signs
-  in with that email and accepts — from the "Invitations for you"
-  list, or by entering a code.
-- The invite **code is the invitation document's id**: 12
-  characters from an unambiguous alphabet, generated with
-  `Random.secure()` — never sequential, never derived from an
-  email, a timestamp or a counter.
-- Accepting runs **one Firestore transaction, entirely
-  client-side**: verify the invite, add the user to the group's
-  `members` map AND the `members` subcollection mirror, mark the
-  invite accepted. It does **not** depend on the Cloud Function
-  `onInvitationAccepted` (not deployed) — that Function is only a
-  redundant notification path once deployed (it re-checks the same
-  accepted transition and reads `acceptedBy`, which the client now
-  sets; before Phase 4 the rules forbade setting `acceptedBy`, so
-  the Function as written could never have fired usefully).
+  in with that email on the same device and accepts — from the
+  "Invitations for you" list, or by entering a code.
+- The invite **code is the invitation's id**: 12 characters from
+  an unambiguous alphabet, generated with `Random.secure()` —
+  never sequential, never derived from an email, a timestamp or
+  a counter.
+- Accepting is **one local save**: verify the invite, add the
+  user to the group's roster, mark the invite accepted — all in
+  the same `lock.json` document write, so it cannot half-apply.
+  The old Firestore transaction and the `onInvitationAccepted`
+  Cloud Function are gone with Firebase.
 - After accepting, the joined group becomes the current household
   and the user can switch between their households.
 
@@ -60,18 +58,20 @@ intent filter — none of that exists in this phase.
 
 ## Invitation fields (as built)
 
-Top-level collection `invitations/{code}` — the document id IS
-the code. See `docs/FIRESTORE_STRUCTURE.md` for the table.
+One entry in the `invitations[]` array of `lock.json` — the
+entry's `id` IS the code. See [docs/LOCK_JSON.md](LOCK_JSON.md)
+for the full schema.
 
 | Field | Notes |
 |---|---|
+| `id` | The invite code (12 chars) |
 | `groupId` / `groupName` | Group being joined (name denormalised) |
-| `invitedEmail` | Lower-cased + trimmed; must match the invitee's Auth email |
-| `invitedBy` / `inviterName` | Inviting owner/admin (UID + display name) |
+| `invitedEmail` | Lower-cased + trimmed; must match the invitee's local account email |
+| `invitedBy` / `inviterName` | Inviting owner/admin (local account uid + display name) |
 | `role` | `member` (default) or `admin` (owner-granted only) |
 | `status` | `pending` \| `accepted` \| `revoked` \| `expired` |
 | `createdAt` / `expiresAt` | `expiresAt = createdAt + 7 days` |
-| `acceptedBy` / `acceptedAt` | Set by the accept flow (UID + time) |
+| `acceptedBy` / `acceptedAt` | Set by the accept flow (local account uid + time) |
 
 ## Rules (expiry, duplicates, revoke)
 
@@ -81,9 +81,9 @@ the code. See `docs/FIRESTORE_STRUCTURE.md` for the table.
   the accept guard (accept refuses it), and a sweep that stores
   `expired`. The sweep runs on the **admin listing path**
   (`getGroupInvitations`) and on the duplicate check during
-  create — the rules only let an owner/admin write the
-  `pending → expired` transition, so the invitee's own list
-  (`getMyInvitations`) derives expiry without writing it.
+  create — the local repository enforces the owner/admin-only
+  write; the invitee's own list (`getMyInvitations`) derives
+  expiry without writing it.
 - **No duplicate ACTIVE invitation** for the same email + group:
   creating a second pending, unexpired invite for the same email
   in the same group is rejected. Re-inviting after a revoke (or
@@ -93,48 +93,29 @@ the code. See `docs/FIRESTORE_STRUCTURE.md` for the table.
   Pending list; the invitee can no longer accept them.
 - **Self-invite** is rejected (inviting your own email).
 - **Roles:** only owner/admin can invite or revoke (enforced in
-  the repository AND the rules AND the UI gating). Granting
-  `admin` additionally requires the inviter to be the group
-  **owner** — a plain admin inviting as `admin` is rejected.
+  the repository AND the UI gating — there are no server rules
+  any more, so the repository is the enforcement point).
+  Granting `admin` additionally requires the inviter to be the
+  group **owner** — a plain admin inviting as `admin` is rejected.
 
-## The accept flow (client transaction)
+## The accept flow (local, one save)
 
-`FirestoreSplitNestRepository.acceptInvitation` runs one
-transaction:
+`LocalJsonRepository.acceptInvitation` (see
+`mobile/lib/data/local_json_repository.dart`):
 
-1. Read `invitations/{code}`. Fail when missing, already
-   accepted, revoked/expired, past `expiresAt`, or addressed to a
-   different email.
-2. Update `groups/{gid}`: set `members.{uid} = {role, joinedAt}`
-   and `joinInvitationId = code` (audit trail of which invite let
-   them in).
-3. Set `groups/{gid}/members/{uid}` (mirror): display name, role,
-   `joinedAt`, `invitationId`, `uid`.
-4. Update the invitation: `status = accepted`,
+1. Load `lock.json`. Fail when the invite is missing, already
+   accepted, revoked/expired, past `expiresAt`, or addressed to
+   a different email.
+2. Add the invitee to the group's roster (`members` entry:
+   local account uid, member id, role, display name, `joinedAt`,
+   `invitationId` = code).
+3. Update the invitation: `status = accepted`,
    `acceptedBy = uid`, `acceptedAt = now`.
-5. After the transaction (best-effort, outside it): an activity
-   entry (`member_joined`) and the user's `groupIds` link. The
-   activity write is denied by the rules until Functions deploy,
-   so it is swallowed exactly like every other client activity
-   write in this app — the session activity log is the Timeline
-   source of truth until then.
-
-Two rules subtleties this design works around (see
-`firestore.rules`):
-
-- The group doc is **not read inside the transaction**: the
-  invitee is not a member yet, so the rules deny them a group
-  read. The blind update is authorised by the rules' self-join
-  branch (a pending, unexpired invitation for this group + email,
-  adding only their own UID, with exactly the role the invitation
-  grants), and it fails outright when the group does not exist —
-  which is the existence check.
-- The rules authorise the join against the **pending** invitation,
-  not the accepted one: inside one transaction the invite flip and
-  the join commit together, so rules see the pre-commit (pending)
-  state for both. A second accept is stopped by the transaction's
-  own checks (status is no longer pending on re-read) and by the
-  rule requiring the UID to be absent from the members map.
+4. Append an activity entry (`member_joined`) and link the group
+   to the user — then save the document **once** (atomic write +
+   backup, see [docs/LOCK_JSON.md](LOCK_JSON.md)). A second
+   accept is stopped by step 1 (status is no longer pending on
+   re-read).
 
 ## Sharing
 
@@ -148,26 +129,30 @@ From the invite screen, for any pending invitation:
   the link instead") instead of crashing.
 - **Copy link / Copy code** — clipboard + confirmation snackbar.
 
+Sharing only carries the code — the invitee must be on the
+**same device** (same `lock.json`) to accept it. Sending the
+code to someone on another device does nothing: their device
+has a different household file and no such invitation.
+
 ## Shared households / group switching
 
 - Each user still gets their own `household-<uid>` group on first
   sign-in (Phase 3 behaviour, unchanged — the demo users' seeded
-  groups and the benchmark are untouched).
+  groups and the benchmark are untouched). The uid is now the
+  **local account uid** (`demo-M01`… / `u-…`), not a Firebase UID.
 - `AppState` now keeps `userGroups` (own group first, then joined
   groups, from the accepted-invitation trail + the profile's
   `groupIds`), `currentGroupId` (alias of `groupId`), and
   `currentRole` in the current group.
 - Switching: Invite & households → Your households → tap a
   household. The choice persists in SharedPreferences, keyed per
-  Firebase UID (`current_group_id_<uid>`), so the next launch
+  local account uid (`current_group_id_<uid>`), so the next launch
   re-opens the same household; a switch also updates the
   in-memory choice immediately. Users with one group always land
   on their own group, exactly as before.
-- `listUserGroups` deliberately does **not** query the `members`
-  map (a user cannot query groups they do not belong to, per the
-  rules). It derives the list from the own-group id, the profile's
-  `groupIds`, and accepted invitations for the user's email.
-  A group that no longer exists is skipped, never faked.
+- `listUserGroups` derives the list from the own-group id, the
+  profile's `groupIds`, and accepted invitations for the user's
+  email. A group that no longer exists is skipped, never faked.
 - Member counts on the invite screen: Total members = roster
   size, Active members = roster size (every roster member counts
   as active — SplitNest has no deactivated members), Pending
@@ -175,42 +160,39 @@ From the invite screen, for any pending invitation:
 
 ## What is NOT verified live
 
-- No live Firestore DB exists yet and the rules are not deployed,
-  so the rules changes below have **not** been evaluated by the
-  real rules engine — they are written to match the client flows
-  exactly, and covered by `mobile/test/invitations_test.dart`
-  against `FakeFirebaseFirestore` (which does not enforce rules).
-- Real two-device accept (two signed-in users, one invite) has
-  not been run; the AppState end-to-end test in
-  `mobile/test/invitations_test.dart` is the same flow against the
-  fake.
+- No live on-device run has been done yet: the flows are covered
+  by `mobile/test/invitations_test.dart` against the real
+  `LocalJsonRepository` (in-memory store) and the AppState
+  end-to-end tests, but `lock.json` persistence on a real Android
+  device (documents directory, backup/restore) still needs one
+  live pass.
+- Real two-device accept is **not possible** in this build by
+  design (local-only store) — the AppState end-to-end test in
+  `mobile/test/invitations_test.dart` is the same flow with two
+  AppStates sharing one in-memory store, i.e. two accounts on
+  one device.
 - No email is actually sent: the invite travels as a code/link
   the inviter shares (Share / WhatsApp / copy). There is no SMTP
-  or FCM invite delivery in this phase.
+  or push invite delivery in this phase — and none is planned
+  while the store stays local.
 
-## Rules changes (Phase 4)
+## Enforcement (local — no server rules any more)
 
-`firestore.rules` (deploy pending, with everything else):
+`firestore.rules` was deleted in Phase 6 with Firebase. The
+rules below are now enforced by `LocalJsonRepository` in code
+(and gated in the UI); there is no server to back them up, so
+whoever holds the device holds the data:
 
 1. **Invitations create:** role must be `member`, or `admin`
    only when the inviter is the group owner; `invitedEmail` must
    be a string and `expiresAt` a future timestamp.
-2. **Invitations update:** the invitee's accept may now also set
-   `acceptedBy` (= their own UID) and `acceptedAt`; an
+2. **Invitations update:** the invitee's accept may set
+   `acceptedBy` (= their own local uid) and `acceptedAt`; an
    owner/admin may sweep `pending → expired`.
-3. **Groups update:** new self-join branch (`canSelfJoin`): an
-   invitee may add only themselves to the `members` map, with
-   exactly the role the pending invitation grants, citing the
-   invitation id in `joinInvitationId`. Admin name/budget edits
-   are unchanged.
-4. **Members mirror create:** new self-join branch: the invitee
-   may create only their own mirror doc, with the role the pending
-   invitation grants and the invitation id recorded. Update/delete
+3. **Groups update (join):** an invitee may add only themselves
+   to the roster, with exactly the role the pending invitation
+   grants, citing the invitation id. Admin name/budget edits
    stay owner/admin-only.
-5. New helper `isPendingInvite(invitationId, groupId)`: the
-   invitation exists, belongs to the group, is addressed to the
-   signed-in user's Auth email, is `pending`, and is unexpired.
-
-No new composite indexes were needed: the duplicate check uses
-`groupId + status` and the joined-groups lookup uses
-`invitedEmail + status`, both already in `firestore.indexes.json`.
+4. **Accept guards:** the invitation must exist, belong to the
+   group, be addressed to the accepting user's account email, be
+   `pending`, and be unexpired.

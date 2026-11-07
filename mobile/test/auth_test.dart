@@ -1,773 +1,544 @@
-import 'dart:async';
+// Phase 6 — local-only auth (lock.json accounts, salted hashes).
+//
+// Covers, in three layers:
+//   1. the pure password hashing (salt/hash/verify) — no store;
+//   2. RealLocalAuthService against an in-memory store: sign-up,
+//      sign-in, demo sign-in, session restore, sign-out, and the
+//      device-local password reset (on-device code, no email);
+//   3. AppState end-to-end with the fake repository: the login /
+//      sign-up / demo / reset flows through the store, plus session
+//      restore across AppState instances sharing one auth service.
+//
+// There is no verification step any more (no mail backend) and no
+// third-party sign-in — sign-up signs in directly.
+library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:splitnest/data/firebase_auth_service.dart';
-import 'package:splitnest/data/google_auth_service.dart';
-import 'package:splitnest/features/auth/auth_validation.dart';
+import 'package:splitnest/data/demo_accounts.dart';
+import 'package:splitnest/data/local_auth_service.dart';
+import 'package:splitnest/data/local_json_repository.dart';
+import 'package:splitnest/data/password_hash.dart';
 import 'package:splitnest/main.dart';
 import 'package:splitnest/state/app_state.dart';
 
 import 'fake_repository.dart';
 
-// ------------------------------------------------------------------
-// Fake Firebase Auth: in-memory users with Firebase-like semantics.
-// signIn throws user-not-found for unknown emails and
-// invalid-credential for wrong passwords (the enumeration-protected
-// behaviour current Firebase projects show); signUp creates an
-// UNVERIFIED user; demo create-or-sign-in mirrors the real service.
-// ------------------------------------------------------------------
+RealLocalAuthService _service() =>
+    RealLocalAuthService(store: LockJsonStore.inMemory());
 
-class _FakeUser {
-  _FakeUser({
-    required this.uid,
-    required this.email,
-    required this.password,
-    required this.displayName,
-    required this.emailVerified,
-  });
-  final String uid;
-  final String email;
-  final String password;
-  String displayName;
-  bool emailVerified;
-}
-
-class FakeFirebaseAuthService implements FirebaseAuthService {
-  final Map<String, _FakeUser> _usersByEmail = {};
-  final Map<String, String> _memberLinks = {};
-  final _controller = StreamController<FirebaseSession?>.broadcast();
-  FirebaseSession? _current;
-  int profileSyncs = 0;
-  int verificationEmailsSent = 0;
-  int passwordResetEmailsSent = 0;
-
-  FirebaseSession _sessionFor(_FakeUser user) => FirebaseSession(
-        uid: user.uid,
-        email: user.email,
-        displayName: user.displayName,
-        emailVerified: user.emailVerified,
-        isDemo: isDemoEmail(user.email),
-      );
-
-  void _emit(_FakeUser? user) {
-    _current = user == null ? null : _sessionFor(user);
-    _controller.add(_current);
-  }
-
-  /// Test helper: mark an email verified, as if the user clicked the
-  /// link in their inbox.
-  void verifyEmail(String email) {
-    final user = _usersByEmail[email];
-    if (user != null) user.emailVerified = true;
-  }
-
-  @override
-  Stream<FirebaseSession?> get authStateChanges => _controller.stream;
-
-  @override
-  FirebaseSession? get currentSession => _current;
-
-  @override
-  Future<FirebaseAuthResult> signInWithEmail({
-    required String email,
-    required String password,
-  }) async {
-    final user = _usersByEmail[email.trim()];
-    if (user == null) {
-      return const FirebaseAuthFailure(
-          'No account exists for that email. Check the email or create an account.');
-    }
-    if (user.password != password) {
-      return const FirebaseAuthFailure(
-          'That email or password is not correct. Try again or reset your password.');
-    }
-    _emit(user);
-    await syncProfile();
-    return FirebaseAuthSuccess(_sessionFor(user));
-  }
-
-  @override
-  Future<FirebaseAuthResult> signUpWithEmail({
-    required String email,
-    required String password,
-    required String displayName,
-  }) async {
-    final clean = email.trim();
-    if (_usersByEmail.containsKey(clean)) {
-      return const FirebaseAuthFailure(
-          'An account already exists for that email. Try signing in instead.');
-    }
-    if (password.length < minPasswordLength) {
-      return const FirebaseAuthFailure(
-          'Password must be at least 6 characters.');
-    }
-    final user = _FakeUser(
-      uid: 'uid-$clean',
-      email: clean,
-      password: password,
-      displayName: displayName,
-      emailVerified: false,
-    );
-    _usersByEmail[clean] = user;
-    verificationEmailsSent++;
-    _emit(user);
-    await syncProfile(displayName: displayName);
-    return FirebaseAuthSuccess(_sessionFor(user));
-  }
-
-  @override
-  Future<FirebaseAuthResult> signInWithGoogle({
-    required String idToken,
-  }) async {
-    // The fake has no Google token to verify; the credential step is
-    // covered by the real service being untestable here — this fake
-    // models "Google user arrives verified".
-    const email = 'google.user@gmail.com';
-    var user = _usersByEmail[email];
-    user ??= _FakeUser(
-      uid: 'uid-google',
-      email: email,
-      password: '',
-      displayName: 'Google User',
-      emailVerified: true,
-    );
-    _usersByEmail[email] = user;
-    _emit(user);
-    await syncProfile();
-    return FirebaseAuthSuccess(_sessionFor(user));
-  }
-
-  @override
-  Future<FirebaseAuthResult> signInDemo(DemoAccount demo) async {
-    var user = _usersByEmail[demo.email];
-    if (user == null) {
-      user = _FakeUser(
-        uid: 'uid-${demo.memberId}',
-        email: demo.email,
-        password: demo.password,
-        displayName: demo.name,
-        emailVerified: false,
-      );
-      _usersByEmail[demo.email] = user;
-    } else if (user.password != demo.password) {
-      return const FirebaseAuthFailure(
-          'The demo account could not be signed in. Try a member sign-in instead.');
-    }
-    _emit(user);
-    await syncProfile(memberId: demo.memberId);
-    return FirebaseAuthSuccess(_sessionFor(user));
-  }
-
-  @override
-  Future<FirebaseAuthResult> sendPasswordReset({
-    required String email,
-  }) async {
-    if (!email.trim().contains('@')) {
-      return const FirebaseAuthFailure(
-          'Enter a valid email address, like name@example.com.');
-    }
-    passwordResetEmailsSent++;
-    return const FirebaseAuthSuccess();
-  }
-
-  @override
-  Future<bool> sendEmailVerification() async {
-    if (_current == null) return false;
-    verificationEmailsSent++;
-    return true;
-  }
-
-  @override
-  Future<FirebaseSession?> reloadCurrentUser() async {
-    final current = _current;
-    if (current == null) return null;
-    final user = _usersByEmail[current.email];
-    if (user == null) return null;
-    _current = _sessionFor(user);
-    return _current;
-  }
-
-  @override
-  Future<void> signOut() async {
-    _emit(null);
-  }
-
-  @override
-  Future<String?> memberIdFor(String uid) async => _memberLinks[uid];
-
-  @override
-  Future<void> saveMemberId(String uid, String memberId) async {
-    _memberLinks[uid] = memberId;
-  }
-
-  @override
-  Future<void> syncProfile({String? displayName, String? memberId}) async {
-    profileSyncs++;
-  }
-}
-
-class _FakeGoogleAuthService implements GoogleAuthService {
-  _FakeGoogleAuthService(this.result);
-  final GoogleSignInResult result;
-  bool signOutCalled = false;
-  @override
-  Future<GoogleSignInResult> signIn() async => result;
-  @override
-  Future<void> signOut() async {
-    signOutCalled = true;
-  }
-}
-
-Future<AppState> _makeState({
-  FakeFirebaseAuthService? firebaseAuth,
-  GoogleAuthService? googleAuth,
-}) async {
-  SharedPreferences.setMockInitialValues({});
-  final state = AppState(
-    repository: FakeSplitNestRepository.benchmark(),
-    googleAuth: googleAuth,
-    firebaseAuth: firebaseAuth,
-  )..refresh();
-  // Let the initial refresh + any restore finish.
-  await Future<void>.delayed(Duration.zero);
-  return state;
-}
-
-Future<void> _pumpApp(
-  WidgetTester tester, {
-  FakeFirebaseAuthService? firebaseAuth,
-  GoogleAuthService? googleAuth,
-}) async {
-  SharedPreferences.setMockInitialValues({});
-  addTearDown(() => SharedPreferences.setMockInitialValues({}));
-  await tester.pumpWidget(
-    ChangeNotifierProvider(
-      create: (_) => AppState(
-        repository: FakeSplitNestRepository.benchmark(),
-        googleAuth: googleAuth,
-        firebaseAuth: firebaseAuth,
-      )..refresh(),
-      child: const SplitNestApp(),
-    ),
-  );
-  await tester.pumpAndSettle();
+Future<void> _settle() async {
+  // Lets unawaited background work (e.g. the persisted session
+  // uid) finish before the next assertion reads it.
+  await Future<void>.delayed(const Duration(milliseconds: 20));
 }
 
 void main() {
-  group('email/password validation', () {
-    test('validateEmail accepts a normal address', () {
-      expect(validateEmail('talha@example.com'), isNull);
-      expect(validateEmail('  a@b.co  '), isNull);
+  group('password hashing (pure)', () {
+    test('same password + different salts -> different hashes', () {
+      const password = 'same-password-123';
+      final saltA = generateSalt();
+      final saltB = generateSalt();
+      expect(saltA, isNot(saltB));
+      expect(saltA.length, 32);
+      expect(saltB.length, 32);
+      final hashA = hashPassword(password, saltA);
+      final hashB = hashPassword(password, saltB);
+      expect(hashA, isNot(hashB));
+      expect(hashA.length, 64);
+      expect(verifyPassword(
+          password: password, salt: saltA, storedHash: hashA), isTrue);
+      expect(verifyPassword(
+          password: password, salt: saltB, storedHash: hashA), isFalse);
+      expect(verifyPassword(
+          password: 'wrong', salt: saltA, storedHash: hashA), isFalse);
     });
 
-    test('validateEmail rejects empty, missing @, missing domain', () {
-      expect(validateEmail(''), 'Enter your email address.');
-      expect(validateEmail('   '), 'Enter your email address.');
-      expect(validateEmail('not-an-email'),
-          'Enter a valid email address, like name@example.com.');
-      expect(validateEmail('a@b'), 'Enter a valid email address, like name@example.com.');
-      expect(validateEmail('a b@c.com'),
-          'Enter a valid email address, like name@example.com.');
-    });
-
-    test('validatePassword requires at least 6 characters', () {
-      expect(validatePassword(''), 'Enter a password.');
-      expect(validatePassword('12345'),
-          'Password must be at least 6 characters.');
-      expect(validatePassword('123456'), isNull);
-      expect(validatePassword('ali123'), isNull);
-    });
-
-    test('validateConfirmPassword requires a match', () {
-      expect(validateConfirmPassword('abc123', ''),
-          'Repeat your password.');
-      expect(validateConfirmPassword('abc123', 'abc124'),
-          'Passwords do not match.');
-      expect(validateConfirmPassword('abc123', 'abc123'), isNull);
-    });
-
-    test('validateDisplayName requires a name', () {
-      expect(validateDisplayName(''), 'Enter your name.');
-      expect(validateDisplayName('  '), 'Enter your name.');
-      expect(validateDisplayName('Ali'), isNull);
+    test('generateSalt is random, not sequential', () {
+      final salts = {
+        for (var i = 0; i < 100; i++) generateSalt(),
+      };
+      expect(salts.length, 100);
     });
   });
 
-  group('auth error mapping', () {
-    test('every required Firebase code maps to a plain message', () {
-      const codes = {
-        'user-not-found': 'No account exists for that email.',
-        'wrong-password': 'Wrong password.',
-        'email-already-in-use': 'An account already exists for that email.',
-        'weak-password': 'Password must be at least 6 characters.',
-        'invalid-email': 'Enter a valid email address, like name@example.com.',
-        'network-request-failed': 'No connection.',
-        'operation-not-allowed': 'Email sign-in is not enabled',
-        'too-many-requests': 'Too many attempts.',
-      };
-      for (final entry in codes.entries) {
-        final message = firebaseAuthErrorMessageForCode(entry.key);
-        expect(message, contains(entry.value),
-            reason: 'code ${entry.key}');
-        expect(message, isNot(contains('FirebaseAuthException')),
-            reason: 'code ${entry.key}');
-        expect(message, isNot(contains('ERROR_')),
-            reason: 'code ${entry.key}');
+  group('RealLocalAuthService (in-memory store)', () {
+    late RealLocalAuthService service;
+
+    setUp(() {
+      SharedPreferences.setMockInitialValues({});
+      service = _service();
+    });
+
+    test('demo accounts are seeded: all three sign in', () async {
+      for (final demo in demoAccounts) {
+        final result = await service.signInDemo(demo);
+        expect(result, isA<LocalAuthSuccess>());
+        final session = (result as LocalAuthSuccess).session!;
+        expect(session.uid, demoUidForMember(demo.memberId));
+        expect(session.email, demo.email);
+        expect(session.isDemo, isTrue);
+        expect(session.memberId, demo.memberId);
       }
     });
 
-    test('unknown codes and non-Firebase errors get the generic message',
-        () {
-      expect(firebaseAuthErrorMessageForCode('something-new'),
-          'Something went wrong. Please try again.');
-      expect(firebaseAuthErrorMessage(Exception('boom')),
-          'Something went wrong. Please try again.');
-      expect(firebaseAuthErrorMessage('raw string'),
-          isNot(contains('raw string')));
+    test('sign-up creates the account and signs in directly', () async {
+      final result = await service.signUpWithEmail(
+        email: '  Talha@Example.COM ',
+        password: 'secret123',
+        displayName: 'Talha',
+        memberId: 'M01',
+      );
+      expect(result, isA<LocalAuthSuccess>());
+      final session = (result as LocalAuthSuccess).session!;
+      expect(session.email, 'talha@example.com');
+      expect(session.displayName, 'Talha');
+      expect(session.isDemo, isFalse);
+      expect(session.memberId, 'M01');
+      expect(await service.memberIdFor(session.uid), 'M01');
+      // The stored record holds a salt + hash, never the password.
+      final doc = await service.store.load();
+      final users = (doc['users'] as List).cast<Map<String, dynamic>>();
+      final stored =
+          users.where((u) => u['id'] == session.uid).single;
+      expect(stored['passwordSalt'], isNotNull);
+      expect(stored['passwordHash'], isNotNull);
+      expect(stored['passwordHash'], isNot(contains('secret123')));
+      expect(
+        verifyPassword(
+          password: 'secret123',
+          salt: stored['passwordSalt'] as String,
+          storedHash: stored['passwordHash'] as String,
+        ),
+        isTrue,
+      );
+    });
+
+    test('sign-up rejects duplicates, bad emails, short passwords',
+        () async {
+      var result = await service.signUpWithEmail(
+        email: 'user@example.com',
+        password: 'secret123',
+        displayName: 'User',
+        memberId: 'M02',
+      );
+      expect(result, isA<LocalAuthSuccess>());
+      result = await service.signUpWithEmail(
+        email: 'USER@example.com',
+        password: 'other123',
+        displayName: 'Other',
+        memberId: 'M03',
+      );
+      expect(result, isA<LocalAuthFailure>());
+      expect((result as LocalAuthFailure).message,
+          contains('already exists'));
+      result = await service.signUpWithEmail(
+        email: 'not-an-email',
+        password: 'secret123',
+        displayName: 'User',
+        memberId: 'M02',
+      );
+      expect(result, isA<LocalAuthFailure>());
+      result = await service.signUpWithEmail(
+        email: 'new@example.com',
+        password: 'short',
+        displayName: 'User',
+        memberId: 'M02',
+      );
+      expect(result, isA<LocalAuthFailure>());
+      expect((result as LocalAuthFailure).message,
+          contains('at least 6 characters'));
+    });
+
+    test('sign-in: wrong password and unknown email share one message',
+        () async {
+      await service.signUpWithEmail(
+        email: 'user@example.com',
+        password: 'secret123',
+        displayName: 'User',
+        memberId: 'M02',
+      );
+      const message = 'That email or password is not correct.';
+      var result = await service.signInWithEmail(
+        email: 'user@example.com',
+        password: 'wrong-password',
+      );
+      expect(result, isA<LocalAuthFailure>());
+      expect((result as LocalAuthFailure).message, contains(message));
+      result = await service.signInWithEmail(
+        email: 'nobody@example.com',
+        password: 'secret123',
+      );
+      expect(result, isA<LocalAuthFailure>());
+      expect((result as LocalAuthFailure).message, contains(message));
+      result = await service.signInWithEmail(
+        email: 'user@example.com',
+        password: 'secret123',
+      );
+      expect(result, isA<LocalAuthSuccess>());
+    });
+
+    test('sign-out clears the session and emits null', () async {
+      final seen = <LocalSession?>[];
+      final sub = service.authStateChanges.listen(seen.add);
+      await service.signInDemo(demoAccounts.first);
+      expect(service.currentSession, isNotNull);
+      await service.signOut();
+      await _settle();
+      expect(service.currentSession, isNull);
+      expect(seen.last, isNull);
+      await sub.cancel();
+    });
+
+    test('session restores from the persisted uid', () async {
+      await service.signUpWithEmail(
+        email: 'user@example.com',
+        password: 'secret123',
+        displayName: 'User',
+        memberId: 'M02',
+      );
+      await _settle();
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString('local_session_uid'), isNotNull);
+      // A second service over the SAME store restores the session.
+      final service2 = RealLocalAuthService(store: service.store);
+      final restored = await service2.restoreSession();
+      expect(restored, isNotNull);
+      expect(restored!.email, 'user@example.com');
+      expect(restored.memberId, 'M02');
+    });
+
+    test('restore returns null when nothing was persisted', () async {
+      final restored = await service.restoreSession();
+      expect(restored, isNull);
+    });
+
+    test('device-local reset: code on device, single-use, signs in',
+        () async {
+      await service.signUpWithEmail(
+        email: 'user@example.com',
+        password: 'old-password',
+        displayName: 'User',
+        memberId: 'M02',
+      );
+      // Unknown email: no code (null), nothing to enumerate.
+      expect(
+        await service.requestPasswordReset(email: 'nobody@example.com'),
+        isNull,
+      );
+      final code = await service.requestPasswordReset(
+          email: 'user@example.com');
+      expect(code, isNotNull);
+      expect(code!.length, 6);
+      expect(int.tryParse(code), isNotNull);
+      // Wrong code is rejected; the old password still works.
+      var result = await service.resetPasswordWithCode(
+        email: 'user@example.com',
+        code: '000000',
+        newPassword: 'new-password',
+      );
+      expect(result, isA<LocalAuthFailure>());
+      result = await service.signInWithEmail(
+        email: 'user@example.com',
+        password: 'old-password',
+      );
+      expect(result, isA<LocalAuthSuccess>());
+      // Right code resets, signs in, and is single-use.
+      result = await service.resetPasswordWithCode(
+        email: 'user@example.com',
+        code: code,
+        newPassword: 'new-password',
+      );
+      expect(result, isA<LocalAuthSuccess>());
+      expect((result as LocalAuthSuccess).session!.email,
+          'user@example.com');
+      await service.signOut();
+      result = await service.signInWithEmail(
+        email: 'user@example.com',
+        password: 'old-password',
+      );
+      expect(result, isA<LocalAuthFailure>());
+      result = await service.signInWithEmail(
+        email: 'user@example.com',
+        password: 'new-password',
+      );
+      expect(result, isA<LocalAuthSuccess>());
+      result = await service.resetPasswordWithCode(
+        email: 'user@example.com',
+        code: code,
+        newPassword: 'another-one',
+      );
+      expect(result, isA<LocalAuthFailure>());
+    });
+
+    test('reset rejects a short new password', () async {
+      await service.signUpWithEmail(
+        email: 'user@example.com',
+        password: 'old-password',
+        displayName: 'User',
+        memberId: 'M02',
+      );
+      final code = (await service.requestPasswordReset(
+          email: 'user@example.com'))!;
+      final result = await service.resetPasswordWithCode(
+        email: 'user@example.com',
+        code: code,
+        newPassword: 'short',
+      );
+      expect(result, isA<LocalAuthFailure>());
+    });
+
+    test('saveMemberId updates the link', () async {
+      final result = await service.signUpWithEmail(
+        email: 'user@example.com',
+        password: 'secret123',
+        displayName: 'User',
+        memberId: 'M02',
+      );
+      final uid = (result as LocalAuthSuccess).session!.uid;
+      await service.saveMemberId(uid, 'M03');
+      expect(await service.memberIdFor(uid), 'M03');
     });
   });
 
-  group('AuthGate state transitions (fake auth service)', () {
-    test('signed-out by default; email sign-in unverified gates',
-        () async {
-      final fake = FakeFirebaseAuthService();
-      final state = await _makeState(firebaseAuth: fake);
-      expect(state.firebaseAuthEnabled, isTrue);
-      expect(state.firebaseStatus, FirebaseAuthStatus.signedOut);
-      expect(state.isLoggedIn, isFalse);
+  group('AppState + local auth (fake repository)', () {
+    AppState makeState({LocalAuthService? localAuth, bool resetPrefs = true}) {
+      if (resetPrefs) SharedPreferences.setMockInitialValues({});
+      return AppState(
+        repository: FakeSplitNestRepository.empty(),
+        localAuth: localAuth ?? _service(),
+      );
+    }
 
-      // Sign up: account created, verification email sent, gate set.
-      final signedUp = await state.signUpWithFirebaseEmail(
-        displayName: 'Test User',
-        email: 'test@example.com',
-        password: 'secret1',
+    test('sign-up via AppState logs in and loads the household',
+        () async {
+      final state = makeState();
+      final ok = await state.signUpWithEmail(
+        displayName: 'Talha',
+        email: 'talha@example.com',
+        password: 'secret123',
         memberId: 'M01',
       );
-      expect(signedUp, isTrue);
-      expect(fake.verificationEmailsSent, 1);
-      expect(state.firebaseStatus, FirebaseAuthStatus.needsVerification);
-      expect(state.isLoggedIn, isFalse,
-          reason: 'unverified users must not reach Home');
-
-      // Still unverified after a check: stays gated.
-      final checkedTooSoon = await state.refreshVerificationStatus();
-      expect(checkedTooSoon, isFalse);
-      expect(state.firebaseStatus, FirebaseAuthStatus.needsVerification);
-
-      // Click the link, then check: verified, member applied, Home.
-      fake.verifyEmail('test@example.com');
-      final checked = await state.refreshVerificationStatus();
-      expect(checked, isTrue);
-      expect(state.firebaseStatus, FirebaseAuthStatus.signedIn);
+      expect(ok, isTrue);
       expect(state.isLoggedIn, isTrue);
       expect(state.loggedInMemberId, 'M01');
+      expect(state.isDemoUser, isFalse);
+      expect(state.members.map((m) => m.id), ['M01', 'M02', 'M03']);
     });
 
-    test('sign-in with a verified account goes straight to Home',
+    test('sign-up with a taken email fails with a plain message',
         () async {
-      final fake = FakeFirebaseAuthService();
-      final state = await _makeState(firebaseAuth: fake);
-      await state.signUpWithFirebaseEmail(
-        displayName: 'Test User',
-        email: 'verified@example.com',
-        password: 'secret1',
+      final service = _service();
+      final state = makeState(localAuth: service);
+      expect(
+        await state.signUpWithEmail(
+          displayName: 'Talha',
+          email: 'talha@example.com',
+          password: 'secret123',
+          memberId: 'M01',
+        ),
+        isTrue,
+      );
+      await state.logout();
+      final ok = await state.signUpWithEmail(
+        displayName: 'Other',
+        email: 'talha@example.com',
+        password: 'other123',
         memberId: 'M02',
       );
-      fake.verifyEmail('verified@example.com');
-      await state.logout();
-      expect(state.firebaseStatus, FirebaseAuthStatus.signedOut);
+      expect(ok, isFalse);
+      expect(state.errorMessage, contains('already exists'));
       expect(state.isLoggedIn, isFalse);
+    });
 
-      final ok = await state.signInWithFirebaseEmail(
-        email: 'verified@example.com',
-        password: 'secret1',
+    test('sign-in via AppState after logout', () async {
+      final service = _service();
+      final state = makeState(localAuth: service);
+      await state.signUpWithEmail(
+        displayName: 'Talha',
+        email: 'talha@example.com',
+        password: 'secret123',
+        memberId: 'M02',
       );
-      expect(ok, isTrue);
-      expect(state.firebaseStatus, FirebaseAuthStatus.signedIn);
+      await state.logout();
+      expect(state.isLoggedIn, isFalse);
+      expect(
+        await state.signInWithEmail(
+          email: 'talha@example.com',
+          password: 'wrong-password',
+        ),
+        isFalse,
+      );
+      expect(state.isLoggedIn, isFalse);
+      expect(
+        await state.signInWithEmail(
+          email: 'talha@example.com',
+          password: 'secret123',
+        ),
+        isTrue,
+      );
       expect(state.isLoggedIn, isTrue);
       expect(state.loggedInMemberId, 'M02');
     });
 
-    test('wrong password and unknown email fail with plain messages',
-        () async {
-      final fake = FakeFirebaseAuthService();
-      final state = await _makeState(firebaseAuth: fake);
-      await state.signUpWithFirebaseEmail(
-        displayName: 'Test User',
-        email: 'real@example.com',
-        password: 'secret1',
-        memberId: 'M01',
-      );
-      var ok = await state.signInWithFirebaseEmail(
-        email: 'real@example.com',
-        password: 'not-the-password',
-      );
-      expect(ok, isFalse);
-      expect(state.errorMessage,
-          'That email or password is not correct. Try again or reset your password.');
-      expect(state.isLoggedIn, isFalse);
-
-      ok = await state.signInWithFirebaseEmail(
-        email: 'nobody@example.com',
-        password: 'secret1',
-      );
-      expect(ok, isFalse);
-      expect(state.errorMessage, contains('No account exists'));
-      expect(state.isLoggedIn, isFalse);
-    });
-
-    test('sign-up with an existing email fails plainly', () async {
-      final fake = FakeFirebaseAuthService();
-      final state = await _makeState(firebaseAuth: fake);
-      await state.signUpWithFirebaseEmail(
-        displayName: 'Test User',
-        email: 'dup@example.com',
-        password: 'secret1',
-        memberId: 'M01',
-      );
-      final again = await state.signUpWithFirebaseEmail(
-        displayName: 'Test User',
-        email: 'dup@example.com',
-        password: 'secret1',
-        memberId: 'M01',
-      );
-      expect(again, isFalse);
-      expect(state.errorMessage, contains('already exists'));
-    });
-
-    test('logout clears the Firebase session and the app login',
-        () async {
-      final fake = FakeFirebaseAuthService();
-      final google = _FakeGoogleAuthService(const GoogleSignedIn(
-        idToken: 'fake-id-token',
-        email: 'test.user@gmail.com',
-      ));
-      final state =
-          await _makeState(firebaseAuth: fake, googleAuth: google);
-      await state.signUpWithFirebaseEmail(
-        displayName: 'Test User',
-        email: 'logout@example.com',
-        password: 'secret1',
-        memberId: 'M03',
-      );
-      fake.verifyEmail('logout@example.com');
-      await state.refreshVerificationStatus();
-      expect(state.isLoggedIn, isTrue);
-
-      // Log in via Google too, so logout must sign Google out.
-      await state.loginWithGoogle(
-          idToken: 'fake-id-token', memberId: 'M03');
-      await state.logout();
-      expect(state.firebaseStatus, FirebaseAuthStatus.signedOut);
-      expect(state.firebaseSession, isNull);
-      expect(state.isLoggedIn, isFalse);
-      expect(state.loggedInMemberId, isNull);
-      expect(fake.currentSession, isNull);
-      expect(google.signOutCalled, isTrue);
-    });
-
-    test('external sign-out clears the app login', () async {
-      final fake = FakeFirebaseAuthService();
-      final state = await _makeState(firebaseAuth: fake);
-      await state.signUpWithFirebaseEmail(
-        displayName: 'Test User',
-        email: 'ext@example.com',
-        password: 'secret1',
-        memberId: 'M01',
-      );
-      fake.verifyEmail('ext@example.com');
-      await state.refreshVerificationStatus();
-      expect(state.isLoggedIn, isTrue);
-
-      // Firebase signs out underneath the app (e.g. token revoked).
-      await fake.signOut();
-      await Future<void>.delayed(Duration.zero);
-      expect(state.firebaseStatus, FirebaseAuthStatus.signedOut);
-      expect(state.isLoggedIn, isFalse);
-    });
-
-    test('profile sync runs on sign-in (best-effort hookup)', () async {
-      final fake = FakeFirebaseAuthService();
-      final state = await _makeState(firebaseAuth: fake);
-      await state.signUpWithFirebaseEmail(
-        displayName: 'Test User',
-        email: 'profile@example.com',
-        password: 'secret1',
-        memberId: 'M01',
-      );
-      expect(fake.profileSyncs, greaterThan(0));
-      expect(await fake.memberIdFor('uid-profile@example.com'), 'M01');
-    });
-  });
-
-  group('demo create-or-sign-in (fake auth service)', () {
-    test('first demo login creates the Firebase user, second signs in',
-        () async {
-      final fake = FakeFirebaseAuthService();
-      final state = await _makeState(firebaseAuth: fake);
-
-      var ok = await state.loginWithDemo(memberId: 'M01');
-      expect(ok, isTrue);
-      expect(state.firebaseStatus, FirebaseAuthStatus.signedIn,
-          reason: 'demo accounts bypass the verification gate');
-      expect(state.isLoggedIn, isTrue);
-      expect(state.loggedInMemberId, 'M01');
-      expect(state.firebaseSession?.email, 'ali.demo@splitnest.app');
-      expect(state.firebaseSession?.isDemo, isTrue);
-
-      await state.logout();
-      ok = await state.loginWithDemo(memberId: 'M01');
-      expect(ok, isTrue, reason: 'second use signs in, no duplicate');
-      expect(state.loggedInMemberId, 'M01');
-    });
-
-    test('all three demo accounts map to the right members', () async {
-      final fake = FakeFirebaseAuthService();
-      final state = await _makeState(firebaseAuth: fake);
-      const cases = {
-        'M01': 'ali.demo@splitnest.app',
-        'M02': 'ayesha.demo@splitnest.app',
-        'M03': 'bilal.demo@splitnest.app',
-      };
-      for (final entry in cases.entries) {
-        final ok = await state.loginWithDemo(memberId: entry.key);
-        expect(ok, isTrue, reason: entry.key);
-        expect(state.firebaseSession?.email, entry.value);
-        expect(state.loggedInMemberId, entry.key);
+    test('demo login via AppState: all three, demo users', () async {
+      final state = makeState();
+      for (final demo in demoAccounts) {
+        expect(await state.loginWithDemo(memberId: demo.memberId),
+            isTrue);
+        expect(state.isLoggedIn, isTrue);
+        expect(state.isDemoUser, isTrue);
+        expect(state.loggedInMemberId, demo.memberId);
+        expect(state.localSession?.email, demo.email);
         await state.logout();
       }
     });
 
-    test('demo login without Firebase uses a local demo identity',
-        () async {
-      // No firebaseAuth wired in: the demo identity is local, and
-      // the household still loads from the repository — there is no
-      // backend login any more.
-      final state = await _makeState();
-      expect(state.firebaseAuthEnabled, isFalse);
-      final ok = await state.loginWithDemo(memberId: 'M02');
-      expect(ok, isTrue);
-      expect(state.loggedInMemberId, 'M02');
-      expect(state.firebaseSession?.isDemo, isTrue);
-      expect(state.firebaseSession?.email, 'ayesha.demo@splitnest.app');
+    test('logout clears the session and the app login', () async {
+      final state = makeState();
+      await state.loginWithDemo(memberId: 'M01');
       expect(state.isLoggedIn, isTrue);
+      await state.logout();
+      expect(state.isLoggedIn, isFalse);
+      expect(state.localSession, isNull);
+      expect(state.members, isEmpty);
     });
-  });
 
-  group('password reset', () {
-    test('reset sends for a valid email, fails plainly otherwise',
+    test('reset via AppState signs in with the new password', () async {
+      final service = _service();
+      final state = makeState(localAuth: service);
+      await state.signUpWithEmail(
+        displayName: 'Talha',
+        email: 'talha@example.com',
+        password: 'old-password',
+        memberId: 'M01',
+      );
+      await state.logout();
+      final code =
+          await state.requestPasswordReset('talha@example.com');
+      expect(code, isNotNull);
+      expect(code!.length, 6);
+      expect(
+        await state.resetPasswordWithCode(
+          email: 'talha@example.com',
+          code: '000000',
+          newPassword: 'new-password',
+        ),
+        isFalse,
+      );
+      expect(
+        await state.resetPasswordWithCode(
+          email: 'talha@example.com',
+          code: code,
+          newPassword: 'new-password',
+        ),
+        isTrue,
+      );
+      expect(state.isLoggedIn, isTrue);
+      await state.logout();
+      expect(
+        await state.signInWithEmail(
+          email: 'talha@example.com',
+          password: 'new-password',
+        ),
+        isTrue,
+      );
+    });
+
+    test('reset for an unknown email fails plainly', () async {
+      final state = makeState();
+      final code =
+          await state.requestPasswordReset('nobody@example.com');
+      expect(code, isNull);
+      expect(state.errorMessage, contains('No account exists'));
+    });
+
+    test('session restores across AppState instances (shared service)',
         () async {
-      final fake = FakeFirebaseAuthService();
-      final state = await _makeState(firebaseAuth: fake);
-      final ok =
-          await state.sendFirebasePasswordReset('user@example.com');
-      expect(ok, isTrue);
-      expect(fake.passwordResetEmailsSent, 1);
+      final service = _service();
+      final state1 = makeState(localAuth: service);
+      await state1.signUpWithEmail(
+        displayName: 'Talha',
+        email: 'talha@example.com',
+        password: 'secret123',
+        memberId: 'M03',
+      );
+      await _settle();
+      // A fresh AppState over the same auth service restores the
+      // persisted session and re-enters the app. Do NOT reset the
+      // mock prefs here — that would wipe the persisted session uid
+      // this test is restoring from.
+      final state2 = makeState(localAuth: service, resetPrefs: false);
+      var restored = false;
+      for (var i = 0; i < 50 && !restored; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+        restored = state2.isLoggedIn;
+      }
+      expect(restored, isTrue);
+      expect(state2.loggedInMemberId, 'M03');
     });
   });
 
-  group('auth screens (widget)', () {
-    testWidgets('email mode shows sign-in form and sign-up link',
-        (tester) async {
-      final fake = FakeFirebaseAuthService();
-      await _pumpApp(tester, firebaseAuth: fake);
-      expect(find.text('Sign in with email instead'), findsOneWidget);
-      await tester.ensureVisible(find.text('Sign in with email instead'));
+  group('login screen (widget)', () {
+    Future<void> pumpApp(WidgetTester tester) async {
+      SharedPreferences.setMockInitialValues({});
+      await tester.pumpWidget(
+        ChangeNotifierProvider(
+          create: (_) => AppState(
+            repository: FakeSplitNestRepository.benchmark(),
+          )..refresh(),
+          child: const SplitNestApp(),
+        ),
+      );
       await tester.pumpAndSettle();
+    }
+
+    testWidgets('invalid email is rejected locally, before any auth call',
+        (tester) async {
+      await pumpApp(tester);
       await tester.tap(find.text('Sign in with email instead'));
       await tester.pumpAndSettle();
-      expect(find.text('Create an account'), findsOneWidget);
-      expect(find.text('Forgot password?'), findsOneWidget);
-      expect(find.text('Sign in'), findsOneWidget);
-      // Invalid email is rejected locally, before any Firebase call.
       await tester.enterText(
           find.widgetWithText(TextField, 'Email'), 'not-an-email');
       await tester.enterText(
-          find.widgetWithText(TextField, 'Password'), 'secret1');
+          find.widgetWithText(TextField, 'Password'), 'secret123');
       await tester.tap(find.text('Sign in'));
       await tester.pumpAndSettle();
-      expect(find.text('Enter a valid email address, like name@example.com.'),
+      expect(
+          find.text('Enter a valid email address, like name@example.com.'),
           findsOneWidget);
-      expect(fake.currentSession, isNull);
+      expect(find.text('Log in'), findsOneWidget);
     });
 
-    testWidgets('sign-up flow ends on the verification screen',
+    testWidgets('email sign-in with a demo account enters Home',
         (tester) async {
-      final fake = FakeFirebaseAuthService();
-      await _pumpApp(tester, firebaseAuth: fake);
-      await tester.ensureVisible(find.text('Sign in with email instead'));
-      await tester.pumpAndSettle();
+      await pumpApp(tester);
       await tester.tap(find.text('Sign in with email instead'));
       await tester.pumpAndSettle();
-      await tester.ensureVisible(find.text('Create an account'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Create an account'));
-      await tester.pumpAndSettle();
-      expect(find.text('Create your SplitNest account'), findsOneWidget);
-      // Short password is rejected locally.
-      await tester.tap(find.text('Ali'));
-      await tester.pumpAndSettle();
+      await tester.enterText(find.widgetWithText(TextField, 'Email'),
+          'ali.demo@splitnest.app');
       await tester.enterText(
-          find.widgetWithText(TextField, 'Your name'), 'Test User');
-      await tester.enterText(
-          find.widgetWithText(TextField, 'Email'), 'new@example.com');
-      await tester.enterText(
-          find.widgetWithText(TextField, 'Password'), 'short');
-      await tester.enterText(
-          find.widgetWithText(TextField, 'Confirm password'), 'short');
-      await tester.ensureVisible(find.text('Create account'));
+          find.widgetWithText(TextField, 'Password'), 'ali123');
+      await tester.tap(find.text('Sign in'));
       await tester.pumpAndSettle();
-      await tester.tap(find.text('Create account'));
-      await tester.pumpAndSettle();
-      expect(find.text('Password must be at least 6 characters.'),
+      // The welcome popup proves the login went through real auth.
+      expect(find.text('You are using SplitNest as Ali (M01)'),
           findsOneWidget);
-      // Mismatched confirmation is rejected locally too.
-      await tester.enterText(
-          find.widgetWithText(TextField, 'Password'), 'secret1');
-      await tester.enterText(
-          find.widgetWithText(TextField, 'Confirm password'), 'secret2');
-      await tester.ensureVisible(find.text('Create account'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Create account'));
-      await tester.pumpAndSettle();
-      expect(find.text('Passwords do not match.'), findsOneWidget);
-      // Valid form: account created, verification screen appears.
-      await tester.enterText(
-          find.widgetWithText(TextField, 'Confirm password'), 'secret1');
-      await tester.ensureVisible(find.text('Create account'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Create account'));
-      await tester.pumpAndSettle();
-      expect(find.text('Verify your email'), findsOneWidget);
-      expect(find.textContaining('new@example.com'), findsOneWidget);
-      expect(fake.verificationEmailsSent, 1);
     });
 
-    testWidgets('verification screen resends and checks again',
+    testWidgets('forgot password shows an on-device code, no email claim',
         (tester) async {
-      final fake = FakeFirebaseAuthService();
-      await _pumpApp(tester, firebaseAuth: fake);
-      await tester.ensureVisible(find.text('Sign in with email instead'));
-      await tester.pumpAndSettle();
+      await pumpApp(tester);
       await tester.tap(find.text('Sign in with email instead'));
-      await tester.pumpAndSettle();
-      await tester.ensureVisible(find.text('Create an account'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Create an account'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Ayesha'));
-      await tester.pumpAndSettle();
-      await tester.enterText(
-          find.widgetWithText(TextField, 'Your name'), 'Test User');
-      await tester.enterText(
-          find.widgetWithText(TextField, 'Email'), 'verify@example.com');
-      await tester.enterText(
-          find.widgetWithText(TextField, 'Password'), 'secret1');
-      await tester.enterText(
-          find.widgetWithText(TextField, 'Confirm password'), 'secret1');
-      await tester.ensureVisible(find.text('Create account'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Create account'));
-      await tester.pumpAndSettle();
-      expect(find.text('Verify your email'), findsOneWidget);
-      // Not verified yet: stays on the verification screen.
-      await tester.tap(find.text('I’ve verified — check again'));
-      await tester.pumpAndSettle();
-      expect(find.text('Verify your email'), findsOneWidget);
-      expect(find.textContaining('Not verified yet'), findsOneWidget);
-      // Resend works.
-      await tester.tap(find.text('Resend verification email'));
-      await tester.pumpAndSettle();
-      expect(find.text('Verification email sent. Check your inbox.'),
-          findsOneWidget);
-      expect(fake.verificationEmailsSent, 2);
-      // Click the link, check again: Home opens as Ayesha.
-      fake.verifyEmail('verify@example.com');
-      await tester.tap(find.text('I’ve verified — check again'));
-      await tester.pumpAndSettle();
-      expect(find.text('Verify your email'), findsNothing);
-      expect(find.text('You are using SplitNest as Ayesha (M02)'),
-          findsOneWidget);
-    });
-
-    testWidgets('forgot-password screen sends and confirms', (tester) async {
-      final fake = FakeFirebaseAuthService();
-      await _pumpApp(tester, firebaseAuth: fake);
-      await tester.ensureVisible(find.text('Sign in with email instead'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Sign in with email instead'));
-      await tester.pumpAndSettle();
-      await tester.ensureVisible(find.text('Forgot password?'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('Forgot password?'));
       await tester.pumpAndSettle();
       expect(find.text('Reset your password'), findsOneWidget);
-      await tester.enterText(
-          find.widgetWithText(TextField, 'Email'), 'bad-email');
-      await tester.tap(find.text('Send reset link'));
-      await tester.pumpAndSettle();
-      expect(find.text('Enter a valid email address, like name@example.com.'),
+      expect(find.textContaining('No email is sent'), findsOneWidget);
+      expect(find.textContaining('Anyone holding this device'),
           findsOneWidget);
-      await tester.enterText(
-          find.widgetWithText(TextField, 'Email'), 'user@example.com');
-      await tester.tap(find.text('Send reset link'));
-      await tester.pumpAndSettle();
-      expect(find.textContaining('password-reset link has been sent'),
-          findsOneWidget);
-      expect(fake.passwordResetEmailsSent, 1);
-    });
-
-    testWidgets('demo login through Firebase shows the welcome popup',
-        (tester) async {
-      final fake = FakeFirebaseAuthService();
-      await _pumpApp(tester, firebaseAuth: fake);
-      await tester.ensureVisible(find.text('Demo'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Demo'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Ali • M01'));
-      await tester.pumpAndSettle();
-      expect(find.text('You are using SplitNest as Ali (M01)'),
-          findsOneWidget);
-      expect(fake.currentSession?.email, 'ali.demo@splitnest.app');
-    });
-
-    testWidgets('Google sign-in links the picked member to Firebase',
-        (tester) async {
-      final fake = FakeFirebaseAuthService();
-      await _pumpApp(
-        tester,
-        firebaseAuth: fake,
-        googleAuth: _FakeGoogleAuthService(const GoogleSignedIn(
-          idToken: 'fake-id-token',
-          email: 'test.user@gmail.com',
-        )),
-      );
-      await tester.ensureVisible(find.text('Continue with Google'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Continue with Google'));
-      await tester.pumpAndSettle();
-      expect(find.text('Choose your account'), findsOneWidget);
-      await tester.tap(find.text('Bilal • M03'));
-      await tester.pumpAndSettle();
-      if (find.text('Got it').evaluate().isNotEmpty) {
-        await tester.tap(find.text('Got it'));
-        await tester.pumpAndSettle();
-        if (find.text('Dismiss').evaluate().isNotEmpty) {
-          await tester.tap(find.text('Dismiss'));
-          await tester.pumpAndSettle();
-        }
-      }
-      expect(find.text('Home'), findsOneWidget);
-      expect(find.text('Logged in as'), findsOneWidget);
-      // (In production the same tap also signs the Google credential
-      // into Firebase and saveFirebaseMember links the picked member
-      // to that Firebase uid, so the next Google sign-in reuses it.
-      // That link step needs a real Firebase user, so it is covered
-      // by the AppState unit tests, not by this widget fake.)
     });
   });
 }

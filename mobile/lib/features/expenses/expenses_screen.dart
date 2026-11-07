@@ -20,7 +20,7 @@ import 'qr_scan_screen.dart';
 import 'verify_receipt_sheet.dart';
 
 /// Expenses tab: the group's recorded expense history (loaded from
-/// Firestore — it persists across reloads) + an Add New Expense
+/// lock.json — it persists across reloads) + an Add New Expense
 /// bottom sheet.
 ///
 /// Search + filters and the Quick-add favourites below are purely
@@ -53,7 +53,7 @@ class _ExpensesScreenState extends State<ExpensesScreen> {
     }).toList();
   }
 
-  /// One-tap re-add of a favourite: posts a REAL expense to Firestore
+  /// One-tap re-add of a favourite: posts a REAL expense to lock.json
   /// (same title, amount, payer and split as its last occurrence,
   /// dated today) and refreshes the single store.
   Future<void> _quickAdd(AppState state, FavouriteExpense fav) async {
@@ -177,7 +177,7 @@ class _ExpensesScreenState extends State<ExpensesScreen> {
             ),
             const SizedBox(height: 16),
           ],
-          // Fixed monthly expenses (templates, persisted in Firestore).
+          // Fixed monthly expenses (templates, persisted in lock.json).
           // The seeded Internet + Electricity templates are
           // equal splits; the benchmark's custom-split Internet
           // expense is separate and untouched by this section.
@@ -604,7 +604,7 @@ Future<void> _openAddExpense(
 
 /// Add New Expense bottom sheet.
 ///
-/// Split strategies — the UI labels ARE the Firestore split types,
+/// Split strategies — the UI labels ARE the lock.json split types,
 /// no translation layer:
 /// - Equal: pick the members who share, split evenly among the chosen
 ///   (remainder paisa in member-ID order).

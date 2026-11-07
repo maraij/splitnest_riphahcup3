@@ -1,14 +1,61 @@
+# SplitNest — PRACTICE ONLY (not for submission).
+# Flutter standard ignores, plus the local-only data files and
+# secrets of this project. The committed seed template
+# (mobile/assets/lock-seed.json) and the log template
+# (docs/logs-template.json) are deliberately NOT ignored.
+
+# --- Flutter / Dart ---
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
+*.log
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# --- Android / iOS build outputs ---
+mobile/build/
+mobile/android/app/build/
+mobile/ios/Pods/
+mobile/ios/.symlinks/
+mobile/.idea/
+
+# --- Local data (runtime files, never committed) ---
+# lock.json is the live household database on the device; its
+# backup and tmp files travel with it. The committed reference
+# seed is mobile/assets/lock-seed.json (different filename, safe).
+lock.json
+lock.json.bak
+lock.json.tmp
+logs.json
+logs.json.bak
+logs.json.tmp
+
+# --- Backend (legacy, retired) ---
 node_modules/
 backend/splitnest.db
 backend/splitnest.db-journal
 backend/splitnest.db-wal
 backend/splitnest.db-shm
-mobile/build/
-mobile/.dart_tool/
-mobile/.idea/
-*.log
-.DS_Store
-# NOTE: mobile/android/app/google-services.json is intentionally NOT
-# ignored — the CI build needs it, and its API key is a client key
-# restricted to this package + SHA-1; the same key ships inside
-# every APK anyway. Rotate it in Firebase console if ever needed.
+backend/node_modules/
+
+# --- Secrets — never commit these ---
+# .env holds real values; .env.example (placeholders only) IS
+# committed. The Gemini API key is supplied via
+# --dart-define=GEMINI_API_KEY=... only — never from a file.
+.env
+*.jks
+*.keystore
+key.properties
+
+# --- Firebase (dropped entirely 2026-11-07, user decision) ---
+# No Firebase config remains in the repo. These patterns are here
+# so a stray config file can never be committed by accident.
+google-services.json
+GoogleService-Info.plist
+firebase.json
+firestore.rules
+storage.rules

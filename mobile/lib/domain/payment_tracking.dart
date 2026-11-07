@@ -1,5 +1,5 @@
 /// Per-member payment tracking + the payment status state machine —
-/// pure functions, no widgets, no Firestore.
+/// pure functions, no widgets, no storage.
 ///
 /// Two balances exist in this app, deliberately, and the UI must
 /// never blur them:

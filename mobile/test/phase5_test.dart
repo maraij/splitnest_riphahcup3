@@ -167,7 +167,7 @@ void main() {
           ],
           knownMembers: ['M01', 'M02', 'M03'],
         ),
-        throwsA(isA<CloudDataException>()),
+        throwsA(isA<LocalDataException>()),
       );
     });
   });
@@ -591,7 +591,7 @@ Thank you!
           ],
           actorUid: 'demo-M01',
         ),
-        throwsA(isA<CloudDataException>()),
+        throwsA(isA<LocalDataException>()),
       );
       expect(repo.allExpenses.length, 1);
     });
@@ -629,7 +629,7 @@ Thank you!
           amount: '100.00',
           actorUid: 'demo-M03',
         ),
-        throwsA(isA<CloudDataException>()),
+        throwsA(isA<LocalDataException>()),
       );
       // Ali (owner) may edit it.
       final ownerEdited = await repo.updateExpense(
@@ -648,7 +648,7 @@ Thank you!
           amount: '0.00',
           actorUid: 'demo-M01',
         ),
-        throwsA(isA<CloudDataException>()),
+        throwsA(isA<LocalDataException>()),
       );
       expect(
         (await repo.getExpenses(gid)).single.amount,
@@ -703,7 +703,7 @@ Thank you!
           id: expense.id,
           actorUid: 'demo-M03',
         ),
-        throwsA(isA<CloudDataException>()),
+        throwsA(isA<LocalDataException>()),
       );
       expect((await repo.getExpenses(gid)).length, 1);
       await repo.deleteExpense(
@@ -718,7 +718,7 @@ Thank you!
           id: expense.id,
           actorUid: 'demo-M01',
         ),
-        throwsA(isA<CloudDataException>()),
+        throwsA(isA<LocalDataException>()),
       );
     });
 
@@ -835,7 +835,7 @@ Thank you!
           paymentId: payment.id,
           actorUid: 'demo-M02',
         ),
-        throwsA(isA<CloudDataException>()),
+        throwsA(isA<LocalDataException>()),
       );
       await expectLater(
         repo.rejectPayment(
@@ -843,7 +843,7 @@ Thank you!
           paymentId: payment.id,
           actorUid: 'demo-M02',
         ),
-        throwsA(isA<CloudDataException>()),
+        throwsA(isA<LocalDataException>()),
       );
       expect(
         (await repo.getPayments(gid)).single.status,
@@ -870,7 +870,7 @@ Thank you!
           paymentId: payment.id,
           actorUid: 'demo-M01',
         ),
-        throwsA(isA<CloudDataException>()),
+        throwsA(isA<LocalDataException>()),
       );
       final second = await repo.recordPayment(
         groupId: gid,
@@ -890,7 +890,7 @@ Thank you!
           paymentId: second.id,
           actorUid: 'demo-M01',
         ),
-        throwsA(isA<CloudDataException>()),
+        throwsA(isA<LocalDataException>()),
       );
     });
   });

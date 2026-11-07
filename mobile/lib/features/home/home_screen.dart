@@ -519,7 +519,7 @@ class HomeScreen extends StatelessWidget {
           ],
           const SizedBox(height: 16),
           Text(
-            'Practice build · Cloud data (Firestore) · Signed in with Firebase.',
+            'Practice build · Data stays on this device.',
             style: TextStyle(
               fontSize: 12,
               color: theme.colorScheme.onSurfaceVariant,
