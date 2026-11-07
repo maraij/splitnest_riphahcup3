@@ -27,12 +27,31 @@ skeleton in `functions/` (not deployed); setup steps in
 succeeds. The app still runs on the Node backend in this phase; no
 screen behaviour changed.
 
+**Phase 2 — Firebase Authentication (done, 2026-11-07):** real Firebase
+Auth email/password sign-up + sign-in, email verification gate
+(verification screen with resend/reload), forgot/reset password, real
+Google Sign-In through Firebase Auth (google_sign_in v7 API), AuthGate
+session handling via `authStateChanges()`, secure logout. Demo accounts
+(ali/ayesha/bilal.demo@splitnest.app) now create-or-sign-in via Firebase
+Auth on first use and bypass the verification gate as seeded demo
+identities. Gates green: `flutter analyze` no issues, `flutter test`
+89/89 (65 baseline + 24 new auth tests), `flutter build web` succeeds.
+**Known limit:** an email-only Firebase user has identity but no Node
+backend token, so data calls 401 until Phase 3 moves data to Firestore;
+the app shows a plain notice instead of failing silently. Demo and
+Google users are unaffected.
+
 **Still pending (needs a console step, not code):** create the Firestore
 database (production mode, `asia-south1`), deploy `firestore.rules` /
 `storage.rules`, enable Storage. See
 [docs/FIREBASE_SETUP.md](docs/FIREBASE_SETUP.md) for exact steps.
 Cloud Functions are written but **not deployed** (scheduled function
-needs the Blaze plan).
+needs the Blaze plan). **Also pending:** enable the Email/Password
+sign-in provider in the console (only Google is confirmed enabled) —
+until then email/demo sign-in fails with `operation-not-allowed` and
+the app says so plainly; see `docs/FIREBASE_SETUP.md` §(g). No live
+sign-up/sign-in has been attempted yet — the real auth code paths need
+one live pass on a device/emulator after the console steps.
 
 ## Stack
 

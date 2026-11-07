@@ -2,23 +2,35 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../../state/app_state.dart';
+import '../../data/firebase_auth_service.dart';
 import '../../data/google_auth_service.dart';
 import '../../core/theme.dart';
 import '../../core/widgets/entrance.dart';
 import '../../core/widgets/error_banner.dart';
 import '../../core/widgets/illustrations.dart';
 import '../../core/widgets/member_avatar.dart';
+import 'auth_validation.dart';
+import 'forgot_password_screen.dart';
+import 'signup_screen.dart';
 
-/// Real login — member + password, checked by POST /api/auth/login,
-/// or Google: the account chooser runs on the device, then the user
-/// picks which member that Google account is, and the store logs
-/// them in via POST /api/auth/google (the backend verifies the ID
-/// token against Google first). The form state (_selectedId +
-/// _password) is the ONLY input to the password login call: the Log
-/// in button and the Demo popup both fill this form and run the same
-/// _submit. On a wrong password the backend returns 401, the store
-/// surfaces "Wrong password, try again", and the user stays on this
-/// page. On success the store holds the session token and Home opens.
+/// Login page — three ways in, one household:
+///
+/// 1. Member + password (default): checked by POST /api/auth/login.
+/// 2. Email + password (Firebase Auth, "Sign in with email instead"):
+///    verified users enter Home; unverified users go to the
+///    verification screen; new users sign up from here. Hidden when
+///    Firebase auth is not wired in.
+/// 3. Google: the account chooser runs on the device, Firebase signs
+///    in with the Google credential, then the user picks which member
+///    that Google account is, and the store logs them in via
+///    POST /api/auth/google (the backend verifies the ID token
+///    against Google first).
+///
+/// The Demo button opens a popup (names + IDs only, no passwords)
+/// and signs the demo user in through Firebase Auth (create on
+/// first use) plus the backend demo password. A Firebase user who
+/// is signed in but has no member linked yet picks a member from
+/// the card at the top of this page.
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
 
@@ -32,9 +44,21 @@ class _LoginScreenState extends State<LoginScreen> {
   bool _obscure = true;
   bool _googleBusy = false;
 
+  /// Email mode (Firebase Auth): email + password sign-in, with
+  /// links to sign-up and forgot-password. Off by default — member
+  /// login is the primary path — and hidden entirely when Firebase
+  /// auth is not wired in (Firebase init failed / tests).
+  bool _useEmail = false;
+  final _email = TextEditingController();
+  final _emailPassword = TextEditingController();
+  bool _obscureEmailPassword = true;
+  String? _emailFormError;
+
   @override
   void dispose() {
     _password.dispose();
+    _email.dispose();
+    _emailPassword.dispose();
     super.dispose();
   }
 
@@ -104,6 +128,114 @@ class _LoginScreenState extends State<LoginScreen> {
                     ),
                     const SizedBox(height: 16),
                   ],
+                  // A Firebase user signed in (verified) but with no
+                  // household member linked yet — e.g. they signed in
+                  // on this device before picking, or cancelled the
+                  // pick. They choose a member here instead of
+                  // signing in again.
+                  if (state.firebaseAuthEnabled &&
+                      state.firebaseSession != null &&
+                      state.firebaseStatus ==
+                          FirebaseAuthStatus.signedIn &&
+                      !state.isLoggedIn) ...[
+                    _FirebaseSessionCard(
+                      email: state.firebaseSession!.email,
+                      onPickMember: (memberId) =>
+                          state.completeFirebaseMemberPick(memberId),
+                      onSignOut: () => state.logout(),
+                    ),
+                    const SizedBox(height: 16),
+                  ],
+                  if (_useEmail) ...[
+                    TextField(
+                      controller: _email,
+                      keyboardType: TextInputType.emailAddress,
+                      textInputAction: TextInputAction.next,
+                      autocorrect: false,
+                      decoration: const InputDecoration(
+                        labelText: 'Email',
+                        prefixIcon: Icon(Icons.email_outlined),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: _emailPassword,
+                      obscureText: _obscureEmailPassword,
+                      enableSuggestions: false,
+                      autocorrect: false,
+                      textInputAction: TextInputAction.done,
+                      decoration: InputDecoration(
+                        labelText: 'Password',
+                        prefixIcon: const Icon(Icons.lock_outline),
+                        suffixIcon: IconButton(
+                          icon: Icon(
+                            _obscureEmailPassword
+                                ? Icons.visibility_outlined
+                                : Icons.visibility_off_outlined,
+                          ),
+                          tooltip: _obscureEmailPassword
+                              ? 'Show password'
+                              : 'Hide password',
+                          onPressed: () => setState(() =>
+                              _obscureEmailPassword =
+                                  !_obscureEmailPassword),
+                        ),
+                      ),
+                      onSubmitted: (_) => _submitEmail(state),
+                    ),
+                    if (_emailFormError != null) ...[
+                      const SizedBox(height: 12),
+                      ErrorBanner(
+                        message: _emailFormError!,
+                        onDismiss: () =>
+                            setState(() => _emailFormError = null),
+                      ),
+                    ],
+                    const SizedBox(height: 16),
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton.icon(
+                        onPressed: state.isBusy
+                            ? null
+                            : () => _submitEmail(state),
+                        icon: state.isBusy
+                            ? const SizedBox(
+                                width: 20,
+                                height: 20,
+                                child: CircularProgressIndicator(
+                                    strokeWidth: 2),
+                              )
+                            : const Icon(Icons.login),
+                        label: Text(
+                            state.isBusy ? 'Signing in…' : 'Sign in'),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    // Wrap, not Row: the two links overflow a narrow
+                    // phone (and the wide Ahem test font) side by
+                    // side, so they stack instead.
+                    Wrap(
+                      alignment: WrapAlignment.center,
+                      children: [
+                        TextButton(
+                          onPressed: () => Navigator.of(context).push(
+                            MaterialPageRoute<void>(
+                              builder: (_) => const SignUpScreen(),
+                            ),
+                          ),
+                          child: const Text('Create an account'),
+                        ),
+                        TextButton(
+                          onPressed: () => Navigator.of(context).push(
+                            MaterialPageRoute<void>(
+                              builder: (_) => const ForgotPasswordScreen(),
+                            ),
+                          ),
+                          child: const Text('Forgot password?'),
+                        ),
+                      ],
+                    ),
+                  ] else ...[
                   if (state.isLoading && state.members.isEmpty)
                     const Padding(
                       padding: EdgeInsets.all(32),
@@ -222,6 +354,20 @@ class _LoginScreenState extends State<LoginScreen> {
                           Text(state.isBusy ? 'Logging in…' : 'Log in'),
                     ),
                   ),
+                  ],
+                  if (state.firebaseAuthEnabled) ...[
+                    const SizedBox(height: 8),
+                    TextButton(
+                      onPressed: () => setState(() {
+                        _useEmail = !_useEmail;
+                        _emailFormError = null;
+                        state.clearError();
+                      }),
+                      child: Text(_useEmail
+                          ? 'Back to member sign-in'
+                          : 'Sign in with email instead'),
+                    ),
+                  ],
                   const SizedBox(height: 20),
                   // "Continue with Google" sits BELOW the member
                   // accounts (user request, 2026-11-05): a full-width
@@ -258,9 +404,9 @@ class _LoginScreenState extends State<LoginScreen> {
                   ),
                   const SizedBox(height: 20),
                   // ONE Demo button: it opens a popup with the three demo
-                  // accounts inside. Each account logs in through the
-                  // REAL POST /api/auth/login (bcrypt check) — not a
-                  // bypass around auth.
+                  // accounts inside. Each account signs in through
+                  // Firebase Auth (create on first use) plus the
+                  // backend demo password — not a bypass around auth.
                   SizedBox(
                     width: double.infinity,
                     child: OutlinedButton.icon(
@@ -300,13 +446,33 @@ class _LoginScreenState extends State<LoginScreen> {
     if (ok && mounted) _password.clear();
   }
 
+  /// Email sign-in via Firebase Auth. Validation errors are local;
+  /// Firebase errors arrive via AppState.errorMessage. On success
+  /// the AuthGate routes automatically (verification screen, member
+  /// pick, or Home) — there is nothing to navigate to here.
+  Future<void> _submitEmail(AppState state) async {
+    final error = validateEmail(_email.text) ??
+        validatePassword(_emailPassword.text);
+    if (error != null) {
+      setState(() => _emailFormError = error);
+      return;
+    }
+    setState(() => _emailFormError = null);
+    final ok = await state.signInWithFirebaseEmail(
+      email: _email.text.trim(),
+      password: _emailPassword.text,
+    );
+    if (ok && mounted) _emailPassword.clear();
+  }
+
   /// REAL Google sign-in: the account chooser / Gmail + password flow
-  /// runs on the device, Google returns an ID token, and this screen
-  /// asks which SplitNest member that Google account belongs to —
-  /// then the store logs that member in via POST /api/auth/google,
-  /// which verifies the token against Google before issuing a session.
-  /// A cancelled chooser or any failure stays on this page with a
-  /// clear message. There is no fake session anywhere in this flow.
+  /// runs on the device, Firebase signs in with the Google credential
+  /// (inside RealGoogleAuthService), then this screen asks which
+  /// SplitNest member that Google account belongs to — then the store
+  /// logs that member in via POST /api/auth/google, which verifies
+  /// the token against Google before issuing a session. A cancelled
+  /// chooser or any failure stays on this page with a clear message.
+  /// There is no fake session anywhere in this flow.
   Future<void> _signInWithGoogle(AppState state) async {
     if (_googleBusy || state.isBusy) return;
     setState(() => _googleBusy = true);
@@ -315,13 +481,21 @@ class _LoginScreenState extends State<LoginScreen> {
       if (!mounted) return;
       switch (result) {
         case GoogleSignedIn(:final idToken, :final email):
-          final memberId = await _pickGoogleMember(email);
+          // Pick up the Firebase user the Google service just signed
+          // in, then reuse a saved member link when one exists.
+          if (state.firebaseAuthEnabled) state.syncFirebaseSession();
+          final savedMemberId = await state.firebaseMemberId();
+          final memberId =
+              savedMemberId ?? await _pickGoogleMember(email);
           if (memberId == null || !mounted) return;
           final ok = await state.loginWithGoogle(
             idToken: idToken,
             memberId: memberId,
           );
-          if (ok && mounted) _password.clear();
+          if (ok) {
+            await state.saveFirebaseMember(memberId);
+            if (mounted) _password.clear();
+          }
         case GoogleSignInCancelled():
           state.showError('Google sign-in was cancelled.');
         case GoogleSignInFailed(:final message):
@@ -336,7 +510,9 @@ class _LoginScreenState extends State<LoginScreen> {
   /// this Google account is. Returns the member id, or null when the
   /// user backs out (then nothing is logged in).
   Future<String?> _pickGoogleMember(String googleEmail) {
-    final members = context.read<AppState>().members;
+    // memberOptions falls back to the three seeded household members
+    // when the backend list is empty (it needs a session to load).
+    final members = context.read<AppState>().memberOptions;
     return showDialog<String>(
       context: context,
       barrierDismissible: true,
@@ -383,12 +559,12 @@ class _LoginScreenState extends State<LoginScreen> {
     );
   }
 
-  /// Demo accounts popup: the three demo accounts live ONLY here.
-  /// Tapping one FILLS this login form (member + password) and runs
-  /// the SAME submit as the Log in button — the same
-  /// loginWithPassword -> POST /api/auth/login password check, the
-  /// same 401 handling, the same token storage. There is no second
-  /// login path: the demo button never logs in on its own.
+  /// Demo accounts popup: the three demo accounts live ONLY here
+  /// (names + IDs only — no passwords are shown). Tapping one signs
+  /// the demo user in through Firebase Auth (create on first use)
+  /// plus the backend demo password, via AppState.loginWithDemo.
+  /// Without Firebase wired in, the same tap is the old backend-only
+  /// demo login. There is no bypass around auth either way.
   Future<void> _showDemoAccounts(
       BuildContext context, AppState state) async {
     await showDialog<void>(
@@ -411,7 +587,7 @@ class _LoginScreenState extends State<LoginScreen> {
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 16),
-              ..._demoAccounts.map((d) => Padding(
+              ...demoAccounts.map((d) => Padding(
                     padding: const EdgeInsets.only(bottom: 8),
                     child: SizedBox(
                       width: double.infinity,
@@ -419,21 +595,15 @@ class _LoginScreenState extends State<LoginScreen> {
                         onPressed: state.isBusy
                             ? null
                             : () {
-                                // Fill the form, close the popup, then
-                                // submit exactly like the Log in button.
                                 Navigator.of(dialogCtx).pop();
-                                setState(() {
-                                  _selectedId = d.id;
-                                  _password.text = d.password;
-                                });
-                                _submit(state);
+                                state.loginWithDemo(memberId: d.memberId);
                               },
                         icon: MemberAvatar(
-                          memberId: d.id,
+                          memberId: d.memberId,
                           name: d.name,
                           radius: 13,
                         ),
-                        label: Text('${d.name} • ${d.id}'),
+                        label: Text('${d.name} • ${d.memberId}'),
                       ),
                     ),
                   )),
@@ -443,6 +613,63 @@ class _LoginScreenState extends State<LoginScreen> {
               ),
             ],
           ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Card shown when a Firebase user is signed in (verified) but has
+/// no household member linked yet: pick a member to enter the app,
+/// or sign out to use a different account.
+class _FirebaseSessionCard extends StatelessWidget {
+  const _FirebaseSessionCard({
+    required this.email,
+    required this.onPickMember,
+    required this.onSignOut,
+  });
+
+  final String? email;
+  final ValueChanged<String> onPickMember;
+  final VoidCallback onSignOut;
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              email == null
+                  ? 'Signed in — which roommate are you?'
+                  : 'Signed in as $email — which roommate are you?',
+              style: SplitNestTheme.sectionStyle,
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 12),
+            ...state.memberOptions.map((m) => Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: SizedBox(
+                    width: double.infinity,
+                    child: OutlinedButton.icon(
+                      onPressed: () => onPickMember(m.id),
+                      icon: MemberAvatar(
+                        memberId: m.id,
+                        name: m.name,
+                        radius: 13,
+                      ),
+                      label: Text('${m.name} • ${m.id}'),
+                    ),
+                  ),
+                )),
+            TextButton(
+              onPressed: onSignOut,
+              child: const Text('Not you? Sign out'),
+            ),
+          ],
         ),
       ),
     );
@@ -561,11 +788,3 @@ class _GoogleGPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
-
-/// Demo accounts (practice build only). The passwords are the backend's
-/// seeded demo passwords — see README.md. Change them before any real use.
-const _demoAccounts = [
-  (id: 'M01', name: 'Ali', password: 'ali123'),
-  (id: 'M02', name: 'Ayesha', password: 'ayesha123'),
-  (id: 'M03', name: 'Bilal', password: 'bilal123'),
-];

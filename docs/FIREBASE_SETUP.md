@@ -130,6 +130,59 @@ with it, so Google sign-in works in those builds.
 A **release** build needs its own signing key + SHA-1 — not
 registered, not needed in this phase (debug APKs only).
 
+## (g) Phase 2 (Auth) — Email/Password provider check (PENDING)
+
+Status as of Phase 2 (2026-11-07): the app now signs users in with
+real Firebase Auth (email/password, Google credential, demo
+create-or-sign-in), but this step was **not verifiable from the VM**
+(no console access, and no real account was created from here).
+
+**Check — do this in the console before testing email sign-up:**
+
+1. Console → project **SplitNest** (`splitnest-b8071`) →
+   **Build → Authentication → Sign-in method** tab.
+2. Look at the **Email/Password** row:
+   - If it shows **Enabled**, nothing to do — email sign-up,
+     sign-in, demo accounts and password reset all work.
+   - If it shows **Disabled**, click it, turn **Email/Password**
+     ON, and click **Save**. (Email link sign-in stays OFF — the
+     app uses password sign-in plus a verification email, not
+     email-link sign-in.)
+3. The **Google** row must stay **Enabled** (already confirmed in
+   Phase 1) — the app signs into Firebase with the Google
+   credential on every Google sign-in.
+
+**What happens if Email/Password is OFF:** every email/password
+call fails with Firebase code `operation-not-allowed`, and the app
+shows: "Email sign-in is not enabled for this project yet. Enable
+it in the Firebase console (Authentication → Sign-in method →
+Email/Password), then try again." Demo accounts fail the same way
+(they are Firebase email/password users). Member-password login
+and Google sign-in are unaffected by this switch — except the
+Firebase half of Google sign-in, which does not depend on the
+Email/Password provider.
+
+**Still pending from Phase 1:** the Firestore database does NOT
+exist yet (step (a) above) and the rules are NOT deployed (step
+(b)). Until then the app's `users/{uid}` profile write is skipped
+and logged — login never blocks on it, and the write is retried
+on the next sign-in.
+
+## (h) Phase 2 — known honest limit: email accounts cannot load household data yet
+
+The household data still lives on the Node backend, and the
+backend issues sessions **only** for member passwords
+(`POST /api/auth/login`) and verified Google ID tokens
+(`POST /api/auth/google`). An email-only Firebase sign-in
+therefore has Firebase identity but **no backend token**, so every
+data call answers 401. The app says so on screen instead of
+showing "Session expired": "Signed in as \<email\>. The household
+data still lives on the Node backend, which does not accept email
+sign-in yet — sign in with a member password or Google to load
+it." Demo and Google users are unaffected (they take a backend
+session as part of their login). Fixing this needs a backend
+change (accept a Firebase ID token) — a later phase, not Phase 2.
+
 ## After these steps
 
 - Firestore exists + rules published → the data model in

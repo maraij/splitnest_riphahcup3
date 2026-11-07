@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
@@ -5,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../data/api_client.dart';
+import '../data/firebase_auth_service.dart';
 import '../data/google_auth_service.dart';
 import '../data/repository.dart';
 import '../domain/insights.dart';
@@ -22,6 +24,7 @@ class AppState extends ChangeNotifier {
   AppState({
     SplitNestRepository? repository,
     GoogleAuthService? googleAuth,
+    this.firebaseAuth,
     bool? initialDarkMode,
   })  : _repository = repository ?? SplitNestRepository(),
         googleAuth = googleAuth ?? RealGoogleAuthService() {
@@ -31,6 +34,19 @@ class AppState extends ChangeNotifier {
     if (initialDarkMode == null) _loadThemeMode();
     _loadCaps();
     _loadProfileImages();
+    // Phase 2 (Auth): when a Firebase auth service is wired in
+    // (production, Firebase initialised), the AuthGate listens to
+    // FirebaseAuth.authStateChanges(). Without one (tests, or
+    // Firebase init failed) the app runs backend-only exactly as
+    // before — member + password login drives isLoggedIn.
+    final firebaseService = firebaseAuth;
+    if (firebaseService != null) {
+      firebaseSession = firebaseService.currentSession;
+      _updateFirebaseStatus();
+      _firebaseSub =
+          firebaseService.authStateChanges.listen(_onFirebaseSession);
+      _restoreFirebaseSession();
+    }
   }
 
   final SplitNestRepository _repository;
@@ -39,6 +55,99 @@ class AppState extends ChangeNotifier {
   /// tests). The login screen calls it; the store never talks to
   /// Google directly.
   final GoogleAuthService googleAuth;
+
+  /// Firebase Auth service (real in production when Firebase
+  /// initialised, fake in auth tests, null in the older widget
+  /// tests and when Firebase init failed). Null means the Firebase
+  /// auth flows are unavailable and the backend login is the only
+  /// way in — the login screen hides the email mode then.
+  final FirebaseAuthService? firebaseAuth;
+  StreamSubscription<FirebaseSession?>? _firebaseSub;
+
+  /// The current Firebase session, if any. Null when signed out or
+  /// when no Firebase auth service is wired in.
+  FirebaseSession? firebaseSession;
+
+  /// Gate state from the Firebase session (see [FirebaseAuthStatus]).
+  /// Meaningless when [firebaseAuth] is null — the backend login
+  /// decides then.
+  FirebaseAuthStatus firebaseStatus = FirebaseAuthStatus.signedOut;
+
+  bool get firebaseAuthEnabled => firebaseAuth != null;
+
+  /// True once a Google sign-in happened this session, so logout
+  /// knows to sign out of Google too. (Widget tests that only use
+  /// password login never touch the Google plugin this way.)
+  bool _usedGoogleSignIn = false;
+
+  @override
+  void dispose() {
+    _firebaseSub?.cancel();
+    super.dispose();
+  }
+
+  /// A Firebase session changed underneath us (sign-in, sign-out,
+  /// token refresh, verification). The gate state follows it; an
+  /// external sign-out also clears the app login, so Home is
+  /// unreachable without a Firebase session when Firebase auth is
+  /// enabled. Token refresh / expiry is the SDK's job — nothing here
+  /// handles tokens manually.
+  void _onFirebaseSession(FirebaseSession? session) {
+    firebaseSession = session;
+    _updateFirebaseStatus();
+    if (session == null && isLoggedIn) _clearLocalSession();
+    notifyListeners();
+  }
+
+  void _updateFirebaseStatus() {
+    final session = firebaseSession;
+    if (session == null) {
+      firebaseStatus = FirebaseAuthStatus.signedOut;
+    } else if (session.emailVerified || session.isDemo) {
+      firebaseStatus = FirebaseAuthStatus.signedIn;
+    } else {
+      firebaseStatus = FirebaseAuthStatus.needsVerification;
+    }
+  }
+
+  /// Restores a persisted Firebase session on launch: a verified (or
+  /// demo) user with a saved member link re-enters the app without
+  /// signing in again. Demo users also silently restore their
+  /// backend session (their demo password is known to the app);
+  /// Google/email users keep Firebase identity only — the backend
+  /// issues no token without a fresh Google ID token or member
+  /// password, so they re-authenticate for data (see
+  /// _applyFirebaseSession's notice).
+  Future<void> _restoreFirebaseSession() async {
+    final service = firebaseAuth;
+    final session = service?.currentSession;
+    if (service == null || session == null) return;
+    firebaseSession = session;
+    _updateFirebaseStatus();
+    if (firebaseStatus != FirebaseAuthStatus.signedIn) {
+      notifyListeners();
+      return;
+    }
+    final memberId = await service.memberIdFor(session.uid);
+    if (memberId == null) {
+      notifyListeners();
+      return;
+    }
+    final demo = demoForMember(memberId);
+    if (demo != null) {
+      try {
+        final result = await _repository.login(
+          memberId: memberId,
+          password: demo.password,
+        );
+        sessionToken = result.token;
+      } catch (_) {
+        // Backend down: Firebase identity stands, data stays
+        // unloaded until the backend is back.
+      }
+    }
+    await _applyFirebaseSession(session, memberId);
+  }
 
   // ---- Theme (light / dark) — one state, AppBar + drawer toggles ----
   static const _themeModeKey = 'theme_mode';
@@ -80,6 +189,20 @@ class AppState extends ChangeNotifier {
   String get apiBaseUrl => _repository.baseUrl;
 
   List<Member> members = [];
+
+  /// Members to offer in the sign-up / member-pick lists. Normally
+  /// the backend list; when it is empty (backend unreachable or not
+  /// logged in — the members endpoint itself needs a session) the
+  /// three seeded household members stand in, so sign-up and the
+  /// Firebase-session member pick still work.
+  List<Member> get memberOptions =>
+      members.isEmpty ? _fallbackHouseholdMembers : members;
+
+  static final _fallbackHouseholdMembers = [
+    Member(id: 'M01', name: 'Ali'),
+    Member(id: 'M02', name: 'Ayesha'),
+    Member(id: 'M03', name: 'Bilal'),
+  ];
   List<ShoppingItem> shopping = [];
   Balances? balances;
   List<ExpenseRecord> recentExpenses = [];
@@ -335,11 +458,14 @@ class AppState extends ChangeNotifier {
   /// password login — token stored, logged-in + active member set,
   /// welcome popup armed, data refreshed. A rejected token returns
   /// false with the verification error and stays logged out.
+  /// (The Firebase credential sign-in for this Google account
+  /// already happened inside RealGoogleAuthService.signIn().)
   Future<bool> loginWithGoogle({
     required String idToken,
     required String memberId,
   }) async {
     if (isBusy) return false;
+    _usedGoogleSignIn = true;
     isBusy = true;
     errorMessage = null;
     notifyListeners();
@@ -364,9 +490,307 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// Logout: clears the token (no endpoint call may succeed after
-  /// this), the logged-in member and the welcome state; returns to login.
-  void logout() {
+  // ---- Phase 2: Firebase Auth ----
+
+  /// The member id linked to the current Firebase session, if any.
+  /// Null when signed out or never linked (then the login screen
+  /// shows the member pick).
+  Future<String?> firebaseMemberId() async {
+    final service = firebaseAuth;
+    final session = firebaseSession;
+    if (service == null || session == null) return null;
+    return service.memberIdFor(session.uid);
+  }
+
+  /// Picks up the Firebase session after a Google sign-in (the
+  /// credential sign-in already happened in RealGoogleAuthService)
+  /// so the gate state is current before the member pick.
+  void syncFirebaseSession() {
+    final session = firebaseAuth?.currentSession;
+    if (session == null) return;
+    firebaseSession = session;
+    _updateFirebaseStatus();
+    notifyListeners();
+  }
+
+  /// Remembers which household member this Firebase user is, and
+  /// syncs the Firestore profile (best-effort, inside the service).
+  Future<void> saveFirebaseMember(String memberId) async {
+    final service = firebaseAuth;
+    final session = firebaseSession;
+    if (service == null || session == null) return;
+    await service.saveMemberId(session.uid, memberId);
+    await service.syncProfile(memberId: memberId);
+  }
+
+  /// Applies a signed-in Firebase session to the app: the member
+  /// becomes logged-in + active, the welcome popup is armed, and
+  /// data is refreshed. When there is no backend token (email-only
+  /// sign-in) the refresh 401s — the notice below replaces the
+  /// backend's misleading 'Session expired' text (see refresh()).
+  Future<void> _applyFirebaseSession(
+    FirebaseSession session,
+    String memberId,
+  ) async {
+    loggedInMemberId = memberId;
+    activeMemberId = memberId;
+    _welcomeShownForMemberId = null;
+    _welcomeDialogPending = false;
+    await firebaseAuth?.saveMemberId(session.uid, memberId);
+    await refresh();
+    notifyListeners();
+  }
+
+  /// Email/password sign-in via Firebase. Returns false with
+  /// [errorMessage] set on failure. On success the AuthGate state
+  /// decides what the user sees next: unverified → verification
+  /// screen; verified with a saved member link → Home; verified
+  /// without one → the login screen's member pick.
+  Future<bool> signInWithFirebaseEmail({
+    required String email,
+    required String password,
+  }) async {
+    final service = firebaseAuth;
+    if (service == null || isBusy) return false;
+    isBusy = true;
+    errorMessage = null;
+    notifyListeners();
+    try {
+      final result =
+          await service.signInWithEmail(email: email, password: password);
+      switch (result) {
+        case FirebaseAuthFailure(:final message):
+          errorMessage = message;
+          return false;
+        case FirebaseAuthSuccess(:final session):
+          final s = session;
+          if (s == null) {
+            errorMessage = 'Something went wrong. Please try again.';
+            return false;
+          }
+          firebaseSession = s;
+          _updateFirebaseStatus();
+          if (firebaseStatus == FirebaseAuthStatus.needsVerification) {
+            return true;
+          }
+          final memberId = await service.memberIdFor(s.uid);
+          if (memberId == null) return true;
+          await _applyFirebaseSession(s, memberId);
+          return true;
+      }
+    } finally {
+      isBusy = false;
+      notifyListeners();
+    }
+  }
+
+  /// Email/password sign-up via Firebase: creates the account, sends
+  /// the verification email, links the picked household member, and
+  /// routes the user to the verification screen (the gate blocks app
+  /// access until the email is verified). Returns false with
+  /// [errorMessage] set on failure.
+  Future<bool> signUpWithFirebaseEmail({
+    required String displayName,
+    required String email,
+    required String password,
+    required String memberId,
+  }) async {
+    final service = firebaseAuth;
+    if (service == null || isBusy) return false;
+    isBusy = true;
+    errorMessage = null;
+    notifyListeners();
+    try {
+      final result = await service.signUpWithEmail(
+        email: email,
+        password: password,
+        displayName: displayName,
+      );
+      switch (result) {
+        case FirebaseAuthFailure(:final message):
+          errorMessage = message;
+          return false;
+        case FirebaseAuthSuccess(:final session):
+          final s = session;
+          if (s == null) {
+            errorMessage = 'Something went wrong. Please try again.';
+            return false;
+          }
+          firebaseSession = s;
+          _updateFirebaseStatus();
+          await service.saveMemberId(s.uid, memberId);
+          await service.syncProfile(
+              displayName: displayName, memberId: memberId);
+          return true;
+      }
+    } finally {
+      isBusy = false;
+      notifyListeners();
+    }
+  }
+
+  /// Demo login via Firebase Auth: create-or-sign-in the demo user
+  /// (ali.demo@splitnest.app etc.), then take a backend session with
+  /// the same demo password so household data loads. Demo sessions
+  /// bypass the verification gate. Without a Firebase service wired
+  /// in (tests, Firebase init failed) this is exactly the old
+  /// backend-only demo login.
+  Future<bool> loginWithDemo({required String memberId}) async {
+    final demo = demoForMember(memberId);
+    if (demo == null) return false;
+    final service = firebaseAuth;
+    if (service == null) {
+      return loginWithPassword(memberId: memberId, password: demo.password);
+    }
+    if (isBusy) return false;
+    isBusy = true;
+    errorMessage = null;
+    notifyListeners();
+    try {
+      final result = await service.signInDemo(demo);
+      switch (result) {
+        case FirebaseAuthFailure(:final message):
+          errorMessage = message;
+          return false;
+        case FirebaseAuthSuccess(:final session):
+          final s = session;
+          if (s == null) {
+            errorMessage = 'Something went wrong. Please try again.';
+            return false;
+          }
+          firebaseSession = s;
+          _updateFirebaseStatus();
+          try {
+            final backend = await _repository.login(
+              memberId: memberId,
+              password: demo.password,
+            );
+            sessionToken = backend.token;
+          } on ApiException {
+            // Backend down or unreachable: the Firebase demo identity
+            // still signs the user in; data stays unloaded and the
+            // refresh below surfaces the backend error honestly.
+          }
+          await service.syncProfile(
+              displayName: demo.name, memberId: memberId);
+          await _applyFirebaseSession(s, memberId);
+          return true;
+      }
+    } finally {
+      isBusy = false;
+      notifyListeners();
+    }
+  }
+
+  /// Completes a Firebase sign-in that has no member link yet (the
+  /// login screen's member pick): links the member and enters Home.
+  Future<bool> completeFirebaseMemberPick(String memberId) async {
+    final session = firebaseSession;
+    final service = firebaseAuth;
+    if (service == null || session == null || isBusy) return false;
+    isBusy = true;
+    errorMessage = null;
+    notifyListeners();
+    try {
+      await service.saveMemberId(session.uid, memberId);
+      await service.syncProfile(memberId: memberId);
+      await _applyFirebaseSession(session, memberId);
+      return true;
+    } finally {
+      isBusy = false;
+      notifyListeners();
+    }
+  }
+
+  /// Re-checks whether the signed-in user's email is verified (after
+  /// they clicked the link). True when verified — the member link is
+  /// applied and Home opens. False keeps the user on the
+  /// verification screen.
+  Future<bool> refreshVerificationStatus() async {
+    final service = firebaseAuth;
+    if (service == null) return false;
+    final session = await service.reloadCurrentUser();
+    if (session == null) {
+      errorMessage = 'You are signed out. Please sign in again.';
+      notifyListeners();
+      return false;
+    }
+    firebaseSession = session;
+    _updateFirebaseStatus();
+    if (firebaseStatus != FirebaseAuthStatus.signedIn) {
+      notifyListeners();
+      return false;
+    }
+    final memberId = await service.memberIdFor(session.uid);
+    if (memberId == null) {
+      notifyListeners();
+      return true;
+    }
+    await _applyFirebaseSession(session, memberId);
+    return true;
+  }
+
+  /// Re-sends the verification email to the current user.
+  Future<bool> resendVerificationEmail() async {
+    final service = firebaseAuth;
+    if (service == null) return false;
+    final sent = await service.sendEmailVerification();
+    if (!sent) {
+      errorMessage =
+          'Could not send the verification email. Try again in a bit.';
+      notifyListeners();
+    }
+    return sent;
+  }
+
+  /// Sends the password-reset email. True means accepted for
+  /// sending (it does not reveal whether the address has an
+  /// account). False sets [errorMessage].
+  Future<bool> sendFirebasePasswordReset(String email) async {
+    final service = firebaseAuth;
+    if (service == null) return false;
+    final result = await service.sendPasswordReset(email: email);
+    switch (result) {
+      case FirebaseAuthFailure(:final message):
+        errorMessage = message;
+        notifyListeners();
+        return false;
+      case FirebaseAuthSuccess():
+        return true;
+    }
+  }
+
+  /// Logout: signs out of Firebase AND Google, clears the backend
+  /// token and all local session state, and returns to login. Each
+  /// provider sign-out is best-effort — a provider failure never
+  /// blocks the local logout. Callers need not await it.
+  Future<void> logout() async {
+    final firebaseService = firebaseAuth;
+    if (firebaseService != null && firebaseSession != null) {
+      try {
+        await firebaseService.signOut();
+      } catch (_) {
+        // Local logout continues regardless of a provider hiccup.
+      }
+    }
+    if (_usedGoogleSignIn) {
+      _usedGoogleSignIn = false;
+      try {
+        await googleAuth.signOut();
+      } catch (_) {
+        // Local logout continues regardless.
+      }
+    }
+    _clearLocalSession();
+    firebaseSession = null;
+    firebaseStatus = FirebaseAuthStatus.signedOut;
+    notifyListeners();
+  }
+
+  /// Clears the in-app session (backend token, logged-in member,
+  /// welcome/celebration state, activity log, error). Used by
+  /// [logout] and by the auth-state listener on external sign-out.
+  void _clearLocalSession() {
     _repository.clearToken();
     sessionToken = null;
     loggedInMemberId = null;
@@ -376,7 +800,6 @@ class AppState extends ChangeNotifier {
     _celebrationDialogPending = false;
     activityLog = [];
     errorMessage = null;
-    notifyListeners();
   }
 
   Member? get loggedInMember => members
@@ -417,6 +840,19 @@ class AppState extends ChangeNotifier {
       }
     } on ApiException catch (e) {
       errorMessage = e.message;
+      // Email-only Firebase sign-in: there is no backend token (the
+      // Node backend issues sessions only for member passwords and
+      // verified Google ID tokens), so every call 401s. Say so
+      // plainly instead of the backend's 'Session expired' text.
+      if (sessionToken == null &&
+          firebaseSession != null &&
+          firebaseStatus == FirebaseAuthStatus.signedIn) {
+        errorMessage =
+            'Signed in as ${firebaseSession?.email ?? 'your email'}. '
+            'The household data still lives on the Node backend, '
+            'which does not accept email sign-in yet — sign in with '
+            'a member password or Google to load it.';
+      }
     } finally {
       isLoading = false;
       notifyListeners();

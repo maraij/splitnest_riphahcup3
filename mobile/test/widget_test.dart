@@ -317,8 +317,13 @@ class FakeRepository extends SplitNestRepository {
 class FakeGoogleAuthService implements GoogleAuthService {
   FakeGoogleAuthService(this.result);
   final GoogleSignInResult result;
+  bool signOutCalled = false;
   @override
   Future<GoogleSignInResult> signIn() async => result;
+  @override
+  Future<void> signOut() async {
+    signOutCalled = true;
+  }
 }
 
 /// API that always fails, for the network-error test.

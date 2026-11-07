@@ -3,9 +3,11 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'data/firebase_auth_service.dart';
+import 'features/auth/login_screen.dart';
+import 'features/auth/verification_screen.dart';
 import 'features/expenses/expenses_screen.dart';
 import 'features/home/home_screen.dart';
-import 'features/auth/login_screen.dart';
 import 'features/monthly/monthly_view_screen.dart';
 import 'features/profile/profile_screen.dart';
 import 'features/settle/settle_screen.dart';
@@ -19,11 +21,15 @@ import 'core/widgets/entrance.dart';
 /// SplitNest — practice-only shared-living expense app.
 /// PRACTICE ONLY — NOT FOR SUBMISSION.
 /// Flow: Splash (logo, auto-advances after ~2.5s, no tap) →
-/// Member + password login (POST /api/auth/login, Bearer token) →
-/// Home as that member. Log out returns to the login page; Home is
-/// unreachable without logging in. Tabs: Home, Shopping, Expenses,
-/// Settle Up. Drawer: the same four tabs plus Monthly view, Timeline
-/// and Profile.
+/// AuthGate: Firebase auth state decides — signed-out → login,
+/// signed-in but email-unverified → verification screen,
+/// signed-in + verified (or demo) → Home as the linked member.
+/// Member + password login (POST /api/auth/login, Bearer token) and
+/// the Demo button still work; email sign-up/sign-in and Google
+/// sign-in go through Firebase Auth (Phase 2). Log out returns to
+/// the login page; Home is unreachable without logging in. Tabs:
+/// Home, Shopping, Expenses, Settle Up. Drawer: the same four tabs
+/// plus Monthly view, Timeline and Profile.
 /// Theme: light (Hisaab Kitaab teal) or dark (Coolors plum palette),
 /// one shared AppState flag; toggled from the AppBar or the drawer,
 /// persisted in SharedPreferences and applied before first paint.
@@ -34,6 +40,10 @@ import 'core/widgets/entrance.dart';
 /// no FirebaseOptions until a web app is registered), the app still
 /// launches and shows a clear, dismissible error banner instead of
 /// crashing. Nothing else reads Firebase in this phase.
+/// Phase 2 (Auth): when Firebase initialised, AppState gets a
+/// RealFirebaseAuthService and the AuthGate above is live. When it
+/// did not initialise, AppState runs backend-only (member login,
+/// demo, Google via the backend) exactly as in Phase 1.
 Future<({bool ready, String? error})> _initFirebase() async {
   try {
     // No options: Android/iOS read google-services.json /
@@ -58,8 +68,14 @@ void main() async {
   final firebase = await _initFirebase();
   runApp(
     ChangeNotifierProvider(
-      create: (_) =>
-          AppState(initialDarkMode: initialDark)..refresh(),
+      create: (_) => AppState(
+        initialDarkMode: initialDark,
+        // Only wire real Firebase Auth when initialisation
+        // succeeded; otherwise the app runs backend-only and the
+        // login screen hides the email mode.
+        firebaseAuth:
+            firebase.ready ? RealFirebaseAuthService() : null,
+      )..refresh(),
       child: SplitNestApp(
         firebaseReady: firebase.ready,
         firebaseError: firebase.error,
@@ -166,9 +182,16 @@ class _SplitNestAppState extends State<SplitNestApp> {
     return Consumer<AppState>(
       builder: (context, state, _) {
         // Smooth fade/slide between splash, login and home.
+        // AuthGate: a signed-in but unverified Firebase user sees
+        // the verification screen, never Home. A signed-in verified
+        // (or demo) user without a linked member yet still sees the
+        // login page, which shows the member pick for their session.
         final Widget child;
         if (_showSplash) {
           child = const SplashScreen(key: ValueKey('splash'));
+        } else if (state.firebaseAuthEnabled &&
+            state.firebaseStatus == FirebaseAuthStatus.needsVerification) {
+          child = const VerificationScreen(key: ValueKey('verify'));
         } else if (!state.isLoggedIn) {
           child = const LoginScreen(key: ValueKey('login'));
         } else {
