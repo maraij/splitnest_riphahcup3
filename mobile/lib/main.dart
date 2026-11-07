@@ -1,3 +1,4 @@
+import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -26,6 +27,25 @@ import 'core/widgets/entrance.dart';
 /// Theme: light (Hisaab Kitaab teal) or dark (Coolors plum palette),
 /// one shared AppState flag; toggled from the AppBar or the drawer,
 /// persisted in SharedPreferences and applied before first paint.
+/// Phase 1 (Foundation): Firebase is initialised here, but the app does
+/// NOT depend on it yet — every screen still talks to the Node backend
+/// exactly as before. If initialisation fails (no Firestore database
+/// yet, no network, no native config for this platform — e.g. web has
+/// no FirebaseOptions until a web app is registered), the app still
+/// launches and shows a clear, dismissible error banner instead of
+/// crashing. Nothing else reads Firebase in this phase.
+Future<({bool ready, String? error})> _initFirebase() async {
+  try {
+    // No options: Android/iOS read google-services.json /
+    // GoogleService-Info.plist. Web has no options yet, so this throws
+    // there until a web app is registered (see docs/FIREBASE_SETUP.md).
+    await Firebase.initializeApp();
+    return (ready: true, error: null);
+  } catch (e) {
+    return (ready: false, error: e.toString());
+  }
+}
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   var initialDark = false;
@@ -35,17 +55,33 @@ void main() async {
   } catch (_) {
     // Storage unavailable: start light; the toggle still works.
   }
+  final firebase = await _initFirebase();
   runApp(
     ChangeNotifierProvider(
       create: (_) =>
           AppState(initialDarkMode: initialDark)..refresh(),
-      child: const SplitNestApp(),
+      child: SplitNestApp(
+        firebaseReady: firebase.ready,
+        firebaseError: firebase.error,
+      ),
     ),
   );
 }
 
 class SplitNestApp extends StatefulWidget {
-  const SplitNestApp({super.key});
+  const SplitNestApp({
+    super.key,
+    this.firebaseReady = true,
+    this.firebaseError,
+  });
+
+  /// True when Firebase.initializeApp() succeeded. False means the app
+  /// is running on the Node backend only (see the banner in build).
+  final bool firebaseReady;
+
+  /// Human-readable init failure, null when [firebaseReady] is true.
+  final String? firebaseError;
+
   @override
   State<SplitNestApp> createState() => _SplitNestAppState();
 }
@@ -53,17 +89,72 @@ class SplitNestApp extends StatefulWidget {
 class _SplitNestAppState extends State<SplitNestApp> {
   int _index = 0;
   bool _showSplash = true;
+  late bool _firebaseReady;
+  late String? _firebaseError;
+  bool _bannerDismissed = false;
 
   static const titles = ['SplitNest', 'Shopping', 'Expenses', 'Settle Up'];
 
   @override
   void initState() {
     super.initState();
+    _firebaseReady = widget.firebaseReady;
+    _firebaseError = widget.firebaseError;
     // Splash auto-advances on its own after ~2.5s. There is no tap
     // handler and no "tap to continue" — it never waits for a tap.
     Future.delayed(const Duration(milliseconds: 2500), () {
       if (mounted) setState(() => _showSplash = false);
     });
+  }
+
+  /// Re-attempt Firebase init from the error banner (e.g. after the
+  /// Firestore database is created or the network comes back).
+  Future<void> _retryFirebase() async {
+    final result = await _initFirebase();
+    if (mounted) {
+      setState(() {
+        _firebaseReady = result.ready;
+        _firebaseError = result.error;
+        _bannerDismissed = false;
+      });
+    }
+  }
+
+  /// Shown only when Firebase init failed. The app keeps working on
+  /// the Node backend; cloud features (Firestore/Auth/FCM) are simply
+  /// unavailable until init succeeds.
+  Widget _firebaseErrorBanner() {
+    return Material(
+      color: Colors.amber.shade100,
+      child: SafeArea(
+        bottom: false,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Row(
+            children: [
+              const Icon(Icons.cloud_off, size: 20),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Cloud services unavailable — running on the local '
+                  'backend only. (${_firebaseError ?? 'Firebase init failed'})',
+                  style: const TextStyle(fontSize: 12),
+                ),
+              ),
+              TextButton(
+                onPressed: _retryFirebase,
+                child: const Text('Retry'),
+              ),
+              IconButton(
+                icon: const Icon(Icons.close, size: 18),
+                tooltip: 'Dismiss',
+                onPressed: () => setState(() => _bannerDismissed = true),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   @override
@@ -92,11 +183,24 @@ class _SplitNestAppState extends State<SplitNestApp> {
           theme: SplitNestTheme.light(),
           darkTheme: SplitNestTheme.dark(),
           themeMode: state.themeMode,
-          home: AnimatedSwitcher(
-            duration: const Duration(milliseconds: 300),
-            transitionBuilder: fadeSlideTransition,
-            child: child,
-          ),
+          home: _firebaseReady || _bannerDismissed
+              ? AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 300),
+                  transitionBuilder: fadeSlideTransition,
+                  child: child,
+                )
+              : Column(
+                  children: [
+                    _firebaseErrorBanner(),
+                    Expanded(
+                      child: AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 300),
+                        transitionBuilder: fadeSlideTransition,
+                        child: child,
+                      ),
+                    ),
+                  ],
+                ),
         );
       },
     );

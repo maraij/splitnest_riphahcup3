@@ -1,0 +1,208 @@
+rules_version = '2';
+
+// SplitNest — Firestore security rules (PRACTICE app).
+// Data model: docs/FIRESTORE_STRUCTURE.md
+// NOT YET DEPLOYED — the Firestore database does not exist yet.
+// Deploy via the console Rules tab or `firebase deploy --only firestore:rules`
+// (see docs/FIREBASE_SETUP.md). These rules are syntactically valid but
+// have not been tested against a live database.
+//
+// Design:
+// - Authenticated-only: every rule requires request.auth != null.
+// - Membership is a `members` map on the group doc ({uid: {role,
+//   joinedAt}}). Rules read it with one get(); the `members`
+//   subcollection is only a queryable mirror.
+// - Roles: owner > admin > member. Only owner/admin can invite,
+//   revoke invites, verify payments, or delete expenses. Members can
+//   record their own payments but NOT mark them verified.
+// - Notifications and activity are Functions-written (Admin SDK
+//   bypasses rules); clients can only read their own notifications
+//   and flip the `read` flag.
+// - The integer-paisa sum invariant (sum(splits) == amountPaisa)
+//   CANNOT be enforced in the rules language (no map-value summation),
+//   so rules enforce types + membership and the invariant is enforced
+//   by client code and a Cloud Function validator (see functions/).
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function groupData(groupId) {
+      return get(/databases/(default)/documents/groups/$(groupId)).data;
+    }
+
+    function isGroupMember(groupId) {
+      return isSignedIn()
+        && groupData(groupId).members[request.auth.uid] != null;
+    }
+
+    function memberRole(groupId) {
+      return groupData(groupId).members[request.auth.uid].role;
+    }
+
+    function isGroupAdmin(groupId) {
+      return isGroupMember(groupId)
+        && (memberRole(groupId) == 'admin'
+            || memberRole(groupId) == 'owner');
+    }
+
+    function isGroupOwner(groupId) {
+      return isGroupMember(groupId) && memberRole(groupId) == 'owner';
+    }
+
+    // ---------- users ----------
+
+    match /users/{userId} {
+      // A user can read and write only their own profile doc.
+      allow read: if isSignedIn() && request.auth.uid == userId;
+      allow create, update: if isSignedIn()
+        && request.auth.uid == userId;
+      allow delete: if false; // profiles are never deleted by clients
+    }
+
+    // ---------- notifications (per-user inbox) ----------
+
+    match /users/{userId}/notifications/{notificationId} {
+      // Only the owning user can read their inbox.
+      allow read: if isSignedIn() && request.auth.uid == userId;
+      // Written by Cloud Functions only (Admin SDK bypasses rules).
+      allow create, delete: if false;
+      // The user may only flip the `read` flag, nothing else.
+      allow update: if isSignedIn() && request.auth.uid == userId
+        && request.resource.data.diff(resource.data)
+             .affectedKeys().hasOnly(['read']);
+    }
+
+    // ---------- groups ----------
+
+    match /groups/{groupId} {
+      allow read: if isGroupMember(groupId);
+
+      // Creating a group: the creator must list themselves as owner
+      // in the members map and as createdBy.
+      allow create: if isSignedIn()
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.members[request.auth.uid].role == 'owner';
+
+      // Admins may change the name / monthly budget only; the members
+      // map is client-read-only (Functions maintain it on join/leave).
+      allow update: if isGroupAdmin(groupId)
+        && request.resource.data.members == resource.data.members
+        && request.resource.data.diff(resource.data)
+             .affectedKeys().hasOnly(['name', 'budgetPaisa']);
+
+      allow delete: if isGroupOwner(groupId);
+    }
+
+    // ---------- group members (queryable mirror) ----------
+
+    match /groups/{groupId}/members/{memberId} {
+      allow read: if isGroupMember(groupId);
+      // Role changes / removals are owner/admin only. Join docs are
+      // normally created by the invite-accept Function (Admin SDK).
+      allow create, update, delete: if isGroupAdmin(groupId);
+    }
+
+    // ---------- expenses ----------
+
+    match /groups/{groupId}/expenses/{expenseId} {
+      allow read: if isGroupMember(groupId);
+
+      // Any member may record an expense. Rules enforce: positive
+      // integer paisa, payer is a group member, the recorder is the
+      // creator. The splits-sum invariant (sum == amountPaisa) is
+      // enforced by client code + a Function validator, not here.
+      allow create: if isGroupMember(groupId)
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.amountPaisa is int
+        && request.resource.data.amountPaisa > 0
+        && request.resource.data.paidBy is string
+        && groupData(groupId)
+             .members[request.resource.data.paidBy] != null
+        && request.resource.data.splits is map;
+
+      // Only owner/admin may edit or delete an expense.
+      allow update, delete: if isGroupAdmin(groupId);
+    }
+
+    // ---------- payments (settlements) ----------
+
+    match /groups/{groupId}/payments/{paymentId} {
+      allow read: if isGroupMember(groupId);
+
+      // Any member may record their OWN payment, only as `recorded`,
+      // to another group member, for a positive integer paisa amount.
+      allow create: if isGroupMember(groupId)
+        && request.resource.data.fromUid == request.auth.uid
+        && request.resource.data.recordedBy == request.auth.uid
+        && request.resource.data.toUid != request.auth.uid
+        && groupData(groupId)
+             .members[request.resource.data.toUid] != null
+        && request.resource.data.amountPaisa is int
+        && request.resource.data.amountPaisa > 0
+        && request.resource.data.status == 'recorded';
+
+      // Verification is owner/admin only: the ONLY allowed change is
+      // recorded -> verified, stamping who verified it and when.
+      // Members can never mark a payment verified, and a verified
+      // payment can never be un-verified by a client.
+      allow update: if isGroupAdmin(groupId)
+        && resource.data.status == 'recorded'
+        && request.resource.data.status == 'verified'
+        && request.resource.data.verifiedBy == request.auth.uid
+        && request.resource.data.diff(resource.data)
+             .affectedKeys().hasOnly(
+               ['status', 'verifiedBy', 'verifiedAt']);
+
+      allow delete: if isGroupAdmin(groupId);
+    }
+
+    // ---------- invitations (top-level) ----------
+
+    match /invitations/{invitationId} {
+      // Readable by the invitee (matched on Auth email), the inviter,
+      // and the group's owner/admins — the invitee is not a member yet,
+      // so group membership cannot be the check.
+      allow read: if isSignedIn() && (
+        request.auth.token.email == resource.data.invitedEmail
+        || request.auth.uid == resource.data.invitedBy
+        || isGroupAdmin(resource.data.groupId)
+      );
+
+      // Only a group owner/admin can send an invite, and only as
+      // `pending`, naming themselves as the inviter.
+      allow create: if isSignedIn()
+        && isGroupAdmin(request.resource.data.groupId)
+        && request.resource.data.invitedBy == request.auth.uid
+        && request.resource.data.status == 'pending';
+
+      // Owner/admin may revoke; the invitee may accept. Nothing else.
+      allow update: if isSignedIn() && (
+        (isGroupAdmin(resource.data.groupId)
+          && resource.data.status == 'pending'
+          && request.resource.data.status == 'revoked'
+          && request.resource.data.diff(resource.data)
+               .affectedKeys().hasOnly(['status']))
+        || (request.auth.token.email == resource.data.invitedEmail
+          && resource.data.status == 'pending'
+          && request.resource.data.status == 'accepted'
+          && request.resource.data.diff(resource.data)
+               .affectedKeys().hasOnly(['status']))
+      );
+
+      allow delete: if false; // invites are revoked, never deleted
+    }
+
+    // ---------- activity (audit log) ----------
+
+    match /groups/{groupId}/activity/{activityId} {
+      // Read-only for members; written by Cloud Functions only.
+      allow read: if isGroupMember(groupId);
+      allow create, update, delete: if false;
+    }
+  }
+}

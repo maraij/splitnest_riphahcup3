@@ -85,6 +85,43 @@ App root: splash → login → logged-in shell. The shell holds the
 4-tab `NavigationBar` and the `Drawer` (same 4 tabs + Monthly view,
 Timeline, Profile, Log out). Drawer tabs set the tab index; Monthly
 view / Timeline / Profile are pushed routes with a back button.
+Phase 1: `Firebase.initializeApp()` runs in `main()` before `runApp`;
+if it fails (no Firestore DB yet, no network, no native config on
+web) the app still launches on the Node backend and shows a
+dismissible amber banner with Retry — it never crashes. No screen
+reads Firebase yet; all data still comes from the Node backend.
+
+## Firebase — repo root + `docs/` + `functions/` (Phase 1, Foundation)
+
+- `firestore.rules` — production rules (NOT DEPLOYED; DB does not
+  exist yet): authenticated-only, group membership via the `members`
+  map, owner/admin-only invite / verify / delete, members record
+  their own payments but cannot verify them, notifications +
+  activity are Functions-only.
+- `storage.rules` — receipts readable only by group members, profile
+  photos owner-written (NOT DEPLOYED; Storage not enabled yet).
+- `firebase.json` — points CLI deploys at the rules, indexes and
+  `functions/`. `firestore.indexes.json` — the 10 composite indexes
+  from `docs/FIRESTORE_STRUCTURE.md`.
+- `docs/FIRESTORE_STRUCTURE.md` — the Firestore data model
+  (`users`, `groups` + `members` map/subcollection, `expenses`,
+  `payments`, `invitations`, `notifications`, `activity`); integer
+  paisa everywhere, Net = Paid − Share + Sent − Received.
+- `docs/FIREBASE_SETUP.md` — exact pending console steps: create
+  the Firestore DB (asia-south1, production mode), publish the
+  rules, enable Storage, FCM notes, google-services.json + SHA-1
+  already in place.
+- `functions/` — Cloud Functions skeleton, NOT DEPLOYED
+  (`index.js` + `package.json` + README with exact deploy steps):
+  onCreate/onUpdate triggers for invitations, expenses, payments
+  (notification + activity log) and a scheduled monthly-summary
+  stub — the scheduled function needs the Blaze plan; triggers work
+  on Spark.
+- `mobile/pubspec.yaml` (Phase 1 deps): `firebase_core`,
+  `firebase_auth`, `cloud_firestore`, `firebase_storage`,
+  `firebase_messaging`, `fl_chart`, `pdf`, `csv`, `share_plus`,
+  `url_launcher`, `google_mlkit_text_recognition` (OCR; resolves
+  cleanly, unused until a later phase).
 
 ## Backend — `backend/`
 

@@ -7,6 +7,33 @@ Ali (M01), Ayesha (M02) and Bilal (M03). Shopping list, multi-item checkout
 that posts exactly one shared expense, manual expenses with equal/custom
 splits, exact paisa accounting, settlements, and a monthly budget.
 
+## Production rebuild — status (2026-11-07)
+
+A full production rebuild is underway (Firebase backend, real auth,
+invitations, redesign, light/dark themes). Work lands incrementally;
+this section tracks what is done so far.
+
+**Phase 1 — Firebase foundation (done, 2026-11-07):** Firebase packages
+added (`firebase_core`, `firebase_auth`, `cloud_firestore`,
+`firebase_storage`, `firebase_messaging`, `fl_chart`, `pdf`, `csv`,
+`share_plus`, `url_launcher`, `google_mlkit_text_recognition`);
+`Firebase.initializeApp()` wired with a graceful fallback banner if cloud
+init fails; Firestore data model documented in
+[docs/FIRESTORE_STRUCTURE.md](docs/FIRESTORE_STRUCTURE.md); production
+security rules in `firestore.rules` / `storage.rules`; Cloud Functions
+skeleton in `functions/` (not deployed); setup steps in
+[docs/FIREBASE_SETUP.md](docs/FIREBASE_SETUP.md). Gates green:
+`flutter analyze` no issues, `flutter test` 65/65, `flutter build web`
+succeeds. The app still runs on the Node backend in this phase; no
+screen behaviour changed.
+
+**Still pending (needs a console step, not code):** create the Firestore
+database (production mode, `asia-south1`), deploy `firestore.rules` /
+`storage.rules`, enable Storage. See
+[docs/FIREBASE_SETUP.md](docs/FIREBASE_SETUP.md) for exact steps.
+Cloud Functions are written but **not deployed** (scheduled function
+needs the Blaze plan).
+
 ## Stack
 
 - **Backend:** Node.js 24 + Express 4, SQLite file-based via Node's built-in
@@ -182,12 +209,14 @@ processes while it runs.
 
 ## Known limitations
 
-- **No APK.** Not attempted: the Gradle daemon is broken on this VM
-  (broken-pipe, daemon dies within seconds; verified in the separate
-  mad_riphahcup build attempts). Use the web build, or build the APK on a
-  machine with a working Android toolchain / via GitHub Actions.
-- **No auth.** The member selector changes perspective; it is not identity.
-  Anyone with the API URL can call the endpoints. Local practice use only.
+- **APK:** debug APKs are built by GitHub Actions
+  (`.github/workflows/android-apk.yml`) — local Gradle builds fail on
+  this VM. The Nov 5 phone-variant APK (real Google Sign-In) was
+  delivered; see the rebuild status above for the current state.
+- **Auth:** real Google Sign-In via Firebase Auth plus email/password
+  login with 3 demo accounts were added Nov 5 (see `mobile/lib/data/
+  google_auth_service.dart`). The old "no password" member selector is
+  gone; the Nov 7 rebuild moves all auth to Firebase Auth.
 - **Surprise features not implemented.** Annexure A lists four options, but
   none was released, so none was built (no `/api/balances/simplify`,
   no tax/discount, no category warnings, no recurring expenses).
@@ -196,4 +225,5 @@ processes while it runs.
   current session; balances and budget always come live from the backend.
 - **Month scope:** budget totals count the current month's expenses;
   balances are computed over all recorded expenses and settlements.
-- Not pushed to GitHub, by design for this practice build.
+- Pushed to GitHub: https://github.com/maraij/splitnest_riphahcup3
+  (main). The Nov 7 rebuild lands there incrementally, phase by phase.

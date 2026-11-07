@@ -1,0 +1,61 @@
+rules_version = '2';
+
+// SplitNest — Firebase Storage security rules (PRACTICE app).
+// NOT YET DEPLOYED — Storage is not enabled yet.
+// Deploy via the console Rules tab or `firebase deploy --only storage`
+// (see docs/FIREBASE_SETUP.md).
+//
+// - Receipt images live under receipts/{groupId}/{expenseId}/ and are
+//   readable only by members of that group (checked against the
+//   Firestore group doc's `members` map).
+// - Profile photos live under profile-photos/{uid}/ and are writable
+//   only by that user; readable by any signed-in user (they are shown
+//   as avatars inside groups).
+// - Uploads are images only, size-capped (receipts 10 MB, photos 5 MB).
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isGroupMember(groupId) {
+      return isSignedIn()
+        && firestore
+          .get(/databases/(default)/documents/groups/$(groupId))
+          .data.members[request.auth.uid] != null;
+    }
+
+    function isGroupAdmin(groupId) {
+      return isGroupMember(groupId)
+        && (firestore
+          .get(/databases/(default)/documents/groups/$(groupId))
+          .data.members[request.auth.uid].role == 'admin'
+          || firestore
+          .get(/databases/(default)/documents/groups/$(groupId))
+          .data.members[request.auth.uid].role == 'owner');
+    }
+
+    function isImage() {
+      return request.resource.contentType.matches('image/.*');
+    }
+
+    // Expense receipts — group members only.
+    match /receipts/{groupId}/{expenseId}/{fileName} {
+      allow read: if isGroupMember(groupId);
+      allow write: if isGroupMember(groupId)
+        && isImage()
+        && request.resource.size < 10 * 1024 * 1024;
+      allow delete: if isGroupAdmin(groupId);
+    }
+
+    // Profile photos — owner writes, any signed-in user reads.
+    match /profile-photos/{userId}/{fileName} {
+      allow read: if isSignedIn();
+      allow write: if isSignedIn() && request.auth.uid == userId
+        && isImage()
+        && request.resource.size < 5 * 1024 * 1024;
+      allow delete: if isSignedIn() && request.auth.uid == userId;
+    }
+  }
+}
