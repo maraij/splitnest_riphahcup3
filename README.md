@@ -1,11 +1,6 @@
 # SplitNest 
 
-> **This app must never be submitted as an RC³ competition** It was built as a separate practice project at the user's explicit
-> confirmation ("Practice only, not for submission — build it separately",
-> 2026-11-05). It lives only in `~/workspace/splitnest-practice/`, touches
-> no other repo, and is not pushed to GitHub. The official RC³ task bans
-> AI-assisted coding for the actual submission; this practice build is not
-> that submission and must not be presented as one.
+> **This app must never be submitted as an RC³ competition**
 
 SplitNest is a shared-living expense tracker for three roommates in Lahore:
 Ali (M01), Ayesha (M02) and Bilal (M03). Shopping list, multi-item checkout
