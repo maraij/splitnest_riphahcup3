@@ -13,24 +13,25 @@ import 'auth_validation.dart';
 import 'forgot_password_screen.dart';
 import 'signup_screen.dart';
 
-/// Login page — three ways in, one household:
+/// Login page — three ways in, one household (all Firebase Auth;
+/// there is no member-password login and no backend session any
+/// more — Phase 3 retired the Node backend):
 ///
-/// 1. Member + password (default): checked by POST /api/auth/login.
-/// 2. Email + password (Firebase Auth, "Sign in with email instead"):
+/// 1. Email + password (Firebase Auth, "Sign in with email instead"):
 ///    verified users enter Home; unverified users go to the
 ///    verification screen; new users sign up from here. Hidden when
 ///    Firebase auth is not wired in.
-/// 3. Google: the account chooser runs on the device, Firebase signs
+/// 2. Google: the account chooser runs on the device, Firebase signs
 ///    in with the Google credential, then the user picks which member
-///    that Google account is, and the store logs them in via
-///    POST /api/auth/google (the backend verifies the ID token
-///    against Google first).
+///    that Google account is, and the store links the member and
+///    loads the Firestore household.
+/// 3. Demo: the Demo button opens a popup (names + IDs only, no
+///    passwords) and signs the demo user in through Firebase Auth
+///    (create on first use) — or a local demo identity when Firebase
+///    is not wired in (tests / init failed).
 ///
-/// The Demo button opens a popup (names + IDs only, no passwords)
-/// and signs the demo user in through Firebase Auth (create on
-/// first use) plus the backend demo password. A Firebase user who
-/// is signed in but has no member linked yet picks a member from
-/// the card at the top of this page.
+/// A Firebase user who is signed in but has no member linked yet
+/// picks a member from the card at the top of this page.
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
 
@@ -39,15 +40,12 @@ class LoginScreen extends StatefulWidget {
 }
 
 class _LoginScreenState extends State<LoginScreen> {
-  String? _selectedId;
-  final _password = TextEditingController();
-  bool _obscure = true;
   bool _googleBusy = false;
 
   /// Email mode (Firebase Auth): email + password sign-in, with
-  /// links to sign-up and forgot-password. Off by default — member
-  /// login is the primary path — and hidden entirely when Firebase
-  /// auth is not wired in (Firebase init failed / tests).
+  /// links to sign-up and forgot-password. Off by default, and hidden
+  /// entirely when Firebase auth is not wired in (Firebase init
+  /// failed / tests).
   bool _useEmail = false;
   final _email = TextEditingController();
   final _emailPassword = TextEditingController();
@@ -56,7 +54,6 @@ class _LoginScreenState extends State<LoginScreen> {
 
   @override
   void dispose() {
-    _password.dispose();
     _email.dispose();
     _emailPassword.dispose();
     super.dispose();
@@ -65,9 +62,6 @@ class _LoginScreenState extends State<LoginScreen> {
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
-    final canSubmit = _selectedId != null &&
-        _password.text.isNotEmpty &&
-        !state.isBusy;
     return Scaffold(
       body: SafeArea(
         child: Center(
@@ -113,10 +107,16 @@ class _LoginScreenState extends State<LoginScreen> {
                   ),
                   const SizedBox(height: 12),
                   Text(
-                    'Welcome to SplitNest',
+                    'Log in',
                     style: SplitNestTheme.titleStyle.copyWith(
                       color: Theme.of(context).colorScheme.onSurface,
                     ),
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Welcome to SplitNest',
+                    style: SplitNestTheme.supportingStyle,
                     textAlign: TextAlign.center,
                   ),
                   const SizedBox(height: 24),
@@ -236,124 +236,17 @@ class _LoginScreenState extends State<LoginScreen> {
                       ],
                     ),
                   ] else ...[
-                  if (state.isLoading && state.members.isEmpty)
-                    const Padding(
-                      padding: EdgeInsets.all(32),
-                      child: Center(child: CircularProgressIndicator()),
-                    )
-                  else if (state.members.isEmpty)
-                    const Card(
-                      child: Padding(
-                        padding: EdgeInsets.all(24),
-                        child: Text(
-                          'Could not load members.',
-                          style: SplitNestTheme.supportingStyle,
-                          textAlign: TextAlign.center,
-                        ),
+                    // No member-password form any more (Phase 3
+                    // retired the backend login): sign in with email,
+                    // Google, or Demo below.
+                    if (!state.firebaseAuthEnabled)
+                      const Text(
+                        'Sign in with Google or try the Demo account '
+                        'below. Email sign-in needs Firebase, which is '
+                        'not available right now.',
+                        style: SplitNestTheme.supportingStyle,
+                        textAlign: TextAlign.center,
                       ),
-                    )
-                  else
-                    ...state.members.map((m) {
-                      final selected = _selectedId == m.id;
-                      return Padding(
-                        padding: const EdgeInsets.only(bottom: 12),
-                        child: Card(
-                          color: selected
-                              ? Theme.of(context)
-                                  .colorScheme
-                                  .primary
-                                  .withValues(alpha: 0.08)
-                              : null,
-                          shape: selected
-                              ? RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(
-                                      SplitNestTheme.cardRadius),
-                                  side: BorderSide(
-                                    color:
-                                        Theme.of(context).colorScheme.primary,
-                                    width: 2,
-                                  ),
-                                )
-                              : null,
-                          child: ListTile(
-                            contentPadding: const EdgeInsets.symmetric(
-                                horizontal: 16, vertical: 4),
-                            leading: MemberAvatar(
-                              memberId: m.id,
-                              name: m.name,
-                              radius: 24,
-                            ),
-                            title: Text(
-                              m.name,
-                              style: SplitNestTheme.sectionStyle,
-                            ),
-                            subtitle: Text(
-                              '${m.id} · Roommate',
-                              style: SplitNestTheme.supportingStyle,
-                            ),
-                            trailing: Icon(
-                              selected
-                                  ? Icons.check_circle
-                                  : Icons.radio_button_unchecked,
-                              color: selected
-                                  ? Theme.of(context).colorScheme.primary
-                                  : Theme.of(context)
-                                      .colorScheme
-                                      .onSurfaceVariant,
-                            ),
-                            onTap: () {
-                              setState(() {
-                                _selectedId = m.id;
-                                state.clearError();
-                              });
-                            },
-                          ),
-                        ),
-                      );
-                    }),
-                  const SizedBox(height: 4),
-                  TextField(
-                    controller: _password,
-                    obscureText: _obscure,
-                    enableSuggestions: false,
-                    autocorrect: false,
-                    textInputAction: TextInputAction.done,
-                    decoration: InputDecoration(
-                      labelText: 'Password',
-                      prefixIcon: const Icon(Icons.lock_outline),
-                      suffixIcon: IconButton(
-                        icon: Icon(
-                          _obscure
-                              ? Icons.visibility_outlined
-                              : Icons.visibility_off_outlined,
-                        ),
-                        tooltip:
-                            _obscure ? 'Show password' : 'Hide password',
-                        onPressed: () =>
-                            setState(() => _obscure = !_obscure),
-                      ),
-                    ),
-                    onChanged: (_) => setState(() {}),
-                    onSubmitted: (_) {
-                      if (canSubmit) _submit(state);
-                    },
-                  ),
-                  const SizedBox(height: 16),
-                  SizedBox(
-                    width: double.infinity,
-                    child: ElevatedButton.icon(
-                      onPressed: canSubmit ? () => _submit(state) : null,
-                      icon: state.isBusy
-                          ? const SizedBox(
-                              width: 20,
-                              height: 20,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.login),
-                      label:
-                          Text(state.isBusy ? 'Logging in…' : 'Log in'),
-                    ),
-                  ),
                   ],
                   if (state.firebaseAuthEnabled) ...[
                     const SizedBox(height: 8),
@@ -369,15 +262,15 @@ class _LoginScreenState extends State<LoginScreen> {
                     ),
                   ],
                   const SizedBox(height: 20),
-                  // "Continue with Google" sits BELOW the member
-                  // accounts (user request, 2026-11-05): a full-width
+                  // "Continue with Google" sits BELOW the sign-in
+                  // options (user request, 2026-11-05): a full-width
                   // dark pill, like the reference screenshot — black
                   // background, thin light border, fully rounded ends,
                   // Google "G" logo, white text. It runs the REAL
                   // Google sign-in (account chooser / Gmail + password
                   // on the device), then asks which member this Google
-                  // account is, then logs that member in via
-                  // POST /api/auth/google.
+                  // account is, then links that member and loads the
+                  // Firestore household.
                   Row(
                     children: [
                       const Expanded(child: Divider()),
@@ -405,8 +298,8 @@ class _LoginScreenState extends State<LoginScreen> {
                   const SizedBox(height: 20),
                   // ONE Demo button: it opens a popup with the three demo
                   // accounts inside. Each account signs in through
-                  // Firebase Auth (create on first use) plus the
-                  // backend demo password — not a bypass around auth.
+                  // Firebase Auth (create on first use) — not a bypass
+                  // around auth.
                   SizedBox(
                     width: double.infinity,
                     child: OutlinedButton.icon(
@@ -436,16 +329,6 @@ class _LoginScreenState extends State<LoginScreen> {
     );
   }
 
-  Future<void> _submit(AppState state) async {
-    final id = _selectedId;
-    if (id == null) return;
-    final ok = await state.loginWithPassword(
-      memberId: id,
-      password: _password.text,
-    );
-    if (ok && mounted) _password.clear();
-  }
-
   /// Email sign-in via Firebase Auth. Validation errors are local;
   /// Firebase errors arrive via AppState.errorMessage. On success
   /// the AuthGate routes automatically (verification screen, member
@@ -469,8 +352,7 @@ class _LoginScreenState extends State<LoginScreen> {
   /// runs on the device, Firebase signs in with the Google credential
   /// (inside RealGoogleAuthService), then this screen asks which
   /// SplitNest member that Google account belongs to — then the store
-  /// logs that member in via POST /api/auth/google, which verifies
-  /// the token against Google before issuing a session. A cancelled
+  /// links that member and loads the Firestore household. A cancelled
   /// chooser or any failure stays on this page with a clear message.
   /// There is no fake session anywhere in this flow.
   Future<void> _signInWithGoogle(AppState state) async {
@@ -494,7 +376,6 @@ class _LoginScreenState extends State<LoginScreen> {
           );
           if (ok) {
             await state.saveFirebaseMember(memberId);
-            if (mounted) _password.clear();
           }
         case GoogleSignInCancelled():
           state.showError('Google sign-in was cancelled.');
@@ -511,7 +392,7 @@ class _LoginScreenState extends State<LoginScreen> {
   /// user backs out (then nothing is logged in).
   Future<String?> _pickGoogleMember(String googleEmail) {
     // memberOptions falls back to the three seeded household members
-    // when the backend list is empty (it needs a session to load).
+    // when the roster has not loaded yet.
     final members = context.read<AppState>().memberOptions;
     return showDialog<String>(
       context: context,
@@ -561,10 +442,10 @@ class _LoginScreenState extends State<LoginScreen> {
 
   /// Demo accounts popup: the three demo accounts live ONLY here
   /// (names + IDs only — no passwords are shown). Tapping one signs
-  /// the demo user in through Firebase Auth (create on first use)
-  /// plus the backend demo password, via AppState.loginWithDemo.
-  /// Without Firebase wired in, the same tap is the old backend-only
-  /// demo login. There is no bypass around auth either way.
+  /// the demo user in through Firebase Auth (create on first use),
+  /// via AppState.loginWithDemo. Without Firebase wired in, the same
+  /// tap uses a local demo identity. There is no bypass around auth
+  /// either way.
   Future<void> _showDemoAccounts(
       BuildContext context, AppState state) async {
     await showDialog<void>(

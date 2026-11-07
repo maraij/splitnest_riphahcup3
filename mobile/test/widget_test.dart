@@ -6,311 +6,12 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:image_picker_platform_interface/image_picker_platform_interface.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:splitnest/data/api_client.dart';
 import 'package:splitnest/data/google_auth_service.dart';
-import 'package:splitnest/core/money.dart';
 import 'package:splitnest/data/repository.dart';
-import 'package:splitnest/domain/models.dart';
 import 'package:splitnest/main.dart';
 import 'package:splitnest/state/app_state.dart';
 
-// A fake API that returns the seeded household, so widget tests never
-// touch a real backend.
-class FakeApi extends ApiClient {
-  FakeApi() : super(baseUrl: 'http://fake');
-  @override
-  Future<List<Member>> getMembers() async => [
-        Member(id: 'M01', name: 'Ali'),
-        Member(id: 'M02', name: 'Ayesha'),
-        Member(id: 'M03', name: 'Bilal'),
-      ];
-  @override
-  Future<List<ShoppingItem>> getShopping() async => List.of(_shopping);
-
-  /// Stateful shopping list, so add/checkout tests see real changes.
-  final List<ShoppingItem> _shopping = [
-    ShoppingItem(id: 'S01', title: 'Milk', unit: 'bottle', requestedQty: 2, status: 'Pending'),
-    ShoppingItem(id: 'S02', title: 'Rice', unit: 'pack', requestedQty: 1, status: 'Pending'),
-  ];
-  int _shoppingSeq = 2;
-
-  @override
-  Future<ShoppingItem> addShopping({
-    required String title,
-    required String unit,
-    required int qty,
-  }) async {
-    final item = ShoppingItem(
-      id: 'S-fake-${++_shoppingSeq}',
-      title: title,
-      unit: unit,
-      requestedQty: qty,
-      status: 'Pending',
-    );
-    _shopping.add(item);
-    return item;
-  }
-
-  @override
-  Future<ExpenseRecord> checkout({
-    required List<String> itemIds,
-    required String totalPaid,
-    required String payerId,
-    required List<String> splitMembers,
-  }) async {
-    for (var i = 0; i < _shopping.length; i++) {
-      if (itemIds.contains(_shopping[i].id)) {
-        final old = _shopping[i];
-        _shopping[i] = ShoppingItem(
-          id: old.id,
-          title: old.title,
-          unit: old.unit,
-          requestedQty: old.requestedQty,
-          status: 'Bought',
-        );
-      }
-    }
-    final shares = equalSplit(parsePaisa(totalPaid) ?? 0, splitMembers)
-        .map((s) => ExpenseShare(
-            memberId: s.memberId, amount: formatPaisa(s.amountPaisa)))
-        .toList();
-    final now = DateTime.now();
-    return ExpenseRecord(
-      id: 'E-checkout-${++_expenseSeq}',
-      title: 'Shopping checkout',
-      category: 'Groceries',
-      amount: totalPaid,
-      payerId: payerId,
-      date:
-          '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}',
-      splitType: 'equal',
-      shares: shares,
-    );
-  }
-
-  @override
-  Future<void> settle({
-    required String senderId,
-    required String recipientId,
-    required String amount,
-  }) async {
-    // Fake: accepts the settlement (balances stay benchmark — the
-    // widget tests assert the log entry and the snackbar, not a
-    // recomputed balance; the backend tests cover the maths).
-  }
-
-  /// Stateful fixed templates, seeded like the backend (Internet
-  /// 1500 Bilal, Electricity 1020 Ali, both equal among all three).
-  final List<FixedExpense> _fixed = [
-    FixedExpense(
-      id: 'F01',
-      title: 'Internet',
-      category: 'Utilities',
-      amount: '1500.00',
-      payerId: 'M03',
-      splitMemberIds: ['M01', 'M02', 'M03'],
-    ),
-    FixedExpense(
-      id: 'F02',
-      title: 'Electricity',
-      category: 'Utilities',
-      amount: '1020.00',
-      payerId: 'M01',
-      splitMemberIds: ['M01', 'M02', 'M03'],
-    ),
-  ];
-  int _fixedSeq = 2;
-  final Set<String> _appliedFixed = {};
-
-  @override
-  Future<List<FixedExpense>> getFixedExpenses() async => List.of(_fixed);
-
-  @override
-  Future<FixedExpense> createFixedExpense({
-    required String title,
-    required String category,
-    required String amount,
-    required String payerId,
-    List<String>? splitMemberIds,
-  }) async {
-    final f = FixedExpense(
-      id: 'F-fake-${++_fixedSeq}',
-      title: title,
-      category: category,
-      amount: amount,
-      payerId: payerId,
-      splitMemberIds: splitMemberIds ?? ['M01', 'M02', 'M03'],
-    );
-    _fixed.add(f);
-    return f;
-  }
-
-  @override
-  Future<FixedExpense> updateFixedExpense({
-    required String id,
-    String? title,
-    String? category,
-    String? amount,
-    String? payerId,
-    List<String>? splitMemberIds,
-  }) async {
-    final i = _fixed.indexWhere((f) => f.id == id);
-    if (i < 0) throw ApiException('Fixed expense not found.');
-    final old = _fixed[i];
-    final updated = FixedExpense(
-      id: old.id,
-      title: title ?? old.title,
-      category: category ?? old.category,
-      amount: amount ?? old.amount,
-      payerId: payerId ?? old.payerId,
-      splitMemberIds: splitMemberIds ?? old.splitMemberIds,
-    );
-    _fixed[i] = updated;
-    return updated;
-  }
-
-  @override
-  Future<void> deleteFixedExpense(String id) async {
-    _fixed.removeWhere((f) => f.id == id);
-  }
-
-  @override
-  Future<({bool applied, ExpenseRecord? expense})> applyFixedExpense(
-      String id) async {
-    final now = DateTime.now();
-    final key =
-        '$id|${now.year}-${now.month.toString().padLeft(2, '0')}';
-    if (_appliedFixed.contains(key)) {
-      return (applied: false, expense: null);
-    }
-    FixedExpense? found;
-    for (final f in _fixed) {
-      if (f.id == id) found = f;
-    }
-    if (found == null) throw ApiException('Fixed expense not found.');
-    _appliedFixed.add(key);
-    final shares = equalSplit(parsePaisa(found.amount) ?? 0, found.splitMemberIds)
-        .map((s) => ExpenseShare(
-            memberId: s.memberId, amount: formatPaisa(s.amountPaisa)))
-        .toList();
-    final expense = ExpenseRecord(
-      id: 'E-fixed-${++_expenseSeq}',
-      title: found.title,
-      category: found.category,
-      amount: found.amount,
-      payerId: found.payerId,
-      date:
-          '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}',
-      splitType: 'equal',
-      shares: shares,
-    );
-    return (applied: true, expense: expense);
-  }
-  static const _demoPasswords = {
-    'M01': 'ali123',
-    'M02': 'ayesha123',
-    'M03': 'bilal123',
-  };
-
-  /// Fake login: checks the demo passwords like the real backend.
-  @override
-  Future<({String token, Member member})> login({
-    required String memberId,
-    required String password,
-  }) async {
-    final members = await getMembers();
-    Member? member;
-    for (final m in members) {
-      if (m.id == memberId) member = m;
-    }
-    if (member == null || _demoPasswords[memberId] != password) {
-      throw ApiException('Wrong password, try again');
-    }
-    final token = 'fake-token-$memberId';
-    setToken(token);
-    return (token: token, member: member);
-  }
-
-  /// Fake Google login: the token is already verified (that is the
-  /// backend's job, tested in test/api.test.js) — here it just issues
-  /// the same session shape for the picked member.
-  @override
-  Future<({String token, Member member})> loginWithGoogle({
-    required String idToken,
-    required String memberId,
-  }) async {
-    final members = await getMembers();
-    Member? member;
-    for (final m in members) {
-      if (m.id == memberId) member = m;
-    }
-    if (member == null) {
-      throw ApiException('Member $memberId does not exist.');
-    }
-    const token = 'fake-google-token';
-    setToken(token);
-    return (token: token, member: member);
-  }
-
-  int _expenseSeq = 0;
-
-  /// Fake add-expense: echoes the inputs back as a recorded expense,
-  /// with shares exactly as the real backend computes them.
-  @override
-  Future<ExpenseRecord> addExpense({
-    required String title,
-    required String category,
-    required String date,
-    required String amount,
-    required String payerId,
-    required String splitType,
-    List<Map<String, String>>? splits,
-    List<String>? splitMembers,
-  }) async {
-    final shares = splits != null
-        ? splits
-            .map((s) => ExpenseShare(
-                memberId: s['member_id']!, amount: s['amount']!))
-            .toList()
-        : splitMembers != null
-            ? equalSplit(parsePaisa(amount) ?? 0, splitMembers)
-                .map((s) => ExpenseShare(
-                    memberId: s.memberId,
-                    amount: formatPaisa(s.amountPaisa)))
-                .toList()
-            : const <ExpenseShare>[];
-    return ExpenseRecord(
-      id: 'E-fake-${++_expenseSeq}',
-      title: title,
-      category: category,
-      amount: amount,
-      payerId: payerId,
-      date: date,
-      splitType: splitType,
-      shares: shares,
-    );
-  }
-
-  @override
-  Future<Balances> getBalances() async => Balances(
-        rows: [
-          BalanceRow(memberId: 'M01', name: 'Ali', net: '250.00', paid: '1800.00', share: '1550.00'),
-          BalanceRow(memberId: 'M02', name: 'Ayesha', net: '-450.00', paid: '900.00', share: '1350.00'),
-          BalanceRow(memberId: 'M03', name: 'Bilal', net: '200.00', paid: '1500.00', share: '1300.00'),
-        ],
-        totalSpending: '4200.00',
-        budget: '5000.00',
-        remaining: '800.00',
-        usedPercent: 84,
-        status: 'Near Limit',
-      );
-}
-
-/// Test repository wrapping the fake API, so AppState talks to the
-/// repository (as in production) rather than to HTTP directly.
-class FakeRepository extends SplitNestRepository {
-  FakeRepository({ApiClient? api}) : super(api: api ?? FakeApi());
-}
+import 'fake_repository.dart';
 
 /// Fake Google sign-in returning a scripted result, so the login
 /// screen's Google flow can be tested without a device or Google.
@@ -326,12 +27,18 @@ class FakeGoogleAuthService implements GoogleAuthService {
   }
 }
 
-/// API that always fails, for the network-error test.
-class ThrowingApi extends ApiClient {
-  ThrowingApi() : super(baseUrl: 'http://fake');
+/// Repository that always fails, for the cloud-unavailable test.
+class ThrowingRepository extends FakeSplitNestRepository {
+  ThrowingRepository() : super.empty();
   @override
-  Future<List<Member>> getMembers() async =>
-      throw ApiException('Could not reach the backend.');
+  Future<GroupInfo> ensureGroup({
+    required String uid,
+    required String displayName,
+    required String? email,
+    required String legacyMemberId,
+    required bool isDemo,
+  }) async =>
+      throw const CloudDataException(cloudUnavailableMessage);
 }
 
 Future<void> pumpApp(WidgetTester tester,
@@ -339,7 +46,7 @@ Future<void> pumpApp(WidgetTester tester,
   await tester.pumpWidget(
     ChangeNotifierProvider(
       create: (_) => AppState(
-        repository: repository ?? FakeRepository(),
+        repository: repository ?? FakeSplitNestRepository.benchmark(),
         googleAuth: googleAuth,
       )..refresh(),
       child: const SplitNestApp(),
@@ -349,16 +56,14 @@ Future<void> pumpApp(WidgetTester tester,
   await tester.pumpAndSettle();
 }
 
-/// Demo passwords used by the widget tests (same as the backend seeds).
-const _testPasswords = {
-  'Ali': 'ali123',
-  'Ayesha': 'ayesha123',
-  'Bilal': 'bilal123',
-};
+const _memberIds = {'Ali': 'M01', 'Ayesha': 'M02', 'Bilal': 'M03'};
 
-/// Pumps the app, waits out the splash, and logs in with the member's
-/// demo password. Dismisses the once-per-login welcome popup (and the
+/// Pumps the app, waits out the splash, and logs in with the Demo
+/// button (the member-password login is gone — Phase 3 retired the
+/// backend). Dismisses the once-per-login welcome popup (and the
 /// savings celebration that follows it on the benchmark balances).
+/// Pass [repository] to log into a differently seeded household
+/// (e.g. [FakeSplitNestRepository.empty] for a fresh group).
 Future<void> loginAs(WidgetTester tester, String name,
     {SplitNestRepository? repository}) async {
   await pumpApp(tester, repository: repository);
@@ -366,23 +71,19 @@ Future<void> loginAs(WidgetTester tester, String name,
 }
 
 /// Logs in on the currently shown login page (also used after logout).
-/// Selects the member card, enters the demo password, taps Log in.
-/// Dismisses the welcome popup unless [dismissWelcome] is false.
+/// Opens Demo, taps the member's account. Dismisses the welcome
+/// popup unless [dismissWelcome] is false.
 Future<void> loginOnCurrentPage(
   WidgetTester tester,
   String name, {
   bool dismissWelcome = true,
 }) async {
   expect(find.text('Log in'), findsOneWidget);
-  await tester.tap(find.text(name));
+  await tester.ensureVisible(find.text('Demo'));
   await tester.pumpAndSettle();
-  await tester.enterText(
-    find.widgetWithText(TextField, 'Password'),
-    _testPasswords[name]!,
-  );
-  await tester.ensureVisible(find.text('Log in'));
+  await tester.tap(find.text('Demo'));
   await tester.pumpAndSettle();
-  await tester.tap(find.text('Log in'));
+  await tester.tap(find.text('$name • ${_memberIds[name]}'));
   await tester.pumpAndSettle();
   if (dismissWelcome && find.text('Got it').evaluate().isNotEmpty) {
     await tester.tap(find.text('Got it'));
@@ -449,24 +150,6 @@ Future<void> _openDrawer(WidgetTester tester) async {
   await tester.pumpAndSettle();
 }
 
-/// Fake balances where the house already spent the whole budget, so
-/// nobody saved anything and the celebration must NOT appear.
-class OverBudgetApi extends FakeApi {
-  @override
-  Future<Balances> getBalances() async => Balances(
-        rows: [
-          BalanceRow(memberId: 'M01', name: 'Ali', net: '0.00', paid: '2000.00', share: '2000.00'),
-          BalanceRow(memberId: 'M02', name: 'Ayesha', net: '0.00', paid: '1500.00', share: '1500.00'),
-          BalanceRow(memberId: 'M03', name: 'Bilal', net: '0.00', paid: '1500.00', share: '1500.00'),
-        ],
-        totalSpending: '5000.00',
-        budget: '5000.00',
-        remaining: '0.00',
-        usedPercent: 100,
-        status: 'Over Budget',
-      );
-}
-
 /// Fake image picker returning fixed bytes (a 1x1 PNG), so the
 /// "Change photo" flow can be tested without a device gallery.
 class _FakePicker extends ImagePickerPlatform {
@@ -492,7 +175,9 @@ void main() {
       (tester) async {
     await tester.pumpWidget(
       ChangeNotifierProvider(
-        create: (_) => AppState(repository: FakeRepository())..refresh(),
+        create: (_) =>
+            AppState(repository: FakeSplitNestRepository.benchmark())
+              ..refresh(),
         child: const SplitNestApp(),
       ),
     );
@@ -567,12 +252,14 @@ void main() {
 
   testWidgets('expenses tab shows add button and recent expenses',
       (tester) async {
-    await loginAs(tester, 'Ali');
+    // Fresh group: the history is the persisted Firestore list, so
+    // it starts empty here and fills as expenses are posted.
+    await loginAs(tester, 'Ali',
+        repository: FakeSplitNestRepository.empty());
     await tester.tap(find.text('Expenses'));
     await tester.pumpAndSettle();
     expect(find.text('Add New Expense'), findsOneWidget);
-    expect(find.text('No expenses added yet in this session'),
-        findsOneWidget);
+    expect(find.text('No expenses recorded yet'), findsOneWidget);
   });
 
   testWidgets('add expense sheet shows categories and live preview',
@@ -680,24 +367,26 @@ void main() {
         findsOneWidget);
   });
 
-  testWidgets('login shows error with retry when backend is down',
+  testWidgets('login shows error with retry when the cloud is down',
       (tester) async {
-    await tester.pumpWidget(
-      ChangeNotifierProvider(
-        create: (_) =>
-            AppState(repository: FakeRepository(api: ThrowingApi()))
-              ..refresh(),
-        child: const SplitNestApp(),
-      ),
-    );
+    await pumpApp(tester, repository: ThrowingRepository());
     await tester.pumpAndSettle();
-    expect(find.textContaining('Could not reach the backend.'),
-        findsOneWidget);
+    // Logged out, nothing has been asked of the cloud yet: no error.
+    expect(find.textContaining('Cloud data unavailable'), findsNothing);
+    // Demo login asks the cloud for the household and fails honestly.
+    await tester.ensureVisible(find.text('Demo'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Demo'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Ali • M01'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('Cloud data unavailable'), findsOneWidget);
     expect(find.text('Retry'), findsOneWidget);
     await tester.tap(find.text('Retry'));
     await tester.pumpAndSettle();
-    expect(find.textContaining('Could not reach the backend.'),
-        findsOneWidget);
+    expect(find.textContaining('Cloud data unavailable'), findsOneWidget);
+    // No fake data leaked in: no budget, no balances, no members.
+    expect(find.text('Monthly Budget'), findsNothing);
   });
 
   testWidgets('phone-size layout has no overflow on any tab',
@@ -719,19 +408,15 @@ void main() {
   });
 
 
-  testWidgets('wrong password shows an error and stays on login',
+  testWidgets('login page has no member-password form any more',
       (tester) async {
+    // Phase 3 retired the member-password login with the backend:
+    // the only ways in are Demo, Google and (with Firebase) email.
     await pumpApp(tester);
-    await tester.tap(find.text('Ayesha'));
-    await tester.pumpAndSettle();
-    await tester.enterText(
-        find.widgetWithText(TextField, 'Password'), 'not-the-password');
-    await tester.ensureVisible(find.text('Log in'));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Log in'));
-    await tester.pumpAndSettle();
-    expect(find.text('Wrong password, try again'), findsOneWidget);
     expect(find.text('Log in'), findsOneWidget);
+    expect(find.text('Demo'), findsOneWidget);
+    expect(find.text('Continue with Google'), findsOneWidget);
+    expect(find.widgetWithText(TextField, 'Password'), findsNothing);
     expect(find.text('Monthly Budget'), findsNothing);
   });
 
@@ -829,21 +514,15 @@ void main() {
     expect(find.text('Log in'), findsOneWidget);
   });
 
-  testWidgets(
-      'Continue with Google sits below the accounts and signs in',
+  testWidgets('Continue with Google signs in and asks for the member',
       (tester) async {
     await pumpApp(tester,
         googleAuth: FakeGoogleAuthService(const GoogleSignedIn(
           idToken: 'fake-id-token',
           email: 'test.user@gmail.com',
         )));
-    // One Google button, below the member accounts (not above them).
+    // One Google button on the login page.
     expect(find.text('Continue with Google'), findsOneWidget);
-    final googleY =
-        tester.getCenter(find.text('Continue with Google')).dy;
-    for (final name in ['Ali', 'Ayesha', 'Bilal']) {
-      expect(tester.getCenter(find.text(name)).dy, lessThan(googleY));
-    }
     // Tapping it runs the Google flow, then asks which member this
     // Google account is — no password, no fake session.
     await tester.ensureVisible(find.text('Continue with Google'));
@@ -899,7 +578,8 @@ void main() {
 
   testWidgets('category breakdown renders from recorded expenses',
       (tester) async {
-    await loginAs(tester, 'Ali');
+    await loginAs(tester, 'Ali',
+        repository: FakeSplitNestRepository.empty());
     await tester.tap(find.text('Expenses'));
     await tester.pumpAndSettle();
     await _addExpenseViaSheet(tester,
@@ -930,7 +610,8 @@ void main() {
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
-    await loginAs(tester, 'Ali');
+    await loginAs(tester, 'Ali',
+        repository: FakeSplitNestRepository.empty());
     await tester.tap(find.text('Expenses'));
     await tester.pumpAndSettle();
     await _addExpenseViaSheet(tester,
@@ -957,8 +638,10 @@ void main() {
     expect(find.widgetWithText(ListTile, 'Cleaning'), findsNothing);
     await tester.tap(find.text('All categories'));
     await tester.pumpAndSettle();
-    // Filter by member (payer).
-    await tester.tap(find.text('Bilal'));
+    // Filter by member (payer). The member name also appears as a
+    // per-member card title further down the list, so target the
+    // filter chip specifically.
+    await tester.tap(find.widgetWithText(ChoiceChip, 'Bilal'));
     await tester.pumpAndSettle();
     expect(find.widgetWithText(ListTile, 'Cleaning'), findsOneWidget);
     expect(find.widgetWithText(ListTile, 'Internet'), findsNothing);
@@ -1028,7 +711,8 @@ void main() {
 
   testWidgets('category cap banner appears at 80 percent of a cap',
       (tester) async {
-    await loginAs(tester, 'Ali');
+    await loginAs(tester, 'Ali',
+        repository: FakeSplitNestRepository.empty());
     // No cap set yet: no banner, no bar.
     expect(find.text('Near a category cap'), findsNothing);
     // Caps live ONLY in Monthly view > Budgets (no-overlap rule).
@@ -1069,14 +753,14 @@ void main() {
   });
 
   testWidgets('trend chart renders from recorded expenses', (tester) async {
-    await loginAs(tester, 'Ali');
+    await loginAs(tester, 'Ali',
+        repository: FakeSplitNestRepository.empty());
     await _openDrawer(tester);
     await tester.tap(find.text('Monthly view'));
     await tester.pumpAndSettle();
     // No recorded history yet: honest empty state, no fake bars.
     expect(find.text('Weekly spending'), findsOneWidget);
-    expect(find.text('No expenses recorded yet in this session'),
-        findsWidgets);
+    expect(find.text('No expenses recorded yet'), findsWidgets);
     await tester.pageBack();
     await tester.pumpAndSettle();
     // Record one expense dated today (day 5 → Week 1).
@@ -1120,11 +804,9 @@ void main() {
     await loginAs(tester, 'Ali');
     // Timeline is drawer-only: it must NOT appear on Home.
     expect(find.text('Timeline'), findsNothing);
-    await tester.tap(find.text('Expenses'));
-    await tester.pumpAndSettle();
-    await _addExpenseViaSheet(tester,
-        title: 'Internet', amount: '1500.00', category: 'Utilities');
-    // Record a settlement: Ayesha → Ali 250 (max from Smart Settle).
+    // Settle FIRST, from the benchmark balances: Ayesha → Ali 250
+    // is the Smart Settle max. (Adding the expense first would move
+    // the balances and the 250.00 chip would not exist.)
     await tester.tap(find.text('Settle Up'));
     await tester.pumpAndSettle();
     await tester.scrollUntilVisible(find.text('Settle Debt'), 300,
@@ -1139,6 +821,10 @@ void main() {
     await tester.tap(find.text('Confirm payment'));
     await tester.pumpAndSettle();
     expect(find.text('Settlement recorded.'), findsOneWidget);
+    await tester.tap(find.text('Expenses'));
+    await tester.pumpAndSettle();
+    await _addExpenseViaSheet(tester,
+        title: 'Internet', amount: '1500.00', category: 'Utilities');
     await _openDrawer(tester);
     await tester.tap(find.text('Timeline'));
     await tester.pumpAndSettle();
@@ -1180,7 +866,8 @@ void main() {
 
   testWidgets('Monthly view shows the logged-in member breakdown',
       (tester) async {
-    await loginAs(tester, 'Ali');
+    await loginAs(tester, 'Ali',
+        repository: FakeSplitNestRepository.empty());
     await tester.tap(find.text('Expenses'));
     await tester.pumpAndSettle();
     await _addExpenseViaSheet(tester,
@@ -1273,7 +960,7 @@ void main() {
   testWidgets('celebration does NOT appear when nobody saved',
       (tester) async {
     await loginAs(tester, 'Ali',
-        repository: FakeRepository(api: OverBudgetApi()));
+        repository: FakeSplitNestRepository.overBudget());
     expect(find.text('Great job, Ali!'), findsNothing);
     expect(find.text('Budget exceeded'), findsWidgets);
   });
@@ -1284,7 +971,8 @@ void main() {
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
-    await loginAs(tester, 'Ali');
+    await loginAs(tester, 'Ali',
+        repository: FakeSplitNestRepository.empty());
     await tester.tap(find.text('Expenses'));
     await tester.pumpAndSettle();
     await _addExpenseViaSheet(tester,
@@ -1350,6 +1038,12 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('Already applied for this month.'), findsOneWidget);
     // Edit Internet 1500 → 1800: share 600, total 2820, my share 940.
+    // (The persisted benchmark history makes the list longer than it
+    // used to be, so scroll the fixed section back into view first.)
+    await tester.scrollUntilVisible(
+        find.byTooltip('Edit amount').first, 300,
+        scrollable: find.byType(Scrollable).first);
+    await tester.pumpAndSettle();
     await tester.tap(find.byTooltip('Edit amount').first);
     await tester.pumpAndSettle();
     expect(find.text('Edit Internet'), findsOneWidget);
@@ -1361,6 +1055,10 @@ void main() {
         findsOneWidget);
     expect(find.text('Internet — PKR 1800.00 / month'), findsOneWidget);
     // Delete Electricity: total drops to the edited Internet only.
+    await tester.scrollUntilVisible(
+        find.byTooltip('Delete fixed expense').at(1), 300,
+        scrollable: find.byType(Scrollable).first);
+    await tester.pumpAndSettle();
     await tester.tap(find.byTooltip('Delete fixed expense').at(1));
     await tester.pumpAndSettle();
     expect(find.text('Delete Electricity?'), findsOneWidget);

@@ -104,7 +104,7 @@ class CategoryBreakdownCard extends StatelessWidget {
             const SizedBox(height: 12),
             if (slices.isEmpty)
               const Text(
-                'No expenses recorded yet in this session',
+                'No expenses recorded yet',
                 style: SplitNestTheme.supportingStyle,
               )
             else

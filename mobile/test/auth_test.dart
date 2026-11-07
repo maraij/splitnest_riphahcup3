@@ -4,14 +4,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:splitnest/data/api_client.dart';
 import 'package:splitnest/data/firebase_auth_service.dart';
 import 'package:splitnest/data/google_auth_service.dart';
-import 'package:splitnest/data/repository.dart';
-import 'package:splitnest/domain/models.dart';
 import 'package:splitnest/features/auth/auth_validation.dart';
 import 'package:splitnest/main.dart';
 import 'package:splitnest/state/app_state.dart';
+
+import 'fake_repository.dart';
 
 // ------------------------------------------------------------------
 // Fake Firebase Auth: in-memory users with Firebase-like semantics.
@@ -210,85 +209,6 @@ class FakeFirebaseAuthService implements FirebaseAuthService {
   }
 }
 
-// A fake API that returns the seeded household, so widget tests never
-// touch a real backend. Mirrors the FakeApi in widget_test.dart.
-class _FakeApi extends ApiClient {
-  _FakeApi() : super(baseUrl: 'http://fake');
-
-  @override
-  Future<List<Member>> getMembers() async => [
-        Member(id: 'M01', name: 'Ali'),
-        Member(id: 'M02', name: 'Ayesha'),
-        Member(id: 'M03', name: 'Bilal'),
-      ];
-
-  @override
-  Future<List<ShoppingItem>> getShopping() async => [];
-
-  @override
-  Future<Balances> getBalances() async => Balances(
-        rows: [
-          BalanceRow(memberId: 'M01', name: 'Ali', net: '250.00', paid: '1800.00', share: '1550.00'),
-          BalanceRow(memberId: 'M02', name: 'Ayesha', net: '-450.00', paid: '900.00', share: '1350.00'),
-          BalanceRow(memberId: 'M03', name: 'Bilal', net: '200.00', paid: '1500.00', share: '1300.00'),
-        ],
-        totalSpending: '4200.00',
-        budget: '5000.00',
-        remaining: '800.00',
-        usedPercent: 84,
-        status: 'Near Limit',
-      );
-
-  @override
-  Future<List<FixedExpense>> getFixedExpenses() async => [];
-
-  static const _demoPasswords = {
-    'M01': 'ali123',
-    'M02': 'ayesha123',
-    'M03': 'bilal123',
-  };
-
-  @override
-  Future<({String token, Member member})> login({
-    required String memberId,
-    required String password,
-  }) async {
-    final members = await getMembers();
-    Member? member;
-    for (final m in members) {
-      if (m.id == memberId) member = m;
-    }
-    if (member == null || _demoPasswords[memberId] != password) {
-      throw ApiException('Wrong password, try again');
-    }
-    final token = 'fake-token-$memberId';
-    setToken(token);
-    return (token: token, member: member);
-  }
-
-  @override
-  Future<({String token, Member member})> loginWithGoogle({
-    required String idToken,
-    required String memberId,
-  }) async {
-    final members = await getMembers();
-    Member? member;
-    for (final m in members) {
-      if (m.id == memberId) member = m;
-    }
-    if (member == null) {
-      throw ApiException('Member $memberId does not exist.');
-    }
-    const token = 'fake-google-token';
-    setToken(token);
-    return (token: token, member: member);
-  }
-}
-
-class _FakeRepository extends SplitNestRepository {
-  _FakeRepository({ApiClient? api}) : super(api: api ?? _FakeApi());
-}
-
 class _FakeGoogleAuthService implements GoogleAuthService {
   _FakeGoogleAuthService(this.result);
   final GoogleSignInResult result;
@@ -307,7 +227,7 @@ Future<AppState> _makeState({
 }) async {
   SharedPreferences.setMockInitialValues({});
   final state = AppState(
-    repository: _FakeRepository(),
+    repository: FakeSplitNestRepository.benchmark(),
     googleAuth: googleAuth,
     firebaseAuth: firebaseAuth,
   )..refresh();
@@ -326,7 +246,7 @@ Future<void> _pumpApp(
   await tester.pumpWidget(
     ChangeNotifierProvider(
       create: (_) => AppState(
-        repository: _FakeRepository(),
+        repository: FakeSplitNestRepository.benchmark(),
         googleAuth: googleAuth,
         firebaseAuth: firebaseAuth,
       )..refresh(),
@@ -597,8 +517,6 @@ void main() {
       expect(state.loggedInMemberId, 'M01');
       expect(state.firebaseSession?.email, 'ali.demo@splitnest.app');
       expect(state.firebaseSession?.isDemo, isTrue);
-      expect(state.sessionToken, isNotNull,
-          reason: 'demo also takes a backend session for data');
 
       await state.logout();
       ok = await state.loginWithDemo(memberId: 'M01');
@@ -623,14 +541,19 @@ void main() {
       }
     });
 
-    test('demo login without Firebase falls back to backend login',
+    test('demo login without Firebase uses a local demo identity',
         () async {
-      // No firebaseAuth wired in: the old backend-only path.
+      // No firebaseAuth wired in: the demo identity is local, and
+      // the household still loads from the repository — there is no
+      // backend login any more.
       final state = await _makeState();
       expect(state.firebaseAuthEnabled, isFalse);
       final ok = await state.loginWithDemo(memberId: 'M02');
       expect(ok, isTrue);
       expect(state.loggedInMemberId, 'M02');
+      expect(state.firebaseSession?.isDemo, isTrue);
+      expect(state.firebaseSession?.email, 'ayesha.demo@splitnest.app');
+      expect(state.isLoggedIn, isTrue);
     });
   });
 

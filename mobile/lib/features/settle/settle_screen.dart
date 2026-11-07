@@ -172,6 +172,50 @@ class SettleScreen extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 16),
+          // Payments recorded but not yet verified. A recorded
+          // payment already counts in the balances above; verification
+          // is the owner/admin confirming it happened. Tapping
+          // Verify flips recorded → verified (the rules enforce that
+          // only an owner/admin can).
+          if (state.pendingPayments.isNotEmpty) ...[
+            const Text('Pending verification',
+                style: SplitNestTheme.sectionStyle),
+            const SizedBox(height: 8),
+            Entrance(
+              delay: const Duration(milliseconds: 120),
+              child: Card(
+                child: Column(
+                  children: [
+                    ...state.pendingPayments.map((p) => ListTile(
+                          leading: const Icon(Icons.hourglass_top),
+                          title: Text(
+                            '${memberName(state.members, p.senderId)} → '
+                            '${memberName(state.members, p.recipientId)}',
+                          ),
+                          subtitle: const Text(
+                              'Recorded — waiting for verification'),
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              MoneyText(p.amount,
+                                  style: SplitNestTheme.bodyStyle
+                                      .copyWith(fontWeight: FontWeight.w700)),
+                              const SizedBox(width: 8),
+                              TextButton(
+                                onPressed: state.isBusy
+                                    ? null
+                                    : () => state.verifyPayment(p.id),
+                                child: const Text('Verify'),
+                              ),
+                            ],
+                          ),
+                        )),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+          ],
         ],
       ),
     );

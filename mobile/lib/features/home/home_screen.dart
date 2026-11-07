@@ -237,6 +237,14 @@ class HomeScreen extends StatelessWidget {
             // ONLY in Monthly view > Budgets — no-overlap rule.)
             BudgetAlertBanner(balances: b),
             const SizedBox(height: 16),
+            // Demo benchmark (demo users only, and only until it is
+            // loaded): loads the four benchmark expenses as
+            // clearly-labelled DEMO data. Never shown to real users,
+            // never auto-seeded.
+            if (state.isDemoUser && !state.demoDataLoaded)
+              _DemoBenchmarkCard(state: state),
+            if (state.isDemoUser && !state.demoDataLoaded)
+              const SizedBox(height: 16),
             // Monthly Budget ring, centred.
             Entrance(
               delay: const Duration(milliseconds: 120),
@@ -469,7 +477,7 @@ class HomeScreen extends StatelessWidget {
           ],
           const SizedBox(height: 16),
           Text(
-            'Practice build · API: ${state.apiBaseUrl} · Password login enabled.',
+            'Practice build · Cloud data (Firestore) · Signed in with Firebase.',
             style: TextStyle(
               fontSize: 12,
               color: theme.colorScheme.onSurfaceVariant,
@@ -562,6 +570,64 @@ class _BalanceRow extends StatelessWidget {
                 '${row.name} $label PKR ${row.net.replaceFirst('-', '')}',
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// Demo-only card: loads the benchmark expenses as clearly-labelled
+/// DEMO data. Shown only to demo users whose group has no demo data
+/// yet; real users never see it, and it never auto-seeds.
+class _DemoBenchmarkCard extends StatelessWidget {
+  const _DemoBenchmarkCard({required this.state});
+  final AppState state;
+
+  @override
+  Widget build(BuildContext context) {
+    return Entrance(
+      child: Card(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Demo data',
+                style: SplitNestTheme.sectionStyle,
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Load the benchmark expenses as demo data: Milk & Rice '
+                'PKR 780.00, Cleaning PKR 900.00, Internet PKR 1500.00, '
+                'Electricity PKR 1020.00. Demo data is labelled DEMO '
+                'wherever it appears.',
+                style: SplitNestTheme.supportingStyle,
+              ),
+              const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: state.isBusy
+                      ? null
+                      : () async {
+                          final n = await state.loadDemoBenchmark();
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text(n > 0
+                                    ? 'Loaded $n demo benchmark expense(s).'
+                                    : 'Demo benchmark is already loaded.'),
+                              ),
+                            );
+                          }
+                        },
+                  icon: const Icon(Icons.science_outlined),
+                  label: const Text('Load demo benchmark'),
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }

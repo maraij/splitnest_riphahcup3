@@ -5,28 +5,37 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import '../data/api_client.dart';
+import '../core/money.dart';
 import '../data/firebase_auth_service.dart';
 import '../data/google_auth_service.dart';
 import '../data/repository.dart';
+import '../domain/balances.dart';
 import '../domain/insights.dart';
 import '../domain/models.dart';
 
 /// AppState — the SINGLE source of truth for the whole app.
 ///
-/// One store holds members, budget (via balances), shopping, expenses
-/// (session-only recent list), balances and the logged-in member.
-/// Widgets read from Provider and call these store methods only — they
-/// never call HTTP, never hold app data in their own setState, and
-/// never refresh per-screen. Every mutation refreshes this store once
-/// and all screens rebuild from it.
+/// One store holds members, budget (via balances), shopping, expenses,
+/// payments, balances and the logged-in member. Widgets read from
+/// Provider and call these store methods only — they never call
+/// Firestore, never hold app data in their own setState, and never
+/// refresh per-screen. Every mutation refreshes this store once and
+/// all screens rebuild from it.
+///
+/// Data flow (Phase 3): Firebase Auth identity → [ensureGroup] in
+/// the [SplitNestRepository] (a per-user household group, seeded with
+/// the 3-member roster and the PKR 5,000 budget) → the repository's
+/// typed Firestore reads → [computeBalances] here → the screens.
+/// There is no Node backend any more: no API base URL, no HTTP, no
+/// backend session token. The repository interface is the seam tests
+/// substitute fakes through.
 class AppState extends ChangeNotifier {
   AppState({
     SplitNestRepository? repository,
     GoogleAuthService? googleAuth,
     this.firebaseAuth,
     bool? initialDarkMode,
-  })  : _repository = repository ?? SplitNestRepository(),
+  })  : _repository = repository ?? const UnavailableSplitNestRepository(),
         googleAuth = googleAuth ?? RealGoogleAuthService() {
     _isDarkMode = initialDarkMode ?? false;
     // When the caller did not preload the saved theme (tests), load
@@ -37,8 +46,10 @@ class AppState extends ChangeNotifier {
     // Phase 2 (Auth): when a Firebase auth service is wired in
     // (production, Firebase initialised), the AuthGate listens to
     // FirebaseAuth.authStateChanges(). Without one (tests, or
-    // Firebase init failed) the app runs backend-only exactly as
-    // before — member + password login drives isLoggedIn.
+    // Firebase init failed) the app runs on a local demo/Google
+    // identity instead — the data still comes from the repository,
+    // which is the Unavailable one when Firebase never initialised,
+    // so the app shows the cloud-unavailable state honestly.
     final firebaseService = firebaseAuth;
     if (firebaseService != null) {
       firebaseSession = firebaseService.currentSession;
@@ -49,7 +60,20 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  final SplitNestRepository _repository;
+  SplitNestRepository _repository;
+
+  /// Swaps the data source (used by main.dart when a Firebase retry
+  /// succeeds after the app started on the Unavailable repository).
+  /// Reloads the household when a user is already signed in.
+  void useRepository(SplitNestRepository repository) {
+    _repository = repository;
+    groupId = null;
+    if (isLoggedIn) {
+      unawaited(refresh());
+    } else {
+      notifyListeners();
+    }
+  }
 
   /// Google sign-in service (real in production, fake in widget
   /// tests). The login screen calls it; the store never talks to
@@ -59,25 +83,49 @@ class AppState extends ChangeNotifier {
   /// Firebase Auth service (real in production when Firebase
   /// initialised, fake in auth tests, null in the older widget
   /// tests and when Firebase init failed). Null means the Firebase
-  /// auth flows are unavailable and the backend login is the only
-  /// way in — the login screen hides the email mode then.
+  /// auth flows are unavailable — demo and Google fall back to a
+  /// local identity (see [loginWithDemo] / [loginWithGoogle]) and
+  /// the login screen hides the email mode.
   final FirebaseAuthService? firebaseAuth;
   StreamSubscription<FirebaseSession?>? _firebaseSub;
 
   /// The current Firebase session, if any. Null when signed out or
-  /// when no Firebase auth service is wired in.
+  /// when no Firebase auth service is wired in and no local demo /
+  /// Google identity has been created yet.
   FirebaseSession? firebaseSession;
 
   /// Gate state from the Firebase session (see [FirebaseAuthStatus]).
-  /// Meaningless when [firebaseAuth] is null — the backend login
+  /// Meaningless when [firebaseAuth] is null — the login state
   /// decides then.
   FirebaseAuthStatus firebaseStatus = FirebaseAuthStatus.signedOut;
 
   bool get firebaseAuthEnabled => firebaseAuth != null;
 
-  /// True once a Google sign-in happened this session, so logout
+  /// True only for the seeded demo identities
+  /// (`*.demo@splitnest.app`, or a local demo session when Firebase
+  /// is not wired in). Demo users may load the demo benchmark; real
+  /// users never see that action.
+  bool get isDemoUser => firebaseSession?.isDemo ?? false;
+
+  /// True only when the popup may be shown: logged in, balances loaded
+  /// (so the balance line is never a wrong/zero guess), and not yet
+  /// shown or scheduled for this login.
+  bool get shouldShowWelcome =>
+      isLoggedIn &&
+      balances != null &&
+      activeBalance != null &&
+      _welcomeShownForMemberId != loggedInMemberId &&
+      !_welcomeDialogPending;
+
+  /// The UID the repository records as the actor of writes: the
+  /// Firebase UID when signed in through Firebase, otherwise a
+  /// stable local identity for the logged-in member.
+  String get currentUid =>
+      firebaseSession?.uid ?? 'local-${loggedInMemberId ?? 'unknown'}';
+
+  /// True only when a Google sign-in happened this session, so logout
   /// knows to sign out of Google too. (Widget tests that only use
-  /// password login never touch the Google plugin this way.)
+  /// demo login never touch the Google plugin this way.)
   bool _usedGoogleSignIn = false;
 
   @override
@@ -112,12 +160,9 @@ class AppState extends ChangeNotifier {
 
   /// Restores a persisted Firebase session on launch: a verified (or
   /// demo) user with a saved member link re-enters the app without
-  /// signing in again. Demo users also silently restore their
-  /// backend session (their demo password is known to the app);
-  /// Google/email users keep Firebase identity only — the backend
-  /// issues no token without a fresh Google ID token or member
-  /// password, so they re-authenticate for data (see
-  /// _applyFirebaseSession's notice).
+  /// signing in again, and their Firestore household loads — this is
+  /// the path that makes email-only users work end-to-end now that
+  /// data lives in Firestore instead of behind a backend token.
   Future<void> _restoreFirebaseSession() async {
     final service = firebaseAuth;
     final session = service?.currentSession;
@@ -132,19 +177,6 @@ class AppState extends ChangeNotifier {
     if (memberId == null) {
       notifyListeners();
       return;
-    }
-    final demo = demoForMember(memberId);
-    if (demo != null) {
-      try {
-        final result = await _repository.login(
-          memberId: memberId,
-          password: demo.password,
-        );
-        sessionToken = result.token;
-      } catch (_) {
-        // Backend down: Firebase identity stands, data stays
-        // unloaded until the backend is back.
-      }
     }
     await _applyFirebaseSession(session, memberId);
   }
@@ -185,14 +217,18 @@ class AppState extends ChangeNotifier {
 
   Future<void> toggleTheme() => setDarkMode(!_isDarkMode);
 
-  /// Base URL of the backend, for display only (Home footer).
-  String get apiBaseUrl => _repository.baseUrl;
+  /// The household group this session loads data from. Null until
+  /// the first successful refresh after login.
+  String? groupId;
+
+  /// Monthly household budget in integer paisa (PKR 5,000 = 500000).
+  /// Loaded from the group document; the default is the seeded value.
+  int budgetPaisa = defaultBudgetPaisa;
 
   List<Member> members = [];
 
   /// Members to offer in the sign-up / member-pick lists. Normally
-  /// the backend list; when it is empty (backend unreachable or not
-  /// logged in — the members endpoint itself needs a session) the
+  /// the group roster; when it is empty (not logged in yet) the
   /// three seeded household members stand in, so sign-up and the
   /// Firebase-session member pick still work.
   List<Member> get memberOptions =>
@@ -205,20 +241,35 @@ class AppState extends ChangeNotifier {
   ];
   List<ShoppingItem> shopping = [];
   Balances? balances;
+
+  /// All expenses in the group, newest first — the full Firestore
+  /// history, not a session-only list. (There was no GET /api/expenses
+  /// endpoint on the old backend, so this used to be session-only;
+  /// the migration makes the history persist across reloads.)
   List<ExpenseRecord> recentExpenses = [];
 
-  /// Fixed monthly expense templates (persisted in the backend).
+  /// All recorded payments (settlements) in the group, newest first.
+  List<PaymentRecord> payments = [];
+
+  /// Fixed monthly expense templates (persisted in Firestore).
   List<FixedExpense> fixedExpenses = [];
 
+  /// Whether any loaded expense is clearly-labelled demo benchmark
+  /// data. The "Load demo benchmark" action hides once this is true.
+  bool demoDataLoaded = false;
+
   /// Activity log (Timeline screen): every successful checkout,
-  /// expense post and settlement this session, newest last.
-  /// Session-only — it resets when the app reloads.
+  /// expense post and settlement this session, newest last. The app
+  /// also persists each entry to the cloud log (best-effort — the
+  /// rules make cloud activity Functions-written until they deploy),
+  /// but this session log is the Timeline source of truth.
   List<ActivityEntry> activityLog = [];
 
   /// Profile pictures, picked by the user, keyed by member id.
   /// Kept in memory; also persisted as base64 in SharedPreferences
   /// when small enough (best effort — a huge photo stays
-  /// session-only rather than breaking storage).
+  /// session-only rather than breaking storage). Local for now —
+  /// Storage upload is a later phase.
   Map<String, Uint8List> profileImages = {};
 
   /// Per-category budget caps in paisa, keyed by cap category.
@@ -227,11 +278,6 @@ class AppState extends ChangeNotifier {
   Map<String, int> categoryCaps = {};
 
   String activeMemberId = 'M01';
-
-  /// Session token from POST /api/auth/login (in-memory only, practice
-  /// build). Null until a successful login; cleared on logout, after
-  /// which no endpoint call may succeed.
-  String? sessionToken;
 
   /// Logged-in member id. Null until a successful login; Home is
   /// unreachable while null.
@@ -243,16 +289,6 @@ class AppState extends ChangeNotifier {
   /// guard so a rebuild before the first frame cannot queue it twice.
   String? _welcomeShownForMemberId;
   bool _welcomeDialogPending = false;
-
-  /// True only when the popup may be shown: logged in, balances loaded
-  /// (so the balance line is never a wrong/zero guess), and not yet
-  /// shown or scheduled for this login.
-  bool get shouldShowWelcome =>
-      isLoggedIn &&
-      balances != null &&
-      activeBalance != null &&
-      _welcomeShownForMemberId != loggedInMemberId &&
-      !_welcomeDialogPending;
 
   /// Marks the popup as scheduled. No notify — no UI depends on this flag.
   void markWelcomeScheduled() {
@@ -335,14 +371,28 @@ class AppState extends ChangeNotifier {
     required String memberId,
     String detail = '',
   }) {
-    activityLog.add(ActivityEntry(
+    final entry = ActivityEntry(
       type: type,
       title: title,
       amount: amount,
       memberId: memberId,
       detail: detail,
       timestamp: DateTime.now(),
-    ));
+    );
+    activityLog.add(entry);
+    // Persist to the cloud log too (best-effort — see
+    // SplitNestRepository.logActivity; a rules denial there never
+    // fails the mutation this entry describes).
+    final gid = groupId;
+    if (gid != null) {
+      unawaited(
+        _repository.logActivity(
+          groupId: gid,
+          entry: entry,
+          actorUid: currentUid,
+        ),
+      );
+    }
   }
 
   // ---- Profile picture ----
@@ -419,78 +469,7 @@ class AppState extends ChangeNotifier {
     await _persistCaps();
   }
 
-  /// Real login: member + password, checked by POST /api/auth/login.
-  /// On success the token is stored, the logged-in member AND the
-  /// active member become that member at once (so Home, Shopping,
-  /// Expenses and Settle Up all agree immediately), the welcome popup
-  /// is armed for this login, and data is refreshed. On a wrong
-  /// password returns false with errorMessage 'Wrong password, try
-  /// again' and stays logged out.
-  Future<bool> loginWithPassword({
-    required String memberId,
-    required String password,
-  }) async {
-    if (isBusy) return false;
-    isBusy = true;
-    errorMessage = null;
-    notifyListeners();
-    try {
-      final result =
-          await _repository.login(memberId: memberId, password: password);
-      sessionToken = result.token;
-      loggedInMemberId = result.member.id;
-      activeMemberId = result.member.id;
-      _welcomeShownForMemberId = null;
-      _welcomeDialogPending = false;
-      await refresh();
-      return true;
-    } on ApiException catch (e) {
-      errorMessage = e.message;
-      return false;
-    } finally {
-      isBusy = false;
-      notifyListeners();
-    }
-  }
-
-  /// Google login: a Google ID token the backend has verified, plus
-  /// the member the user picked. Same session handling as the
-  /// password login — token stored, logged-in + active member set,
-  /// welcome popup armed, data refreshed. A rejected token returns
-  /// false with the verification error and stays logged out.
-  /// (The Firebase credential sign-in for this Google account
-  /// already happened inside RealGoogleAuthService.signIn().)
-  Future<bool> loginWithGoogle({
-    required String idToken,
-    required String memberId,
-  }) async {
-    if (isBusy) return false;
-    _usedGoogleSignIn = true;
-    isBusy = true;
-    errorMessage = null;
-    notifyListeners();
-    try {
-      final result = await _repository.loginWithGoogle(
-        idToken: idToken,
-        memberId: memberId,
-      );
-      sessionToken = result.token;
-      loggedInMemberId = result.member.id;
-      activeMemberId = result.member.id;
-      _welcomeShownForMemberId = null;
-      _welcomeDialogPending = false;
-      await refresh();
-      return true;
-    } on ApiException catch (e) {
-      errorMessage = e.message;
-      return false;
-    } finally {
-      isBusy = false;
-      notifyListeners();
-    }
-  }
-
-  // ---- Phase 2: Firebase Auth ----
+  // ---- Firebase Auth (identity) + Firestore (data) ----
 
   /// The member id linked to the current Firebase session, if any.
   /// Null when signed out or never linked (then the login screen
@@ -523,11 +502,26 @@ class AppState extends ChangeNotifier {
     await service.syncProfile(memberId: memberId);
   }
 
-  /// Applies a signed-in Firebase session to the app: the member
-  /// becomes logged-in + active, the welcome popup is armed, and
-  /// data is refreshed. When there is no backend token (email-only
-  /// sign-in) the refresh 401s — the notice below replaces the
-  /// backend's misleading 'Session expired' text (see refresh()).
+  String _displayNameFor(String memberId) {
+    final session = firebaseSession;
+    if (session?.displayName != null && session!.displayName!.isNotEmpty) {
+      return session.displayName!;
+    }
+    final demo = demoForMember(memberId);
+    if (demo != null) return demo.name;
+    return memberOptions
+        .where((m) => m.id == memberId)
+        .firstOrNull
+        ?.name ??
+        'Member';
+  }
+
+  /// Applies a signed-in session to the app: the member becomes
+  /// logged-in + active, the welcome popup is armed, and the
+  /// Firestore household loads. This is the same path for demo,
+  /// Google and email sign-ins — data no longer needs any backend
+  /// token, so email-only users now load their household here too
+  /// (the Phase 2 limit this migration fixes).
   Future<void> _applyFirebaseSession(
     FirebaseSession session,
     String memberId,
@@ -629,18 +623,38 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// Demo login via Firebase Auth: create-or-sign-in the demo user
-  /// (ali.demo@splitnest.app etc.), then take a backend session with
-  /// the same demo password so household data loads. Demo sessions
-  /// bypass the verification gate. Without a Firebase service wired
-  /// in (tests, Firebase init failed) this is exactly the old
-  /// backend-only demo login.
+  /// Demo login: create-or-sign-in the demo user
+  /// (ali.demo@splitnest.app etc.) through Firebase Auth, then load
+  /// their Firestore household. Demo sessions bypass the verification
+  /// gate. Without a Firebase service wired in (tests, Firebase init
+  /// failed) the demo identity is local — the data still comes from
+  /// the repository, which is the Unavailable one when Firebase
+  /// never initialised, so the app shows the cloud-unavailable state
+  /// instead of fake data.
   Future<bool> loginWithDemo({required String memberId}) async {
     final demo = demoForMember(memberId);
     if (demo == null) return false;
     final service = firebaseAuth;
     if (service == null) {
-      return loginWithPassword(memberId: memberId, password: demo.password);
+      if (isBusy) return false;
+      isBusy = true;
+      errorMessage = null;
+      notifyListeners();
+      try {
+        firebaseSession = FirebaseSession(
+          uid: 'demo-$memberId',
+          email: demo.email,
+          displayName: demo.name,
+          emailVerified: false,
+          isDemo: true,
+        );
+        _updateFirebaseStatus();
+        await _applyFirebaseSession(firebaseSession!, memberId);
+        return true;
+      } finally {
+        isBusy = false;
+        notifyListeners();
+      }
     }
     if (isBusy) return false;
     isBusy = true;
@@ -660,22 +674,68 @@ class AppState extends ChangeNotifier {
           }
           firebaseSession = s;
           _updateFirebaseStatus();
-          try {
-            final backend = await _repository.login(
-              memberId: memberId,
-              password: demo.password,
-            );
-            sessionToken = backend.token;
-          } on ApiException {
-            // Backend down or unreachable: the Firebase demo identity
-            // still signs the user in; data stays unloaded and the
-            // refresh below surfaces the backend error honestly.
-          }
           await service.syncProfile(
               displayName: demo.name, memberId: memberId);
           await _applyFirebaseSession(s, memberId);
           return true;
       }
+    } finally {
+      isBusy = false;
+      notifyListeners();
+    }
+  }
+
+  /// Google login: the Google account chooser and the Firebase
+  /// credential sign-in already happened inside GoogleAuthService —
+  /// this only links the picked household member to that Firebase
+  /// identity and loads the Firestore household. There is no backend
+  /// token exchange any more. Without a Firebase service wired in
+  /// (tests, Firebase init failed) the identity is local; the data
+  /// still comes from the repository (Unavailable when Firebase
+  /// never initialised, so the cloud-unavailable state shows).
+  Future<bool> loginWithGoogle({
+    required String idToken,
+    required String memberId,
+  }) async {
+    if (isBusy) return false;
+    _usedGoogleSignIn = true;
+    isBusy = true;
+    errorMessage = null;
+    notifyListeners();
+    try {
+      final service = firebaseAuth;
+      if (service == null) {
+        firebaseSession = const FirebaseSession(
+          uid: 'local-google',
+          email: null,
+          displayName: null,
+          emailVerified: true,
+          isDemo: false,
+        );
+        _updateFirebaseStatus();
+        await _applyFirebaseSession(firebaseSession!, memberId);
+        return true;
+      }
+      var session = service.currentSession;
+      if (session == null) {
+        final result =
+            await service.signInWithGoogle(idToken: idToken);
+        switch (result) {
+          case FirebaseAuthFailure(:final message):
+            errorMessage = message;
+            return false;
+          case FirebaseAuthSuccess(session: final s):
+            session = s;
+        }
+      }
+      if (session == null) {
+        errorMessage ??= 'Something went wrong. Please try again.';
+        return false;
+      }
+      firebaseSession = session;
+      _updateFirebaseStatus();
+      await _applyFirebaseSession(session, memberId);
+      return true;
     } finally {
       isBusy = false;
       notifyListeners();
@@ -760,10 +820,10 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// Logout: signs out of Firebase AND Google, clears the backend
-  /// token and all local session state, and returns to login. Each
-  /// provider sign-out is best-effort — a provider failure never
-  /// blocks the local logout. Callers need not await it.
+  /// Logout: signs out of Firebase AND Google, clears all local
+  /// session state and the loaded household data, and returns to
+  /// login. Each provider sign-out is best-effort — a provider
+  /// failure never blocks the local logout. Callers need not await it.
   Future<void> logout() async {
     final firebaseService = firebaseAuth;
     if (firebaseService != null && firebaseSession != null) {
@@ -787,13 +847,22 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Clears the in-app session (backend token, logged-in member,
-  /// welcome/celebration state, activity log, error). Used by
+  /// Clears the in-app session (logged-in member, loaded household
+  /// data, welcome/celebration state, activity log, error). Used by
   /// [logout] and by the auth-state listener on external sign-out.
+  /// The loaded data is cleared so a later login never flashes the
+  /// previous user's household.
   void _clearLocalSession() {
-    _repository.clearToken();
-    sessionToken = null;
     loggedInMemberId = null;
+    groupId = null;
+    budgetPaisa = defaultBudgetPaisa;
+    members = [];
+    shopping = [];
+    balances = null;
+    recentExpenses = [];
+    payments = [];
+    fixedExpenses = [];
+    demoDataLoaded = false;
     _welcomeShownForMemberId = null;
     _welcomeDialogPending = false;
     _celebrationShownForMemberId = null;
@@ -816,43 +885,69 @@ class AppState extends ChangeNotifier {
 
   int get pendingCount => shopping.where((i) => i.isPending).length;
 
+  /// Payments still waiting for verification (status `recorded`).
+  List<PaymentRecord> get pendingPayments =>
+      payments.where((p) => p.status == 'recorded').toList();
+
   // NOTE: there is no free member switcher. The member is set at
   // login() and changed via logout + login again.
 
+  /// Loads the signed-in user's household from the repository:
+  /// resolves (or creates) the group, reads members, shopping,
+  /// expenses, payments and fixed templates, and computes balances
+  /// from that history. Before login this is a no-op — there is no
+  /// household to load and no error to show. When Firestore is
+  /// unavailable (database not created yet, offline, rules not
+  /// deployed) [errorMessage] carries the plain cloud-unavailable
+  /// text and every data list stays as it was — the app never shows
+  /// fake data.
   Future<void> refresh() async {
+    if (!isLoggedIn) {
+      isLoading = false;
+      return;
+    }
     isLoading = true;
     errorMessage = null;
     notifyListeners();
     try {
+      final memberId = loggedInMemberId!;
+      final info = await _repository.ensureGroup(
+        uid: currentUid,
+        displayName: _displayNameFor(memberId),
+        email: firebaseSession?.email,
+        legacyMemberId: memberId,
+        isDemo: isDemoUser,
+      );
+      groupId = info.groupId;
+      final gid = groupId!;
+      budgetPaisa = info.budgetPaisa;
       final results = await Future.wait([
-        _repository.getMembers(),
-        _repository.getShopping(),
-        _repository.getBalances(),
-        _repository.getFixedExpenses(),
+        _repository.getMembers(gid),
+        _repository.getShopping(gid),
+        _repository.getExpenses(gid),
+        _repository.getPayments(gid),
+        _repository.getFixedExpenses(gid),
       ]);
       members = results[0] as List<Member>;
       shopping = results[1] as List<ShoppingItem>;
-      balances = results[2] as Balances;
-      fixedExpenses = results[3] as List<FixedExpense>;
+      recentExpenses = results[2] as List<ExpenseRecord>;
+      payments = results[3] as List<PaymentRecord>;
+      fixedExpenses = results[4] as List<FixedExpense>;
+      demoDataLoaded = recentExpenses.any((e) => e.isDemo);
+      balances = computeBalances(
+        expenses: recentExpenses,
+        payments: payments,
+        members: members,
+        budgetPaisa: budgetPaisa,
+      );
       if (members.isNotEmpty &&
           members.every((m) => m.id != activeMemberId)) {
         activeMemberId = members.first.id;
       }
-    } on ApiException catch (e) {
+    } on CloudDataException catch (e) {
       errorMessage = e.message;
-      // Email-only Firebase sign-in: there is no backend token (the
-      // Node backend issues sessions only for member passwords and
-      // verified Google ID tokens), so every call 401s. Say so
-      // plainly instead of the backend's 'Session expired' text.
-      if (sessionToken == null &&
-          firebaseSession != null &&
-          firebaseStatus == FirebaseAuthStatus.signedIn) {
-        errorMessage =
-            'Signed in as ${firebaseSession?.email ?? 'your email'}. '
-            'The household data still lives on the Node backend, '
-            'which does not accept email sign-in yet — sign in with '
-            'a member password or Google to load it.';
-      }
+    } catch (_) {
+      errorMessage = 'Something went wrong. Please try again.';
     } finally {
       isLoading = false;
       notifyListeners();
@@ -861,23 +956,33 @@ class AppState extends ChangeNotifier {
 
   /// Runs a mutation with the submit lock held; refreshes the single
   /// store once on success so every screen rebuilds from fresh data.
+  /// A cloud failure sets the plain error message and returns false;
+  /// nothing is ever shown as succeeding when it did not.
   Future<bool> _runMutation(Future<dynamic> Function() fn) async {
     if (isBusy) return false;
     isBusy = true;
     errorMessage = null;
     notifyListeners();
     try {
-      final result = await fn();
-      if (result is ExpenseRecord) recentExpenses.insert(0, result);
+      await fn();
       await refresh();
       return true;
-    } on ApiException catch (e) {
+    } on CloudDataException catch (e) {
       errorMessage = e.message;
+      return false;
+    } catch (_) {
+      errorMessage = 'Something went wrong. Please try again.';
       return false;
     } finally {
       isBusy = false;
       notifyListeners();
     }
+  }
+
+  String get _groupOrUnavailable {
+    final gid = groupId;
+    if (gid == null) throw const CloudDataException(cloudUnavailableMessage);
+    return gid;
   }
 
   // ---- Store actions (the only mutations widgets may call) ----
@@ -888,9 +993,11 @@ class AppState extends ChangeNotifier {
     required int qty,
   }) =>
       _runMutation(() => _repository.addShopping(
+            groupId: _groupOrUnavailable,
             title: title,
             unit: unit,
             qty: qty,
+            actorUid: currentUid,
           ));
 
   Future<bool> checkout({
@@ -900,10 +1007,12 @@ class AppState extends ChangeNotifier {
     required List<String> splitMembers,
   }) async {
     final ok = await _runMutation(() => _repository.checkout(
+          groupId: _groupOrUnavailable,
           itemIds: itemIds,
           totalPaid: totalPaid,
           payerId: payerId,
           splitMembers: splitMembers,
+          actorUid: currentUid,
         ));
     if (ok) {
       _logActivity(
@@ -929,6 +1038,7 @@ class AppState extends ChangeNotifier {
     bool repeatMonthly = false,
   }) async {
     final ok = await _runMutation(() => _repository.addExpense(
+          groupId: _groupOrUnavailable,
           title: title,
           category: category,
           date: date,
@@ -937,6 +1047,7 @@ class AppState extends ChangeNotifier {
           splitType: splitType,
           splits: splits,
           splitMembers: splitMembers,
+          actorUid: currentUid,
         ));
     if (ok) {
       _logActivity(
@@ -954,11 +1065,13 @@ class AppState extends ChangeNotifier {
           ? (splits ?? []).map((s) => s['member_id']!).toList()
           : (splitMembers ?? this.members.map((m) => m.id).toList());
       await _runMutation(() => _repository.createFixedExpense(
+            groupId: _groupOrUnavailable,
             title: title,
             category: category,
             amount: amount,
             payerId: payerId,
             splitMemberIds: members,
+            actorUid: currentUid,
           ));
     }
     return ok;
@@ -972,40 +1085,45 @@ class AppState extends ChangeNotifier {
     List<String>? splitMemberIds,
   }) =>
       _runMutation(() => _repository.createFixedExpense(
+            groupId: _groupOrUnavailable,
             title: title,
             category: category,
             amount: amount,
             payerId: payerId,
             splitMemberIds: splitMemberIds,
+            actorUid: currentUid,
           ));
 
   Future<bool> updateFixedExpense({
     required String id,
     String? amount,
   }) =>
-      _runMutation(
-          () => _repository.updateFixedExpense(id: id, amount: amount));
+      _runMutation(() => _repository.updateFixedExpense(
+          groupId: _groupOrUnavailable, id: id, amount: amount));
 
   Future<bool> deleteFixedExpense(String id) =>
-      _runMutation(() => _repository.deleteFixedExpense(id));
+      _runMutation(() => _repository.deleteFixedExpense(
+          groupId: _groupOrUnavailable, id: id));
 
   /// Applies every fixed template for the current month (each posts
-  /// at most once per month — the backend enforces it). Returns how
+  /// at most once per month — the repository enforces it). Returns how
   /// many expenses were actually posted this call.
   Future<int> applyFixedForMonth() async {
-    if (isBusy) return 0;
+    final gid = groupId;
+    if (gid == null || isBusy) return 0;
     isBusy = true;
     errorMessage = null;
     notifyListeners();
     var applied = 0;
     try {
       for (final f in fixedExpenses) {
-        final result = await _repository.applyFixedExpense(f.id);
+        final result = await _repository.applyFixedExpense(
+          groupId: gid,
+          id: f.id,
+          actorUid: currentUid,
+        );
         if (result.applied) {
           applied++;
-          if (result.expense != null) {
-            recentExpenses.insert(0, result.expense!);
-          }
           _logActivity(
             type: 'expense',
             title: 'Fixed: ${f.title}',
@@ -1017,8 +1135,11 @@ class AppState extends ChangeNotifier {
       }
       await refresh();
       return applied;
-    } on ApiException catch (e) {
+    } on CloudDataException catch (e) {
       errorMessage = e.message;
+      return applied;
+    } catch (_) {
+      errorMessage = 'Something went wrong. Please try again.';
       return applied;
     } finally {
       isBusy = false;
@@ -1031,10 +1152,37 @@ class AppState extends ChangeNotifier {
     required String recipientId,
     required String amount,
   }) async {
-    final ok = await _runMutation(() => _repository.settle(
+    if (isBusy) return false;
+    final paisa = parsePaisa(amount);
+    if (paisa == null || paisa <= 0) {
+      errorMessage = 'Settlement amount must be positive.';
+      notifyListeners();
+      return false;
+    }
+    // Pre-check against the live ledger so the user gets the plain
+    // reason immediately; the repository re-validates before writing.
+    final b = balances;
+    if (b != null) {
+      final error = settlementError(
+        nets: {
+          for (final r in b.rows) r.memberId: parsePaisa(r.net) ?? 0,
+        },
+        senderId: senderId,
+        recipientId: recipientId,
+        amountPaisa: paisa,
+      );
+      if (error != null) {
+        errorMessage = error;
+        notifyListeners();
+        return false;
+      }
+    }
+    final ok = await _runMutation(() => _repository.recordPayment(
+          groupId: _groupOrUnavailable,
           senderId: senderId,
           recipientId: recipientId,
           amount: amount,
+          actorUid: currentUid,
         ));
     if (ok) {
       _logActivity(
@@ -1046,6 +1194,53 @@ class AppState extends ChangeNotifier {
       );
     }
     return ok;
+  }
+
+  /// Verifies a recorded payment (recorded → verified). Only an
+  /// owner/admin can do this — on the real database the rules
+  /// enforce it and a rejection surfaces as the plain cloud message.
+  Future<bool> verifyPayment(String paymentId) => _runMutation(
+        () => _repository.verifyPayment(
+          groupId: _groupOrUnavailable,
+          paymentId: paymentId,
+          actorUid: currentUid,
+        ),
+      );
+
+  /// Loads the clearly-labelled DEMO benchmark into this group.
+  /// Demo users only — real users never see the action (the Home
+  /// card gates on [isDemoUser]) and the repository never auto-seeds
+  /// it. Returns how many benchmark expenses were seeded (0 when
+  /// already loaded).
+  Future<int> loadDemoBenchmark() async {
+    if (!isDemoUser) {
+      errorMessage = 'Demo data is only available for demo accounts.';
+      notifyListeners();
+      return 0;
+    }
+    final gid = groupId;
+    if (gid == null || isBusy) return 0;
+    isBusy = true;
+    errorMessage = null;
+    notifyListeners();
+    try {
+      final n = await _repository.loadDemoBenchmark(
+        groupId: gid,
+        actorUid: currentUid,
+        actorName: loggedInMember?.name ?? 'Demo',
+      );
+      await refresh();
+      return n;
+    } on CloudDataException catch (e) {
+      errorMessage = e.message;
+      return 0;
+    } catch (_) {
+      errorMessage = 'Something went wrong. Please try again.';
+      return 0;
+    } finally {
+      isBusy = false;
+      notifyListeners();
+    }
   }
 
   /// Shows a message on the login page (e.g. a cancelled Google

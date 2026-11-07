@@ -4,6 +4,8 @@ import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'data/firebase_auth_service.dart';
+import 'data/firestore_repository.dart';
+import 'data/repository.dart';
 import 'features/auth/login_screen.dart';
 import 'features/auth/verification_screen.dart';
 import 'features/expenses/expenses_screen.dart';
@@ -24,32 +26,32 @@ import 'core/widgets/entrance.dart';
 /// AuthGate: Firebase auth state decides — signed-out → login,
 /// signed-in but email-unverified → verification screen,
 /// signed-in + verified (or demo) → Home as the linked member.
-/// Member + password login (POST /api/auth/login, Bearer token) and
-/// the Demo button still work; email sign-up/sign-in and Google
-/// sign-in go through Firebase Auth (Phase 2). Log out returns to
-/// the login page; Home is unreachable without logging in. Tabs:
+/// Sign-in is Firebase Auth only (email/password, Google, demo);
+/// there is no member-password login and no backend session any
+/// more. Household data lives in Cloud Firestore
+/// (FirestoreSplitNestRepository); the Node backend is retired (see
+/// backend/LEGACY.md). Log out returns to the login page; Home is
+/// unreachable without logging in. Tabs:
 /// Home, Shopping, Expenses, Settle Up. Drawer: the same four tabs
 /// plus Monthly view, Timeline and Profile.
 /// Theme: light (Hisaab Kitaab teal) or dark (Coolors plum palette),
 /// one shared AppState flag; toggled from the AppBar or the drawer,
 /// persisted in SharedPreferences and applied before first paint.
-/// Phase 1 (Foundation): Firebase is initialised here, but the app does
-/// NOT depend on it yet — every screen still talks to the Node backend
-/// exactly as before. If initialisation fails (no Firestore database
-/// yet, no network, no native config for this platform — e.g. web has
-/// no FirebaseOptions until a web app is registered), the app still
-/// launches and shows a clear, dismissible error banner instead of
-/// crashing. Nothing else reads Firebase in this phase.
-/// Phase 2 (Auth): when Firebase initialised, AppState gets a
-/// RealFirebaseAuthService and the AuthGate above is live. When it
-/// did not initialise, AppState runs backend-only (member login,
-/// demo, Google via the backend) exactly as in Phase 1.
+/// Phase 3 (Firestore data): Firebase is initialised here and
+/// Firestore offline persistence is enabled. If initialisation fails
+/// (no Firestore database yet, no network, no native config for this
+/// platform — e.g. web has no FirebaseOptions until a web app is
+/// registered), the app still launches and shows a clear,
+/// dismissible error banner instead of crashing — and AppState runs
+/// on the Unavailable repository, so every data read shows the plain
+/// "Cloud data unavailable" state instead of fake data.
 Future<({bool ready, String? error})> _initFirebase() async {
   try {
     // No options: Android/iOS read google-services.json /
     // GoogleService-Info.plist. Web has no options yet, so this throws
     // there until a web app is registered (see docs/FIREBASE_SETUP.md).
     await Firebase.initializeApp();
+    configureFirestorePersistence();
     return (ready: true, error: null);
   } catch (e) {
     return (ready: false, error: e.toString());
@@ -70,9 +72,15 @@ void main() async {
     ChangeNotifierProvider(
       create: (_) => AppState(
         initialDarkMode: initialDark,
+        // Firestore is the only data source when Firebase
+        // initialised; otherwise the Unavailable repository makes
+        // every data call report cloud-unavailable honestly.
+        repository: firebase.ready
+            ? FirestoreSplitNestRepository()
+            : const UnavailableSplitNestRepository(),
         // Only wire real Firebase Auth when initialisation
-        // succeeded; otherwise the app runs backend-only and the
-        // login screen hides the email mode.
+        // succeeded; otherwise demo/Google use a local identity and
+        // the login screen hides the email mode.
         firebaseAuth:
             firebase.ready ? RealFirebaseAuthService() : null,
       )..refresh(),
@@ -124,7 +132,9 @@ class _SplitNestAppState extends State<SplitNestApp> {
   }
 
   /// Re-attempt Firebase init from the error banner (e.g. after the
-  /// Firestore database is created or the network comes back).
+  /// Firestore database is created or the network comes back). On
+  /// success the AppState swaps from the Unavailable repository to
+  /// the Firestore one, so the household can load.
   Future<void> _retryFirebase() async {
     final result = await _initFirebase();
     if (mounted) {
@@ -133,12 +143,18 @@ class _SplitNestAppState extends State<SplitNestApp> {
         _firebaseError = result.error;
         _bannerDismissed = false;
       });
+      if (result.ready) {
+        context.read<AppState>().useRepository(
+              FirestoreSplitNestRepository(),
+            );
+      }
     }
   }
 
-  /// Shown only when Firebase init failed. The app keeps working on
-  /// the Node backend; cloud features (Firestore/Auth/FCM) are simply
-  /// unavailable until init succeeds.
+  /// Shown only when Firebase init failed. The app keeps launching
+  /// and shows this banner; sign-in and household data stay
+  /// unavailable (plain cloud-unavailable states) until init
+  /// succeeds — nothing runs on a local backend any more.
   Widget _firebaseErrorBanner() {
     return Material(
       color: Colors.amber.shade100,
@@ -152,8 +168,8 @@ class _SplitNestAppState extends State<SplitNestApp> {
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
-                  'Cloud services unavailable — running on the local '
-                  'backend only. (${_firebaseError ?? 'Firebase init failed'})',
+                  'Cloud services unavailable — sign-in and household '
+                  'data need Firebase. (${_firebaseError ?? 'Firebase init failed'})',
                   style: const TextStyle(fontSize: 12),
                 ),
               ),

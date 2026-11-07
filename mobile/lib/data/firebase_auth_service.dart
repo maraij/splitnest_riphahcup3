@@ -9,12 +9,12 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// never touches [FirebaseAuth] directly. The production
 /// implementation is [RealFirebaseAuthService]; tests inject a fake.
 ///
-/// Design notes (Phase 2):
-/// - Firebase is the IDENTITY layer only. The household data still
-///   lives on the Node backend, which issues its own Bearer sessions
-///   for member passwords and verified Google ID tokens — an
-///   email-only Firebase sign-in therefore has no backend token (see
-///   AppState._applyFirebaseSession, which says so on screen).
+/// Design notes (Phase 2, updated Phase 3):
+/// - Firebase is the IDENTITY layer. The household data lives in
+///   Cloud Firestore ([SplitNestRepository] / FirestoreSplitNest-
+///   Repository) — an email-only Firebase sign-in now loads its
+///   household directly, with no backend token involved (the Phase 2
+///   limit this migration fixes).
 /// - The Firestore profile write is BEST-EFFORT: the Firestore
 ///   database may not exist yet (console creation is still pending).
 ///   It is fire-and-forget, logs when skipped, and NEVER blocks or
@@ -92,9 +92,9 @@ class FirebaseAuthFailure extends FirebaseAuthResult {
 }
 
 /// One demo account: a fixed household member with a Firebase identity
-/// on the demo domain. The passwords are the same demo passwords the
-/// backend seeds (ali123 / ayesha123 / bilal123) so prior behaviour
-/// is preserved.
+/// on the demo domain. The passwords are the demo passwords the app
+/// has always used for its demo accounts (ali123 / ayesha123 /
+/// bilal123).
 class DemoAccount {
   const DemoAccount({
     required this.memberId,
@@ -501,12 +501,16 @@ class RealFirebaseAuthService implements FirebaseAuthService {
       final data = <String, Object?>{
         'displayName': user.displayName,
         'email': user.email?.toLowerCase(),
-        'updatedAt': FieldValue.serverTimestamp(),
+        // Client timestamp, matching the Phase 3 rule in
+        // docs/FIRESTORE_STRUCTURE.md (serverTimestamp sentinels
+        // cannot be exercised against fake_cloud_firestore 4.4.0
+        // and read as null while offline).
+        'updatedAt': Timestamp.now(),
       };
       if (memberId != null) data['legacyMemberId'] = memberId;
       final snap = await ref.get();
       if (!snap.exists) {
-        data['createdAt'] = FieldValue.serverTimestamp();
+        data['createdAt'] = Timestamp.now();
       }
       await ref.set(data, SetOptions(merge: true));
     } catch (e) {

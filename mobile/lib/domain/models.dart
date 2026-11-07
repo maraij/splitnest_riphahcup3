@@ -1,5 +1,5 @@
-/// Domain models — pure data, no HTTP, no Flutter.
-/// JSON parsing lives here; HTTP lives in data/api_client.dart.
+/// Domain models — pure data, no Firestore, no Flutter.
+/// Firestore mapping lives in data/firestore_repository.dart.
 library;
 
 class Member {
@@ -166,6 +166,7 @@ class ExpenseRecord {
     this.date,
     this.splitType,
     this.shares = const [],
+    this.isDemo = false,
   });
   final String id;
   final String title;
@@ -175,6 +176,11 @@ class ExpenseRecord {
   final String? date;
   final String? splitType;
   final List<ExpenseShare> shares;
+
+  /// True when this expense is clearly-labelled DEMO benchmark data
+  /// (see SplitNestRepository.loadDemoBenchmark). Demo rows are never
+  /// mixed silently into a real user's history.
+  final bool isDemo;
   factory ExpenseRecord.fromJson(Map<String, dynamic> j) => ExpenseRecord(
         id: j['id'] as String,
         title: j['title'] as String,
@@ -188,4 +194,36 @@ class ExpenseRecord {
                 .toList() ??
             const [],
       );
+}
+
+/// One settlement (payment) between two members.
+///
+/// A payment is a **record** first and a **verified fact** second:
+/// `status` starts as `recorded` (set by the sender) and moves to
+/// `verified` when an owner/admin confirms it. Either way it counts
+/// in the ledger immediately (Net = Paid − Share + Sent − Received),
+/// exactly as the old backend's settlements did — verification is a
+/// trust flag, not a second posting. A payment never changes total
+/// spending.
+class PaymentRecord {
+  PaymentRecord({
+    required this.id,
+    required this.senderId,
+    required this.recipientId,
+    required this.amount,
+    required this.status,
+    this.verifiedBy,
+    this.createdAt,
+  });
+  final String id;
+  final String senderId;
+  final String recipientId;
+
+  /// Amount, two-decimal string ('250.00').
+  final String amount;
+
+  /// 'recorded' | 'verified'.
+  final String status;
+  final String? verifiedBy;
+  final DateTime? createdAt;
 }

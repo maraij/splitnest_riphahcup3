@@ -145,7 +145,7 @@ class MonthlyViewScreen extends StatelessWidget {
                           EmptyStateIllustration(
                               kind: EmptyArtKind.receipt),
                           SizedBox(height: 8),
-                          Text('No expenses recorded yet in this session',
+                          Text('No expenses recorded yet',
                               style: SplitNestTheme.sectionStyle,
                               textAlign: TextAlign.center),
                         ],
@@ -186,7 +186,7 @@ class MonthlyViewScreen extends StatelessWidget {
                   children: [
                     EmptyStateIllustration(kind: EmptyArtKind.receipt),
                     SizedBox(height: 8),
-                    Text('No expenses recorded yet in this session',
+                    Text('No expenses recorded yet',
                         style: SplitNestTheme.sectionStyle,
                         textAlign: TextAlign.center),
                   ],

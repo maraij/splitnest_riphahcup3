@@ -41,6 +41,39 @@ backend token, so data calls 401 until Phase 3 moves data to Firestore;
 the app shows a plain notice instead of failing silently. Demo and
 Google users are unaffected.
 
+**Phase 3 — Firestore data migration (done, 2026-11-07):** Firestore
+is now the app's **only** data source; the Node backend is retired
+(see `backend/LEGACY.md`). `FirestoreSplitNestRepository`
+(`mobile/lib/data/firestore_repository.dart`) implements the
+`SplitNestRepository` interface (`mobile/lib/data/repository.dart`);
+`AppState` reads/writes through it exclusively — no `API_BASE_URL`,
+no HTTP calls, no backend token/session anywhere in the app (the
+`http` package and `mobile/lib/data/api_client.dart` are gone).
+What changed under the hood: expenses/payments/shopping/fixed
+templates all live in `groups/{gid}/…` subcollections (integer
+paisa, `splits` map sums to amount, payments `recorded` → `verified`,
+checkout and fixed-apply are transactions); balances are computed
+client-side in `mobile/lib/domain/balances.dart`; Firestore offline
+persistence is enabled, and a missing/unreachable database shows a
+plain "Cloud data unavailable — check setup/connection" state instead
+of crashing or faking data. Seeding: `ensureGroup` creates the group
+(`household-<uid>`, PKR 5,000 budget, 3-member roster) on first
+sign-in; the benchmark loads only as clearly-labelled DEMO data via a
+**Load demo benchmark** card shown to demo users only, never
+auto-seeded. This also fixes the Phase 2 limit: email-only Firebase
+users now work end-to-end (identity + Firestore data, no backend
+token). Gates green: `flutter analyze` no issues, `flutter test`
+**117/117** (89 + 28 new Firestore tests, incl. the real repository
+against `FakeFirebaseFirestore` and atomic-checkout tests),
+`flutter build web` succeeds. **Not verified live:** the Firestore
+database does not exist yet and the rules are not deployed, so no
+live-DB verification was possible; the first live pass is a Phase 4
+console step. **Known limitation:** each Firebase user gets their
+own household group (`household-<uid>`) until the invite-accept
+Cloud Function lands — true shared households need Phase 4. See
+[docs/FIRESTORE_STRUCTURE.md](docs/FIRESTORE_STRUCTURE.md) for the
+as-built schema and the divergence notes.
+
 **Still pending (needs a console step, not code):** create the Firestore
 database (production mode, `asia-south1`), deploy `firestore.rules` /
 `storage.rules`, enable Storage. See
@@ -55,37 +88,21 @@ one live pass on a device/emulator after the console steps.
 
 ## Stack
 
-- **Backend:** Node.js 24 + Express 4, SQLite file-based via Node's built-in
-  `node:sqlite` (no native modules). Money is integer paisa internally;
-  JSON carries amounts as two-decimal strings (`"780.00"`).
+- **Backend:** Cloud Firestore (Firebase project `splitnest-b8071`,
+  Spark plan) via `cloud_firestore` — integer paisa, expenses /
+  payments / shopping / fixed templates under `groups/{gid}/…`; see
+  [docs/FIRESTORE_STRUCTURE.md](docs/FIRESTORE_STRUCTURE.md). The
+  Node.js + Express + SQLite backend is retired (see
+  `backend/LEGACY.md`); it is kept only as a reference implementation
+  and for its benchmark tests.
 - **Mobile:** Flutter 3.47.9 (Dart 3.13.7) + Provider, bottom navigation
   Home / Shopping / Expenses & Settle.
-- **Database file:** `backend/splitnest.db` — created and seeded on first
-  backend start (members M01/M02/M03, budget PKR 5,000.00, pending items
-  Milk bottle ×2 and Rice pack ×1). Benchmark expenses are **not** preloaded.
+- **Database:** Firestore — created on first sign-in by `ensureGroup`
+  (members M01/M02/M03, budget PKR 5,000.00). Benchmark expenses are
+  **not** preloaded; a demo user loads them from Home via **Load demo
+  benchmark** (labelled DEMO).
 
-## Run the backend
-
-```sh
-cd backend
-npm install
-npm start          # listens on http://0.0.0.0:3000
-# PORT=3000 DB_PATH=./splitnest.db node src/server.js
-```
-
-Seven endpoints only:
-
-| Method | Path | Purpose |
-|---|---|---|
-| GET | `/api/members` | `[{id, name}]` |
-| GET | `/api/shopping` | Shopping items |
-| POST | `/api/shopping` | Add item (`title`, `unit` pack/dozen/bottle/bag, `requested_qty`) |
-| POST | `/api/shopping/checkout` | Atomic checkout → exactly one expense |
-| POST | `/api/expenses` | Manual expense (equal or custom split) |
-| GET | `/api/balances` | Net balances (sum = 0.00) + budget summary |
-| POST | `/api/settle` | Debtor → creditor payment |
-
-## Run the mobile app
+## Run the mobile app (no backend needed any more)
 
 ```sh
 cd mobile
@@ -93,28 +110,19 @@ flutter pub get
 flutter run
 ```
 
-API base URL — pass it at build/run time, or the app defaults to the
-Android emulator host loopback:
-
-```sh
-# Android emulator
-flutter run --dart-define=API_BASE_URL=http://10.0.2.2:3000
-# Physical Android/iOS device on the same Wi-Fi (use your laptop's LAN IP)
-flutter run --dart-define=API_BASE_URL=http://192.168.1.10:3000
-# Web on the same machine
-flutter run -d chrome --dart-define=API_BASE_URL=http://127.0.0.1:3000
-```
-
-A web build already exists at `mobile/build/web/` (built with
-`API_BASE_URL=http://127.0.0.1:3000`); serve it with any static server,
-e.g. `python3 -m http.server 8123` inside `mobile/build/web/`, while the
-backend runs on port 3000.
+The app talks to Cloud Firestore directly (Firebase config from
+`firebase_options.dart` / `google-services.json`); there is no
+`API_BASE_URL` and no local server to start. If the Firestore
+database has not been created yet (pending console step), the app
+shows a plain "Cloud data unavailable" state instead of crashing.
 
 ## Benchmark (reproduce exactly)
 
-From a fresh database (delete `backend/splitnest.db` first, then start
-the backend), or run `npm test` in `backend/` — the benchmark test does
-this automatically against a temporary database:
+Sign in as a demo user and tap **Load demo benchmark** on Home (or
+run `flutter test` in `mobile/` — `firestore_test.dart` reproduces
+it against the Firestore repository). The legacy backend reproduces
+it from a fresh database (delete `backend/splitnest.db` first, then
+start the backend), or run `npm test` in `backend/`:
 
 1. Checkout Milk + Rice: total `780.00`, payer Ali, equal split → 260.00 each.
 2. Cleaning Supplies: `900.00`, payer Ayesha, equal Ali + Ayesha → 450.00 each.
@@ -232,16 +240,11 @@ processes while it runs.
   (`.github/workflows/android-apk.yml`) — local Gradle builds fail on
   this VM. The Nov 5 phone-variant APK (real Google Sign-In) was
   delivered; see the rebuild status above for the current state.
-- **Auth:** real Google Sign-In via Firebase Auth plus email/password
-  login with 3 demo accounts were added Nov 5 (see `mobile/lib/data/
-  google_auth_service.dart`). The old "no password" member selector is
-  gone; the Nov 7 rebuild moves all auth to Firebase Auth.
-- **Surprise features not implemented.** Annexure A lists four options, but
-  none was released, so none was built (no `/api/balances/simplify`,
-  no tax/discount, no category warnings, no recurring expenses).
-- **Expense history:** only the 7 specified endpoints exist, so there is
-  no `GET /api/expenses`. The mobile app shows expenses added in the
-  current session; balances and budget always come live from the backend.
+- **Auth:** real Firebase Auth (email/password + Google + demo
+  accounts) since Phase 2; identity is the Firebase UID, there is no
+  backend token. Email-only users work end-to-end since Phase 3.
+- **Expense history:** persisted in Firestore since Phase 3
+  (`groups/{gid}/expenses`, newest first) — no longer session-only.
 - **Month scope:** budget totals count the current month's expenses;
   balances are computed over all recorded expenses and settlements.
 - Pushed to GitHub: https://github.com/maraij/splitnest_riphahcup3

@@ -14,8 +14,9 @@ import '../../core/widgets/illustrations.dart';
 import '../../core/widgets/member_avatar.dart';
 import '../../core/widgets/money_text.dart';
 
-/// Expenses tab: recent-expense list (session-only history — there is
-/// no GET /api/expenses endpoint) + an Add New Expense bottom sheet.
+/// Expenses tab: the group's recorded expense history (loaded from
+/// Firestore — it persists across reloads) + an Add New Expense
+/// bottom sheet.
 ///
 /// Search + filters and the Quick-add favourites below are purely
 /// local UI state; the list itself always comes from AppState.
@@ -47,7 +48,7 @@ class _ExpensesScreenState extends State<ExpensesScreen> {
     }).toList();
   }
 
-  /// One-tap re-add of a favourite: posts a REAL expense via the API
+  /// One-tap re-add of a favourite: posts a REAL expense to Firestore
   /// (same title, amount, payer and split as its last occurrence,
   /// dated today) and refreshes the single store.
   Future<void> _quickAdd(AppState state, FavouriteExpense fav) async {
@@ -138,8 +139,8 @@ class _ExpensesScreenState extends State<ExpensesScreen> {
             ),
             const SizedBox(height: 16),
           ],
-          // Fixed monthly expenses (templates, persisted in the
-          // backend). The seeded Internet + Electricity templates are
+          // Fixed monthly expenses (templates, persisted in Firestore).
+          // The seeded Internet + Electricity templates are
           // equal splits; the benchmark's custom-split Internet
           // expense is separate and untouched by this section.
           const Text('Fixed monthly expenses',
@@ -217,7 +218,7 @@ class _ExpensesScreenState extends State<ExpensesScreen> {
                       EmptyStateIllustration(
                           kind: EmptyArtKind.receipt),
                       SizedBox(height: 8),
-                      Text('No expenses added yet in this session',
+                      Text('No expenses recorded yet',
                           style: SplitNestTheme.sectionStyle,
                           textAlign: TextAlign.center),
                     ],
@@ -246,7 +247,7 @@ class _ExpensesScreenState extends State<ExpensesScreen> {
                     memberId: e.payerId,
                     name: memberName(state.members, e.payerId),
                   ),
-                  title: Text(e.title),
+                  title: Text(e.isDemo ? '${e.title} · DEMO' : e.title),
                   subtitle: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -318,7 +319,7 @@ class _MemberExpensesCard extends StatelessWidget {
             const SizedBox(height: 8),
             if (summary.expenses.isEmpty)
               const Text(
-                'No expenses recorded yet in this session',
+                'No expenses recorded yet',
                 style: SplitNestTheme.supportingStyle,
               )
             else
@@ -353,7 +354,7 @@ class _FixedMonthlySection extends StatelessWidget {
   final AppState state;
 
   /// This member's equal share of one template (exact, remainder
-  /// paisa in member-ID order — same rule as the backend).
+  /// paisa in member-ID order — the preserved split rule).
   String _myShare(FixedExpense f) {
     final paisa = parsePaisa(f.amount) ?? 0;
     final shares = equalSplit(paisa, f.splitMemberIds);
@@ -529,7 +530,7 @@ Future<void> _openAddExpense(BuildContext context, AppState state) async {
 
 /// Add New Expense bottom sheet.
 ///
-/// Split strategies — the UI labels ARE the backend split types,
+/// Split strategies — the UI labels ARE the Firestore split types,
 /// no translation layer:
 /// - Equal: pick the members who share, split evenly among the chosen
 ///   (remainder paisa in member-ID order).

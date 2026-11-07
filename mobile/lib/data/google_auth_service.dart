@@ -7,7 +7,7 @@ import 'firebase_auth_service.dart';
 /// (Firebase project SplitNest). A client id is a public identifier,
 /// not a secret — the same value ships inside the built app through
 /// the Firebase config. It is the serverClientId Google needs to
-/// issue an ID token our backend can verify.
+/// issue an ID token for Firebase Auth.
 const String googleServerClientId =
     '780339874841-o9eaoan4imbo23gjge4s99cah5pqkgpo.apps.googleusercontent.com';
 
@@ -18,7 +18,7 @@ sealed class GoogleSignInResult {
   const GoogleSignInResult();
 }
 
-/// Signed in: the backend can verify [idToken], and the UI can show
+/// Signed in: Firebase Auth verified [idToken], and the UI can show
 /// [email] in the member picker. [firebaseUid] is set when the same
 /// sign-in also completed Firebase Auth (the real implementation);
 /// fakes leave it null.
@@ -62,17 +62,12 @@ abstract class GoogleAuthService {
 /// verified against google_sign_in 7.2.0 in the pub cache):
 /// initialize once with the Web client id, then authenticate() shows
 /// the account chooser / Gmail + password flow and returns the
-/// account. Its ID token is used TWICE:
-///
-/// 1. Firebase Auth: signInWithCredential(
-///      GoogleAuthProvider.credential(idToken: idToken))
-///    — this is the real Firebase Google sign-in. A Google user
-///    arrives email-verified, so the verification gate does not
-///    apply. (v7's authentication object carries only an ID token,
-///    no access token — the credential call takes idToken alone.)
-/// 2. The Node backend: POST /api/auth/google verifies the same ID
-///    token against Google before issuing the household session
-///    (that step lives in AppState.loginWithGoogle, unchanged).
+/// account. Its ID token is used for Firebase Auth:
+/// signInWithCredential(GoogleAuthProvider.credential(idToken:
+/// idToken)) — this is the real Firebase Google sign-in. A Google
+/// user arrives email-verified, so the verification gate does not
+/// apply. (v7's authentication object carries only an ID token,
+/// no access token — the credential call takes idToken alone.)
 ///
 /// A cancelled chooser is reported as [GoogleSignInCancelled], never
 /// as an error and never as a session. A Firebase rejection is a
@@ -112,7 +107,7 @@ class RealGoogleAuthService implements GoogleAuthService {
       // Real Firebase sign-in with the Google credential. If Firebase
       // is not initialised (or the Google provider is off), this
       // throws and the Google login fails with a plain message
-      // instead of silently falling back to a backend-only session.
+      // instead of silently succeeding without an identity.
       try {
         final credential = await _auth.signInWithCredential(
           GoogleAuthProvider.credential(idToken: idToken),
