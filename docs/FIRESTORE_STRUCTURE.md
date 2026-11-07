@@ -3,17 +3,18 @@
 **PRACTICE ONLY — NOT FOR SUBMISSION.** Production Firestore model for
 the SplitNest practice app (Flutter + Firebase).
 
-**Status — Phase 3 implemented (2026-11-07): Firestore is now the
-app's only data source.** `mobile/lib/data/firestore_repository.dart`
-(`FirestoreSplitNestRepository`) implements the `SplitNestRepository`
-interface in `mobile/lib/data/repository.dart`; `AppState` reads and
-writes through it exclusively. The Node/SQLite backend is retired —
-see `backend/LEGACY.md`. **The database itself still does not exist
-yet** (console creation is a pending manual step) and the rules are
-not deployed, so nothing has been verified against a live Firestore
-DB; coverage is via `mobile/test/firestore_test.dart` (in-memory fake
+**Status — Phase 4 implemented (2026-11-07): Firestore-backed
+invitations and shared households are in.** `invitations/{code}`
+(the document id IS the 12-character invite code), client-side
+accept transaction (members map + mirror + accepted status, no
+deployed Function needed), group switching with a persisted
+current group. See `docs/INVITATIONS.md` for the full Phase 4
+write-up. The database itself still does not exist yet (console
+creation is a pending manual step) and the rules are not deployed,
+so nothing has been verified against a live Firestore DB; coverage
+is via `mobile/test/invitations_test.dart` (in-memory fake
 repository + `FakeFirebaseFirestore` against the real repository
-class). See `docs/FIREBASE_SETUP.md` for the pending console steps.
+class, plus AppState end-to-end invite → accept → switch).
 
 Project: **SplitNest** (`splitnest-b8071`, Spark plan).
 Rules: `firestore.rules` (repo root). Storage rules: `storage.rules`.
@@ -30,14 +31,20 @@ Rules: `firestore.rules` (repo root). Storage rules: `storage.rules`.
    (`groups/{gid}/shopping`, `groups/{gid}/fixedExpenses`) — the
    design said "later"; Phase 3 moved them in so checkout and
    fixed-apply could be transactional.
-3. **Group per user, for now.** `ensureGroup` creates a deterministic
-   group `household-<uid>` owned by the signing-in user. The rules
-   make the `members` map client-read-only and the invite-accept
-   Function is not deployed, so a client cannot join another user's
-   group yet. True shared households (one group, three Firebase
-   users) need the invite-accept Function (Phase 4). The repository
-   interface and the in-memory test fake already model the shared
-   household; only the group-resolution step is per-user.
+3. **Group per user, for now — plus joining by invitation
+   (Phase 4).** `ensureGroup` creates a deterministic group
+   `household-<uid>` owned by the signing-in user. Since Phase 4
+   the client accept flow can move users between groups: accepting
+   an invitation adds the invitee to the invited group (members
+   map + mirror, in one transaction — see
+   `docs/INVITATIONS.md`), and `AppState` switches the current
+   group among the user's groups (own group + accepted
+   invitations), persisted per UID in SharedPreferences. The
+   `members` map is still Functions-maintained for every other
+   join/leave/role change; the one client exception is the
+   invitation self-join, authorised by the pending invitation
+   itself (see `firestore.rules`: `isPendingInvite` /
+   `canSelfJoin`).
 4. **Timestamps are client time (`Timestamp.now()`), not
    `FieldValue.serverTimestamp()`.** `fake_cloud_firestore` 4.4.0
    cannot handle the server-timestamp sentinel (it needs
@@ -83,6 +90,49 @@ Rules: `firestore.rules` (repo root). Storage rules: `storage.rules`.
    id). Doc ids are random auto-ids, so sorting by id alone would
    scramble the list — and the checkout title (`Shopping: Milk,
    Rice`) is built from this order.
+
+10. **Invitation expiry is derived, not just stored (Phase 4).**
+   A stored-`pending` invitation past its `expiresAt` counts as
+   `expired` everywhere (`Invitation.isExpired` /
+   `effectiveStatus`): list filtering, the accept guard, and an
+   admin-side sweep that stores `expired` on the admin listing
+   path and on the duplicate check during create. The invitee's
+   own list never writes the sweep (the rules forbid it) — it
+   derives expiry client-side.
+
+## Phase 4 implementation notes (as built)
+
+- **The invitation document id IS the invite code** (12
+  secure-random characters from an unambiguous alphabet; see
+  `mobile/lib/domain/invitations.dart`). Code entry is a direct
+  document read, and the rules authorise a self-join by reading
+  the invitation by id.
+- **The shareable link is plain text**
+  (`https://splitnest.app/join?code=<CODE>`). No App Links /
+  deep-link auto-join is wired and no hosting exists behind that
+  domain — the code-entry + share path is the working mechanism.
+- **The accept transaction does not read the group doc** (the
+  invitee is not a member yet, so the rules deny the read). The
+  blind members-map update is authorised by the rules' self-join
+  branch and fails when the group does not exist.
+- **Rules authorise the join against the PENDING invitation**,
+  not the accepted one (transaction writes commit together, so
+  rules see the pre-commit state). See `docs/INVITATIONS.md`.
+- **No new composite indexes were needed** (duplicate check:
+  `groupId + status`; joined-groups lookup: `invitedEmail +
+  status` — both already in `firestore.indexes.json`).
+- **`users/{uid}` gained a `groupIds` array** (best-effort,
+  `arrayUnion` on accept) so `listUserGroups` can also find joined
+  groups from the profile, not only from the invitation trail.
+  `groupId` (singular, the own group) is still written by
+  `ensureGroup` as before.
+- **AppState never awaits SharedPreferences on a load path.**
+  The prefs instance is cached from a background load at
+  construction; the current-group choice is read from the cache
+  (or the in-memory override set by a switch/accept). Awaiting
+  `getInstance()` inside `refresh()` hung widget tests without
+  mock values, and a `Future.timeout` around it left a pending
+  Timer that failed tests at teardown — both are gone.
 
 ## Money rules (carried over unchanged from SQLite)
 
@@ -130,8 +180,10 @@ Rules: `firestore.rules` (repo root). Storage rules: `storage.rules`.
 - The **`members` subcollection** is the queryable mirror (list members
   with display names/photos, paginate, listen for joins/leaves).
   Cloud Functions keep the two in sync on join/leave/role change;
-  clients never write the map directly (rules deny it — see
-  `firestore.rules`).
+  clients never write the map directly — except the Phase 4
+  invitation self-join (see `docs/INVITATIONS.md` and the
+  `canSelfJoin` rule), which is the one client write the rules
+  allow, authorised by the pending invitation itself.
 
 ## `users/{uid}`
 
@@ -146,6 +198,7 @@ only its own doc.
 | `photoUrl` | string? | Google photo URL, or Storage path after upload |
 | `legacyMemberId` | string? | Link to the old Node backend member (`M01`…), used only during migration |
 | `groupId` | string? | The user's household group (`household-<uid>` as built in Phase 3); written best-effort by `ensureGroup` |
+| `groupIds` | list<string>? | Phase 4: every group the user belongs to (own + joined by invitation); `arrayUnion` on accept, best-effort — used by `listUserGroups` alongside the invitation trail |
 | `fcmTokens` | map<string, Timestamp> | Device tokens, keyed by token; pruned by Functions on send failure |
 | `createdAt` | Timestamp | Client timestamp (`Timestamp.now()` as built; see Phase 3 notes) |
 | `updatedAt` | Timestamp | Updated on profile edits |
@@ -187,10 +240,14 @@ Ali, Ayesha, Bilal — but the model supports many).
 | `currency` | string | Always `PKR` for now |
 | `members` | map<string, map> | `{uid: {role, joinedAt}}` — rules source of truth (see above) |
 | `inviteCode` | string? | Optional short join code (later phase; not used while email invites are the flow) |
+| `joinInvitationId` | string? | Phase 4: id (= code) of the invitation that let the latest joiner in — audit trail written by the client accept flow; overwritten by each later join |
 
 Read: any UID present in `members`. Write: only `owner`/`admin`
 may update `name`/`budgetPaisa`; the `members` map itself is
-client-read-only (Functions maintain it on invite accept / removal).
+client-read-only (Functions maintain it on invite accept / removal)
+EXCEPT for the Phase 4 invitation self-join (the invitee adding
+only themselves, authorised by a pending invitation — see
+`firestore.rules` `canSelfJoin` and `docs/INVITATIONS.md`).
 Delete: `owner` only.
 
 ### Roles
@@ -213,9 +270,13 @@ Queryable mirror of the `members` map (kept in sync by Functions).
 | `role` | string | `owner` \| `admin` \| `member` |
 | `legacyMemberId` | string? | `M01`… during migration |
 | `joinedAt` | Timestamp | |
+| `invitationId` | string? | Phase 4: the invite code that authorised this join (set by the client accept flow) |
+| `uid` | string? | Phase 4: the member's Firebase UID (the doc id is the UID for joined members) |
 
 Read: group members. Write: `owner`/`admin` only (role changes,
-removal); the doc is created by the invite-accept Function.
+removal); the doc is created by the invite-accept Function — or,
+until Functions deploy, by the Phase 4 client accept flow for the
+invitee's own doc, authorised by the pending invitation.
 
 ## `groups/{groupId}/expenses/{expenseId}`
 
@@ -276,7 +337,10 @@ after recording it. Delete: `owner`/`admin` only.
 ## `invitations/{invitationId}`
 
 Top-level (not under a group) so the invitee can read it before
-they are a member of the group.
+they are a member of the group. **Phase 4, as built: the document
+id IS the invite code** — a 12-character secure-random code (see
+`docs/INVITATIONS.md` for the exact format and the shareable
+link). Full write-up: `docs/INVITATIONS.md`.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -284,16 +348,25 @@ they are a member of the group.
 | `groupName` | string | Denormalised for the invite email/screen |
 | `invitedEmail` | string | Lower-cased; must match the invitee's Auth email |
 | `invitedBy` | string (uid) | Inviting owner/admin |
-| `role` | string | Role granted on accept (`member` by default) |
+| `inviterName` | string? | Denormalised inviter display name |
+| `role` | string | Role granted on accept (`member` by default; `admin` only when the owner grants it) |
 | `status` | string | `pending` \| `accepted` \| `revoked` \| `expired` |
 | `createdAt` | Timestamp | |
 | `expiresAt` | Timestamp | `createdAt + 7 days` |
+| `acceptedBy` | string? (uid) | Set by the client accept flow |
+| `acceptedAt` | Timestamp? | Set by the client accept flow |
 
 Read: the inviter, group owner/admins, and the invitee
 (`request.auth.token.email == invitedEmail`). Create: group
-owner/admin only. Update: owner/admin may set `status = 'revoked'`;
-the invitee may set `status = 'accepted'` (the accept Function then
-adds them to the group). Delete: nobody from a client.
+owner/admin only, as `pending`, with a future `expiresAt` and
+role `member` (or `admin` only by the owner). Update: owner/admin
+may set `status = 'revoked'` or sweep `pending → 'expired'`; the
+invitee may set `status = 'accepted'` **with `acceptedBy` /
+`acceptedAt`** (the accept transaction then adds them to the
+group client-side — the Function is a redundant notification path
+once deployed). A stored-`pending` invitation past its expiry
+counts as `expired` everywhere (derived status + admin sweep).
+Delete: nobody from a client.
 
 ## `groups/{groupId}/shopping/{itemId}` (Phase 3)
 
@@ -392,27 +465,35 @@ Shopping and fixed-expense templates **are** in Firestore since
 Phase 3 (see the sections above); the earlier "later" mapping is
 done.
 
-## Migration status (Phase 3 done — what remains)
+## Migration status (Phase 4 done — what remains)
 
 Phase 3 (2026-11-07) completed the migration: the app's only data
 source is Firestore; the Node backend is retired (see
-`backend/LEGACY.md`). What is still outstanding, in order:
+`backend/LEGACY.md`). Phase 4 (2026-11-07) added Firestore-backed
+invitations and shared households, fully client-side (see
+`docs/INVITATIONS.md`). What is still outstanding, in order:
 
 1. **Console steps** (manual, see `docs/FIREBASE_SETUP.md`): create
    the Firestore database (production mode, `asia-south1`), deploy
    `firestore.rules` / `storage.rules`, enable Storage and the
    Email/Password provider. Nothing has been verified against a live
    DB yet.
-2. **Cloud Functions deploy** (Phase 4): invite-accept (adds the
-   invitee to the group's `members` map + mirror), activity-log and
-   notification triggers. Until then: one group per Firebase user
-   (`household-<uid>`), activity client writes are best-effort
-   no-ops, and no notifications are produced.
-3. **Shared household** follows from (2): once invite-accept lands,
-   the three demo users can share one group instead of three
-   per-user groups; the repository interface already supports it.
+2. **Cloud Functions deploy**: activity-log and notification
+   triggers, plus `onInvitationAccepted` — now a REDUNDANT path,
+   not a requirement: the client accept transaction already adds
+   the member, and the Function only re-checks the accepted
+   transition (reading `acceptedBy`, which the client now sets)
+   and notifies the inviter. Until Functions deploy: activity
+   client writes are best-effort no-ops, and no notifications are
+   produced. The scheduled monthly summary still needs Blaze.
+3. **Shared household** is done client-side since Phase 4: the
+   three demo users can share one group by invitation instead of
+   three per-user groups; `AppState` switches the current group
+   among the user's groups.
 4. **Live verification pass**: one live sign-up/sign-in + benchmark
    load on a device/emulator after the console steps, to confirm
    the rules accept the Phase 3 write shapes (group create with the
    creator as owner, expense create with UID-keyed splits, payment
-   verify by owner).
+   verify by owner) — **plus a live two-user invite → accept**
+   (the rules' self-join branch has only been exercised against
+   `FakeFirebaseFirestore`, which does not enforce rules).

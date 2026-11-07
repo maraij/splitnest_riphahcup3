@@ -10,6 +10,7 @@ import 'features/auth/login_screen.dart';
 import 'features/auth/verification_screen.dart';
 import 'features/expenses/expenses_screen.dart';
 import 'features/home/home_screen.dart';
+import 'features/invite/invite_screen.dart';
 import 'features/monthly/monthly_view_screen.dart';
 import 'features/profile/profile_screen.dart';
 import 'features/settle/settle_screen.dart';
@@ -274,6 +275,7 @@ class _HomeScaffoldState extends State<_HomeScaffold> {
       HomeScreen(
         onGoToShopping: () => widget.onIndexChanged(1),
         onGoToMonthly: () => _openScreen(context, const MonthlyViewScreen()),
+        onGoToInvite: () => _openScreen(context, const InviteScreen()),
       ),
       const ShoppingScreen(),
       const ExpensesScreen(),
@@ -437,6 +439,16 @@ class _HomeScaffoldState extends State<_HomeScaffold> {
                 onChanged: (_) =>
                     context.read<AppState>().toggleTheme(),
               ),
+            ),
+            // Invite & households sits below the theme switch so the
+            // switch keeps its position in the drawer list.
+            ListTile(
+              leading: const Icon(Icons.group_add_outlined),
+              title: const Text('Invite & households'),
+              onTap: () {
+                Navigator.of(context).pop();
+                _openScreen(context, const InviteScreen());
+              },
             ),
             ListTile(
               leading: const Icon(Icons.logout),

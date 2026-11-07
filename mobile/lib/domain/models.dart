@@ -2,6 +2,8 @@
 /// Firestore mapping lives in data/firestore_repository.dart.
 library;
 
+import 'invitations.dart';
+
 class Member {
   Member({required this.id, required this.name});
   final String id;
@@ -226,4 +228,105 @@ class PaymentRecord {
   final String status;
   final String? verifiedBy;
   final DateTime? createdAt;
+}
+
+/// One household the signed-in user belongs to, for the group
+/// switcher (Phase 4). [role] is the user's own role in that group.
+class GroupSummary {
+  const GroupSummary({
+    required this.groupId,
+    required this.name,
+    required this.budgetPaisa,
+    this.role,
+  });
+  final String groupId;
+  final String name;
+  final int budgetPaisa;
+  final String? role;
+}
+
+/// One invitation to join a household (Phase 4, top-level
+/// `invitations` collection).
+///
+/// The document id IS the invite code (see
+/// `domain/invitations.dart`): a 12-character code from an
+/// unambiguous alphabet, generated with a cryptographically secure
+/// random source. That makes "enter invite code" a direct document
+/// read, and lets the security rules authorise a self-join by
+/// reading the invitation doc by id.
+class Invitation {
+  const Invitation({
+    required this.id,
+    required this.groupId,
+    required this.groupName,
+    required this.invitedEmail,
+    required this.invitedBy,
+    this.inviterName,
+    required this.role,
+    required this.status,
+    required this.createdAt,
+    required this.expiresAt,
+    this.acceptedBy,
+    this.acceptedAt,
+  });
+
+  /// The invite code (document id).
+  final String id;
+  final String groupId;
+  final String groupName;
+
+  /// Lower-cased; must match the invitee's Auth email to accept.
+  final String invitedEmail;
+
+  /// UID of the owner/admin who sent the invite.
+  final String invitedBy;
+  final String? inviterName;
+
+  /// Role granted on accept: `member` (default) or `admin`
+  /// (owner-granted only).
+  final String role;
+
+  /// Stored status: `pending` | `accepted` | `revoked` | `expired`.
+  final String status;
+  final DateTime createdAt;
+
+  /// `createdAt + 7 days`.
+  final DateTime expiresAt;
+
+  /// UID of the user who accepted (set by the accept flow).
+  final String? acceptedBy;
+  final DateTime? acceptedAt;
+
+  /// A stored-`pending` invitation whose expiry has passed counts as
+  /// expired everywhere — list filtering, the accept guard, and the
+  /// admin-side sweep all use this, never the stored status alone.
+  bool get isExpired =>
+      status == 'pending' && DateTime.now().isAfter(expiresAt);
+
+  /// The status the UI and the accept guard use: `expired` when a
+  /// pending invite is past its expiry, otherwise the stored status.
+  String get effectiveStatus => isExpired ? 'expired' : status;
+
+  bool get isPending => effectiveStatus == 'pending';
+
+  /// The code as shown to humans: `XXXX-XXXX-XXXX`.
+  String get displayCode => formatInviteCode(id);
+
+  /// The shareable link (plain text; see docs/INVITATIONS.md).
+  String get link => inviteLinkFor(id);
+
+  Invitation copyWith({String? status, String? acceptedBy}) => Invitation(
+        id: id,
+        groupId: groupId,
+        groupName: groupName,
+        invitedEmail: invitedEmail,
+        invitedBy: invitedBy,
+        inviterName: inviterName,
+        role: role,
+        status: status ?? this.status,
+        createdAt: createdAt,
+        expiresAt: expiresAt,
+        acceptedBy: acceptedBy ?? this.acceptedBy,
+        acceptedAt: acceptedAt,
+      );
 }

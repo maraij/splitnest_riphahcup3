@@ -194,6 +194,85 @@ abstract class SplitNestRepository {
     required String actorName,
   });
 
+  // ---- Invitations + shared households (Phase 4) ----
+  // See docs/INVITATIONS.md. The invitation document id IS the
+  // invite code (12 secure-random characters); expiry is 7 days
+  // from creation; a stored-`pending` invitation past its expiry
+  // counts as expired everywhere (derived status, accept guard,
+  // admin-side sweep).
+
+  /// Sends an invitation to join [groupId]. Only a group owner or
+  /// admin may invite (enforced here and by the security rules);
+  /// granting the `admin` role additionally requires the actor to be
+  /// the group owner. Rejects an invalid or own email, an unknown
+  /// role, and a second ACTIVE (pending, unexpired) invitation for
+  /// the same email + group. Returns the created invitation — its
+  /// [Invitation.id] is the shareable code.
+  Future<Invitation> createInvitation({
+    required String groupId,
+    required String groupName,
+    required String invitedEmail,
+    required String role,
+    required String actorUid,
+    required String? actorEmail,
+    required String actorName,
+  });
+
+  /// All invitations for one group, newest first. Expired pending
+  /// invitations are swept to stored status `expired` by this call
+  /// (admin path — the rules only let an owner/admin write that).
+  /// Callers must be owner/admin; a plain member listing them is
+  /// denied by the rules.
+  Future<List<Invitation>> getGroupInvitations(String groupId);
+
+  /// All invitations addressed to one email (any status), newest
+  /// first. Expiry is derived client-side here — the invitee cannot
+  /// write the sweep, so a past-expiry pending invite is returned
+  /// with stored status `pending` and `isExpired == true`.
+  Future<List<Invitation>> getMyInvitations(String email);
+
+  /// Revokes a pending invitation. Only a group owner/admin may do
+  /// this. A non-pending invitation cannot be revoked.
+  Future<void> revokeInvitation({
+    required String groupId,
+    required String invitationId,
+    required String actorUid,
+  });
+
+  /// Accepts an invitation, atomically: verifies status pending +
+  /// not expired + [email] matches the invited email, then adds the
+  /// user to the group's members map AND the members subcollection
+  /// mirror AND marks the invitation accepted (with `acceptedBy`).
+  /// This runs entirely client-side in a Firestore transaction — it
+  /// does NOT depend on the (undeployed) `onInvitationAccepted`
+  /// Cloud Function; that Function is only a redundant notification
+  /// path once deployed. The activity entry is best-effort (the
+  /// rules make activity Functions-written until they deploy).
+  /// Returns the accepted invitation.
+  Future<Invitation> acceptInvitation({
+    required String invitationId,
+    required String actorUid,
+    required String email,
+    required String displayName,
+  });
+
+  /// Every group [uid] belongs to: their own `household-<uid>`
+  /// group plus every group joined by accepting an invitation.
+  /// The user's own group comes first. A group that no longer
+  /// exists (or the user no longer belongs to) is skipped, never
+  /// faked.
+  Future<List<GroupSummary>> listUserGroups({
+    required String uid,
+    required String? email,
+  });
+
+  /// The user's own role (`owner` | `admin` | `member`) in one
+  /// group, or null when they are not a member of it.
+  Future<String?> getMyRole({
+    required String groupId,
+    required String uid,
+  });
+
   /// Persists one activity entry to the cloud log. Best-effort on
   /// the real database: the security rules make activity
   /// Functions-written only, so a client write is denied until the
@@ -345,6 +424,56 @@ class UnavailableSplitNestRepository implements SplitNestRepository {
     required String groupId,
     required String actorUid,
     required String actorName,
+  }) =>
+      _unavailable();
+
+  @override
+  Future<Invitation> createInvitation({
+    required String groupId,
+    required String groupName,
+    required String invitedEmail,
+    required String role,
+    required String actorUid,
+    required String? actorEmail,
+    required String actorName,
+  }) =>
+      _unavailable();
+
+  @override
+  Future<List<Invitation>> getGroupInvitations(String groupId) =>
+      _unavailable();
+
+  @override
+  Future<List<Invitation>> getMyInvitations(String email) => _unavailable();
+
+  @override
+  Future<void> revokeInvitation({
+    required String groupId,
+    required String invitationId,
+    required String actorUid,
+  }) =>
+      _unavailable();
+
+  @override
+  Future<Invitation> acceptInvitation({
+    required String invitationId,
+    required String actorUid,
+    required String email,
+    required String displayName,
+  }) =>
+      _unavailable();
+
+  @override
+  Future<List<GroupSummary>> listUserGroups({
+    required String uid,
+    required String? email,
+  }) =>
+      _unavailable();
+
+  @override
+  Future<String?> getMyRole({
+    required String groupId,
+    required String uid,
   }) =>
       _unavailable();
 

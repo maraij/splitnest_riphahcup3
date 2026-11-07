@@ -74,6 +74,31 @@ Cloud Function lands — true shared households need Phase 4. See
 [docs/FIRESTORE_STRUCTURE.md](docs/FIRESTORE_STRUCTURE.md) for the
 as-built schema and the divergence notes.
 
+**Phase 4 — Invitations & shared households (done, 2026-11-07):**
+Firestore-backed invitations, fully client-side — no deployed
+Function needed. The invitation document id IS the invite code (12
+secure-random characters); shareable link
+`https://splitnest.app/join?code=<CODE>` (plain text — no App
+Links / deep-link auto-join wired); expiry 7 days with derived
+expired status + admin sweep; no duplicate active invite per
+email + group; owner/admin-only invite/revoke, admin grant by
+owner only. Accepting runs one Firestore transaction (members map
++ mirror + accepted status) and the joined group becomes current;
+`AppState` switches between the user's households with the choice
+persisted per UID. The `onInvitationAccepted` Function is now a
+redundant notification path once deployed, not a requirement.
+Invite UI: drawer / Home → Invite & households (send, share via
+system sheet / WhatsApp / copy link & code, revoke, accept from
+list or by code). Gates green: `flutter analyze` no issues,
+`flutter test` **143/143** (117 + 26 new invitation tests, incl.
+the real repository against `FakeFirebaseFirestore` and an
+AppState invite → accept → switch end-to-end test),
+`flutter build web` succeeds. **Not verified live:** the
+Firestore database still does not exist, the rules (which gained
+a narrow invitation self-join branch) are not deployed, and no
+real two-device accept has been run. See
+[docs/INVITATIONS.md](docs/INVITATIONS.md) for the full write-up.
+
 **Still pending (needs a console step, not code):** create the Firestore
 database (production mode, `asia-south1`), deploy `firestore.rules` /
 `storage.rules`, enable Storage. See

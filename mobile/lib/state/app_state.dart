@@ -11,6 +11,7 @@ import '../data/google_auth_service.dart';
 import '../data/repository.dart';
 import '../domain/balances.dart';
 import '../domain/insights.dart';
+import '../domain/invitations.dart';
 import '../domain/models.dart';
 
 /// AppState — the SINGLE source of truth for the whole app.
@@ -41,6 +42,10 @@ class AppState extends ChangeNotifier {
     // When the caller did not preload the saved theme (tests), load
     // it here; main() preloads it before first paint instead.
     if (initialDarkMode == null) _loadThemeMode();
+    // Warm the prefs cache in the background (see [_prefs]): the
+    // first refresh after login reads the persisted current group
+    // from it without ever awaiting the store.
+    unawaited(_ensurePrefs());
     _loadCaps();
     _loadProfileImages();
     // Phase 2 (Auth): when a Firebase auth service is wired in
@@ -220,6 +225,44 @@ class AppState extends ChangeNotifier {
   /// The household group this session loads data from. Null until
   /// the first successful refresh after login.
   String? groupId;
+
+  /// Alias for [groupId]: the currently selected household
+  /// (Phase 4 — the user may belong to several groups and switch
+  /// between them; persisted per user, see [switchGroup]).
+  String? get currentGroupId => groupId;
+
+  /// Every group the signed-in user belongs to (own household first),
+  /// for the group switcher.
+  List<GroupSummary> userGroups = [];
+
+  /// The user's own role in the current group (`owner` | `admin` |
+  /// `member`), or null when it is not known yet. Drives invite
+  /// gating in the UI; the repository and the security rules enforce
+  /// it again on every write.
+  String? currentRole;
+
+  /// True when the user may send and revoke invitations in the
+  /// current group (owner or admin).
+  bool get canInvite => currentRole == 'owner' || currentRole == 'admin';
+
+  /// True when the user owns the current group (only an owner may
+  /// grant the admin role).
+  bool get isGroupOwner => currentRole == 'owner';
+
+  /// Invitations this group sent, newest first (owner/admin only).
+  List<Invitation> groupInvitations = [];
+
+  /// Invitations addressed to the signed-in user's email, newest
+  /// first (any status; expiry is derived — see [Invitation]).
+  List<Invitation> myInvitations = [];
+
+  /// Pending invitations this group sent.
+  int get pendingInviteCount =>
+      groupInvitations.where((i) => i.isPending).length;
+
+  /// Pending invitations addressed to the signed-in user.
+  List<Invitation> get myPendingInvitations =>
+      myInvitations.where((i) => i.isPending).toList();
 
   /// Monthly household budget in integer paisa (PKR 5,000 = 500000).
   /// Loaded from the group document; the default is the seeded value.
@@ -855,6 +898,11 @@ class AppState extends ChangeNotifier {
   void _clearLocalSession() {
     loggedInMemberId = null;
     groupId = null;
+    userGroups = [];
+    currentRole = null;
+    groupInvitations = [];
+    myInvitations = [];
+    _groupOverride = null;
     budgetPaisa = defaultBudgetPaisa;
     members = [];
     shopping = [];
@@ -918,9 +966,57 @@ class AppState extends ChangeNotifier {
         legacyMemberId: memberId,
         isDemo: isDemoUser,
       );
-      groupId = info.groupId;
+      // Phase 4 (shared households): the user may belong to several
+      // groups — their own household group plus every group they
+      // joined by accepting an invitation. The current group is the
+      // persisted choice when it is still one of theirs, otherwise
+      // their own household group. Single-group users (the demo
+      // benchmark, every existing flow) always land on their own
+      // group, exactly as before.
+      var groups = <GroupSummary>[];
+      try {
+        groups = await _repository.listUserGroups(
+          uid: currentUid,
+          email: firebaseSession?.email,
+        );
+      } catch (_) {
+        groups = [];
+      }
+      if (groups.isEmpty) {
+        groups = [
+          GroupSummary(
+            groupId: info.groupId,
+            name: 'SplitNest Household',
+            budgetPaisa: info.budgetPaisa,
+            role: 'owner',
+          ),
+        ];
+      }
+      userGroups = groups;
+      // The current group, in priority order: this session's
+      // explicit choice, then the persisted choice, then the user's
+      // own household group. The persisted choice is only honoured
+      // when no explicit choice exists, so it can never yank the
+      // user out of a household they switched to; and it is read
+      // on every refresh, so a prefs cache that was not ready at
+      // the first refresh still restores the household on the next
+      // one. Single-group users always land on their own group,
+      // exactly as before.
+      final saved = _prefs?.getString('$_currentGroupKeyPrefix$currentUid');
+      unawaited(_ensurePrefs());
+      final selected = (_groupOverride != null &&
+              groups.any((g) => g.groupId == _groupOverride))
+          ? _groupOverride!
+          : (saved != null && groups.any((g) => g.groupId == saved))
+              ? saved
+              : info.groupId;
+      groupId = selected;
       final gid = groupId!;
-      budgetPaisa = info.budgetPaisa;
+      budgetPaisa = groups
+              .where((g) => g.groupId == gid)
+              .firstOrNull
+              ?.budgetPaisa ??
+          info.budgetPaisa;
       final results = await Future.wait([
         _repository.getMembers(gid),
         _repository.getShopping(gid),
@@ -944,6 +1040,20 @@ class AppState extends ChangeNotifier {
           members.every((m) => m.id != activeMemberId)) {
         activeMemberId = members.first.id;
       }
+      // Role + invitations load after the household data, and each
+      // in its own try/catch: an invitation read must never break
+      // the household load (e.g. a plain member may not list the
+      // group's sent invitations — the rules deny it, so the list
+      // is simply empty for them).
+      try {
+        currentRole = await _repository.getMyRole(
+          groupId: gid,
+          uid: currentUid,
+        );
+      } catch (_) {
+        currentRole = null;
+      }
+      await _loadInvitations();
     } on CloudDataException catch (e) {
       errorMessage = e.message;
     } catch (_) {
@@ -1206,6 +1316,267 @@ class AppState extends ChangeNotifier {
           actorUid: currentUid,
         ),
       );
+
+  // ---- Shared households + invitations (Phase 4) ----
+
+  static const _currentGroupKeyPrefix = 'current_group_id_';
+
+  /// Cached SharedPreferences instance, loaded once in the
+  /// background at construction. The household load ([refresh])
+  /// NEVER awaits the store: in widget tests without mock values
+  /// `getInstance()` never completes, and awaiting it would hang
+  /// the load (and its spinner) forever — a `Future.timeout`
+  /// around it does not help either, because `pumpAndSettle`
+  /// returns while such a timer is pending. In production the
+  /// instance is ready long before login (main() already awaited
+  /// it for the theme, and the plugin caches it), so the restore
+  /// below works there; when the cache is not ready yet, the own
+  /// group is the correct default.
+  SharedPreferences? _prefs;
+
+  Future<void> _ensurePrefs() async {
+    if (_prefs != null) return;
+    _prefs = await _prefsOrNull();
+  }
+
+  /// SharedPreferences, or null when the store cannot be reached.
+  /// Deliberately NO timeout here: `Future.timeout` plants a Timer
+  /// that outlives widget tests without mock values and fails them
+  /// at teardown ("a Timer is still pending"). A never-completing
+  /// background load is harmless; callers never await this on a
+  /// UI path anyway (see [_prefs]).
+  Future<SharedPreferences?> _prefsOrNull() async {
+    try {
+      return await SharedPreferences.getInstance();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Explicit current-group choice made this session (group switch
+  /// or invite accept). It outranks the persisted choice, so a
+  /// switch applies immediately even when the prefs cache is not
+  /// ready yet (e.g. in tests).
+  String? _groupOverride;
+
+  /// Persists the current-group choice (fire-and-forget: never
+  /// awaited on a UI path — see [_prefs]).
+  void _persistCurrentGroupId(String gid) {
+    unawaited(_storeGroupId(gid));
+  }
+
+  Future<void> _storeGroupId(String gid) async {
+    try {
+      final prefs = _prefs ?? await _prefsOrNull();
+      _prefs ??= prefs;
+      await prefs?.setString('$_currentGroupKeyPrefix$currentUid', gid);
+    } catch (_) {
+      // Persistence is best-effort; the in-memory choice still
+      // applies for this session.
+    }
+  }
+
+  String get _currentGroupName =>
+      userGroups
+          .where((g) => g.groupId == groupId)
+          .firstOrNull
+          ?.name ??
+      'SplitNest Household';
+
+  /// Loads the invitation lists for the current group / user.
+  /// Failures leave the lists empty — never an error banner, since
+  /// a plain member simply may not list the group's invitations.
+  Future<void> _loadInvitations() async {
+    groupInvitations = [];
+    myInvitations = [];
+    final gid = groupId;
+    if (gid == null) return;
+    final email = firebaseSession?.email;
+    if (email != null && email.isNotEmpty) {
+      try {
+        myInvitations = await _repository.getMyInvitations(email);
+      } catch (_) {
+        myInvitations = [];
+      }
+    }
+    if (canInvite) {
+      try {
+        groupInvitations = await _repository.getGroupInvitations(gid);
+      } catch (_) {
+        groupInvitations = [];
+      }
+    }
+  }
+
+  /// Reloads only the invitation lists (after a send/revoke).
+  Future<void> refreshInvitations() async {
+    await _loadInvitations();
+    notifyListeners();
+  }
+
+  /// Switches the current household to one of the user's groups and
+  /// reloads the household from it. The choice persists, so the
+  /// next launch re-opens the same household. Returns false (with
+  /// [errorMessage] set) when the group is not one of the user's.
+  Future<bool> switchGroup(String newGroupId) async {
+    if (isBusy) return false;
+    if (!userGroups.any((g) => g.groupId == newGroupId)) {
+      errorMessage = 'That household is not in your list.';
+      notifyListeners();
+      return false;
+    }
+    if (newGroupId == groupId) return true;
+    _groupOverride = newGroupId;
+    _persistCurrentGroupId(newGroupId);
+    await refresh();
+    return errorMessage == null;
+  }
+
+  /// Sends an invitation to join the current group. Only an
+  /// owner/admin may invite; only an owner may grant `admin`.
+  /// Returns the created invitation (its id is the shareable code),
+  /// or null with [errorMessage] set.
+  Future<Invitation?> sendInvitation({
+    required String email,
+    String role = 'member',
+  }) async {
+    final gid = groupId;
+    if (gid == null || isBusy) return null;
+    if (!canInvite) {
+      errorMessage =
+          'Only the household owner or an admin can invite.';
+      notifyListeners();
+      return null;
+    }
+    isBusy = true;
+    errorMessage = null;
+    notifyListeners();
+    try {
+      final invite = await _repository.createInvitation(
+        groupId: gid,
+        groupName: _currentGroupName,
+        invitedEmail: email,
+        role: role,
+        actorUid: currentUid,
+        actorEmail: firebaseSession?.email,
+        actorName: _displayNameFor(loggedInMemberId!),
+      );
+      await _loadInvitations();
+      _logActivity(
+        type: 'invite_sent',
+        title: 'Invite sent to ${invite.invitedEmail}',
+        amount: '0.00',
+        memberId: loggedInMemberId!,
+        detail: _currentGroupName,
+      );
+      return invite;
+    } on CloudDataException catch (e) {
+      errorMessage = e.message;
+      return null;
+    } catch (_) {
+      errorMessage = 'Something went wrong. Please try again.';
+      return null;
+    } finally {
+      isBusy = false;
+      notifyListeners();
+    }
+  }
+
+  /// Revokes a pending invitation the current group sent. Only an
+  /// owner/admin may revoke.
+  Future<bool> revokeInvitation(String invitationId) async {
+    final gid = groupId;
+    if (gid == null || isBusy) return false;
+    if (!canInvite) {
+      errorMessage =
+          'Only the household owner or an admin can revoke an '
+          'invitation.';
+      notifyListeners();
+      return false;
+    }
+    isBusy = true;
+    errorMessage = null;
+    notifyListeners();
+    try {
+      await _repository.revokeInvitation(
+        groupId: gid,
+        invitationId: invitationId,
+        actorUid: currentUid,
+      );
+      await _loadInvitations();
+      return true;
+    } on CloudDataException catch (e) {
+      errorMessage = e.message;
+      return false;
+    } catch (_) {
+      errorMessage = 'Something went wrong. Please try again.';
+      return false;
+    } finally {
+      isBusy = false;
+      notifyListeners();
+    }
+  }
+
+  /// Accepts an invitation by code (or a pasted
+  /// `splitnest.app/join?code=...` link — the code is extracted
+  /// from it). On success the joined group becomes the current
+  /// group and its household loads. Returns the accepted invitation,
+  /// or null with [errorMessage] set.
+  Future<Invitation?> acceptInvitationByCode(String rawCode) async {
+    final code = parseInviteCode(rawCode);
+    if (code.isEmpty) {
+      errorMessage = 'Enter an invite code to join a household.';
+      notifyListeners();
+      return null;
+    }
+    return acceptInvitation(code);
+  }
+
+  /// Accepts one invitation by id (= code). The repository runs the
+  /// accept transaction (membership + mirror + accepted status);
+  /// this only switches the current group to the joined household
+  /// and logs the join.
+  Future<Invitation?> acceptInvitation(String invitationId) async {
+    if (isBusy) return null;
+    final email = firebaseSession?.email;
+    if (email == null || email.isEmpty) {
+      errorMessage =
+          'Sign in with an email address to accept an invitation.';
+      notifyListeners();
+      return null;
+    }
+    isBusy = true;
+    errorMessage = null;
+    notifyListeners();
+    try {
+      final accepted = await _repository.acceptInvitation(
+        invitationId: invitationId,
+        actorUid: currentUid,
+        email: email,
+        displayName: _displayNameFor(loggedInMemberId!),
+      );
+      _groupOverride = accepted.groupId;
+      _persistCurrentGroupId(accepted.groupId);
+      await refresh();
+      _logActivity(
+        type: 'member_joined',
+        title: 'You joined ${accepted.groupName}',
+        amount: '0.00',
+        memberId: loggedInMemberId!,
+        detail: accepted.groupName,
+      );
+      return accepted;
+    } on CloudDataException catch (e) {
+      errorMessage = e.message;
+      return null;
+    } catch (_) {
+      errorMessage = 'Something went wrong. Please try again.';
+      return null;
+    } finally {
+      isBusy = false;
+      notifyListeners();
+    }
+  }
 
   /// Loads the clearly-labelled DEMO benchmark into this group.
   /// Demo users only — real users never see the action (the Home

@@ -20,6 +20,7 @@ library;
 
 import 'package:splitnest/core/money.dart';
 import 'package:splitnest/data/demo_benchmark.dart';
+import 'package:splitnest/domain/invitations.dart';
 import 'package:splitnest/data/repository.dart';
 import 'package:splitnest/domain/balances.dart';
 import 'package:splitnest/domain/models.dart';
@@ -90,6 +91,17 @@ class FakeSplitNestRepository implements SplitNestRepository {
   bool _benchmarkLoaded;
   int _seq = 0;
 
+  // ---- Invitations (Phase 4) ----
+  final List<Invitation> _invitations = [];
+  // groupId -> uid -> role. ensureGroup makes the first caller the
+  // owner; later callers of the same (fake-collapsed) group join as
+  // members — the fake has one group id, so this models the shared
+  // household rather than per-user groups.
+  final Map<String, Map<String, String>> _roles = {};
+  // uid -> group ids the user belongs to (own group + accepted).
+  final Map<String, Set<String>> _userGroups = {};
+  final Map<String, String> _groupNames = {};
+
   /// Test hook: the next checkout throws mid-call (after
   /// validation, before any mutation) to prove atomicity.
   bool failNextCheckout = false;
@@ -100,6 +112,7 @@ class FakeSplitNestRepository implements SplitNestRepository {
   List<ShoppingItem> get allShopping => List.of(_shopping);
   List<FixedExpense> get allFixed => List.of(_fixed);
   List<ActivityEntry> get allActivity => List.of(_activity);
+  List<Invitation> get allInvitations => List.of(_invitations);
   bool get benchmarkLoaded => _benchmarkLoaded;
 
   String _today() {
@@ -128,8 +141,19 @@ class FakeSplitNestRepository implements SplitNestRepository {
     required String? email,
     required String legacyMemberId,
     required bool isDemo,
-  }) async =>
-      const GroupInfo(groupId: groupId, budgetPaisa: defaultBudgetPaisa);
+  }) async {
+    // First caller owns the group; later callers join as members
+    // (the fake collapses every household to one group id).
+    final roles = _roles[groupId] ??= {};
+    if (!roles.values.contains('owner')) {
+      roles[uid] = 'owner';
+    } else {
+      roles.putIfAbsent(uid, () => 'member');
+    }
+    (_userGroups[uid] ??= {}).add(groupId);
+    _groupNames[groupId] ??= 'SplitNest Household';
+    return const GroupInfo(groupId: groupId, budgetPaisa: defaultBudgetPaisa);
+  }
 
   @override
   Future<List<Member>> getMembers(String groupId) async =>
@@ -495,6 +519,221 @@ class FakeSplitNestRepository implements SplitNestRepository {
     _benchmarkLoaded = true;
     return benchmarkExpenses.length;
   }
+
+  // ---- Invitations + shared households (Phase 4) ----
+  // Same contract as FirestoreSplitNestRepository, over plain lists.
+
+  String _roleOf(String groupId, String uid) {
+    final role = _roles[groupId]?[uid];
+    if (role == null) {
+      throw const CloudDataException(
+          'Only the household owner or an admin can do that.');
+    }
+    return role;
+  }
+
+  void _sweepExpiredFake() {
+    for (var i = 0; i < _invitations.length; i++) {
+      if (_invitations[i].isExpired) {
+        _invitations[i] = _invitations[i].copyWith(status: 'expired');
+      }
+    }
+  }
+
+  @override
+  Future<Invitation> createInvitation({
+    required String groupId,
+    required String groupName,
+    required String invitedEmail,
+    required String role,
+    required String actorUid,
+    required String? actorEmail,
+    required String actorName,
+  }) async {
+    final email = normalizeInviteEmail(invitedEmail);
+    if (!isValidInviteEmail(email)) {
+      throw const CloudDataException(
+          'Enter a valid email address, like name@example.com.');
+    }
+    if (actorEmail != null && email == normalizeInviteEmail(actorEmail)) {
+      throw const CloudDataException(
+          'You cannot invite yourself — that email is already in '
+          'this household.');
+    }
+    if (role != 'member' && role != 'admin') {
+      throw const CloudDataException('Role must be member or admin.');
+    }
+    final actorRole = _roleOf(groupId, actorUid);
+    if (actorRole != 'owner' && actorRole != 'admin') {
+      throw const CloudDataException(
+          'Only the household owner or an admin can invite.');
+    }
+    if (role == 'admin' && actorRole != 'owner') {
+      throw const CloudDataException(
+          'Only the household owner can grant the admin role.');
+    }
+    _sweepExpiredFake();
+    if (_invitations.any((i) =>
+        i.groupId == groupId &&
+        i.invitedEmail == email &&
+        i.isPending)) {
+      throw CloudDataException(
+          'An invitation is already pending for $email in this '
+          'household.');
+    }
+    var code = '';
+    for (var attempt = 0; attempt < 5; attempt++) {
+      code = generateInviteCode();
+      if (!_invitations.any((i) => i.id == code)) break;
+      if (attempt == 4) {
+        throw const CloudDataException(
+            'Could not create the invitation. Please try again.');
+      }
+    }
+    final now = DateTime.now();
+    final invite = Invitation(
+      id: code,
+      groupId: groupId,
+      groupName: groupName,
+      invitedEmail: email,
+      invitedBy: actorUid,
+      inviterName: actorName,
+      role: role,
+      status: 'pending',
+      createdAt: now,
+      expiresAt: invitationExpiryFrom(now),
+    );
+    _invitations.add(invite);
+    return invite;
+  }
+
+  @override
+  Future<List<Invitation>> getGroupInvitations(String groupId) async {
+    _sweepExpiredFake();
+    final invites =
+        _invitations.where((i) => i.groupId == groupId).toList();
+    invites.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    return invites;
+  }
+
+  @override
+  Future<List<Invitation>> getMyInvitations(String email) async {
+    final clean = normalizeInviteEmail(email);
+    final invites =
+        _invitations.where((i) => i.invitedEmail == clean).toList();
+    invites.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    return invites;
+  }
+
+  @override
+  Future<void> revokeInvitation({
+    required String groupId,
+    required String invitationId,
+    required String actorUid,
+  }) async {
+    final role = _roleOf(groupId, actorUid);
+    if (role != 'owner' && role != 'admin') {
+      throw const CloudDataException(
+          'Only the household owner or an admin can revoke an '
+          'invitation.');
+    }
+    final i = _invitations.indexWhere((v) => v.id == invitationId);
+    if (i < 0) throw const CloudDataException('Invitation not found.');
+    if (_invitations[i].status != 'pending') {
+      throw const CloudDataException(
+          'This invitation is no longer pending.');
+    }
+    _invitations[i] = _invitations[i].copyWith(status: 'revoked');
+  }
+
+  @override
+  Future<Invitation> acceptInvitation({
+    required String invitationId,
+    required String actorUid,
+    required String email,
+    required String displayName,
+  }) async {
+    final cleanEmail = normalizeInviteEmail(email);
+    if (cleanEmail.isEmpty || !isValidInviteEmail(cleanEmail)) {
+      throw const CloudDataException(
+          'Sign in with an email address to accept an invitation.');
+    }
+    final code = normalizeInviteCode(invitationId);
+    if (code.isEmpty) {
+      throw const CloudDataException(
+          'Enter an invite code to join a household.');
+    }
+    final i = _invitations.indexWhere((v) => v.id == code);
+    if (i < 0) throw const CloudDataException('Invitation not found.');
+    final inv = _invitations[i];
+    if (inv.status == 'accepted') {
+      throw const CloudDataException(
+          'This invitation has already been accepted.');
+    }
+    if (inv.status != 'pending') {
+      throw const CloudDataException(
+          'This invitation is no longer pending.');
+    }
+    if (inv.isExpired) {
+      throw const CloudDataException(
+          'This invitation has expired. Ask for a new one.');
+    }
+    if (inv.invitedEmail != cleanEmail) {
+      throw const CloudDataException(
+          'This invitation was sent to a different email address. '
+          'Sign in with that email to accept it.');
+    }
+    // Atomic in the fake: every mutation below happens only after
+    // every check above passed, mirroring the Firestore
+    // transaction (members map + mirror + invite + activity).
+    final accepted = inv.copyWith(status: 'accepted', acceptedBy: actorUid);
+    _invitations[i] = accepted;
+    final grantedRole = inv.role == 'admin' ? 'admin' : 'member';
+    (_roles[inv.groupId] ??= {})[actorUid] = grantedRole;
+    (_userGroups[actorUid] ??= {}).add(inv.groupId);
+    _groupNames[inv.groupId] ??= inv.groupName;
+    _activity.add(ActivityEntry(
+      type: 'member_joined',
+      title: '$displayName joined the group',
+      amount: '0.00',
+      memberId: actorUid,
+      detail: inv.groupName,
+      timestamp: DateTime.now(),
+    ));
+    return accepted;
+  }
+
+  @override
+  Future<List<GroupSummary>> listUserGroups({
+    required String uid,
+    required String? email,
+  }) async {
+    final ids = <String>{...?_userGroups[uid]};
+    if (email != null) {
+      final clean = normalizeInviteEmail(email);
+      for (final inv in _invitations) {
+        if (inv.invitedEmail == clean && inv.status == 'accepted') {
+          ids.add(inv.groupId);
+        }
+      }
+    }
+    if (ids.isEmpty) ids.add(groupId);
+    return ids
+        .map((gid) => GroupSummary(
+              groupId: gid,
+              name: _groupNames[gid] ?? 'SplitNest Household',
+              budgetPaisa: defaultBudgetPaisa,
+              role: _roles[gid]?[uid],
+            ))
+        .toList();
+  }
+
+  @override
+  Future<String?> getMyRole({
+    required String groupId,
+    required String uid,
+  }) async =>
+      _roles[groupId]?[uid];
 
   @override
   Future<void> logActivity({

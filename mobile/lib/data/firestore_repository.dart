@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart';
 
 import '../core/money.dart';
 import '../domain/balances.dart';
+import '../domain/invitations.dart';
 import '../domain/models.dart';
 import 'demo_benchmark.dart';
 import 'repository.dart';
@@ -155,6 +156,35 @@ ShoppingItem shoppingItemFromData(String id, Map<String, dynamic> data) {
     unit: data['unit'] as String? ?? 'pack',
     requestedQty: (data['requestedQty'] as num?)?.toInt() ?? 1,
     status: data['status'] as String? ?? 'Pending',
+  );
+}
+
+/// Reads one invitation document back into an [Invitation]. The
+/// document id IS the invite code (see `domain/invitations.dart`).
+Invitation invitationFromData(
+  String id,
+  Map<String, dynamic> data,
+) {
+  final createdAt = data['createdAt'];
+  final expiresAt = data['expiresAt'];
+  final acceptedAt = data['acceptedAt'];
+  return Invitation(
+    id: id,
+    groupId: data['groupId'] as String? ?? '',
+    groupName: data['groupName'] as String? ?? '',
+    invitedEmail: data['invitedEmail'] as String? ?? '',
+    invitedBy: data['invitedBy'] as String? ?? '',
+    inviterName: data['inviterName'] as String?,
+    role: data['role'] as String? ?? 'member',
+    status: data['status'] as String? ?? 'pending',
+    createdAt:
+        createdAt is Timestamp ? createdAt.toDate() : DateTime.now(),
+    expiresAt: expiresAt is Timestamp
+        ? expiresAt.toDate()
+        : DateTime.now().add(
+            const Duration(days: invitationValidityDays)),
+    acceptedBy: data['acceptedBy'] as String?,
+    acceptedAt: acceptedAt is Timestamp ? acceptedAt.toDate() : null,
   );
 }
 
@@ -960,6 +990,401 @@ class FirestoreSplitNestRepository implements SplitNestRepository {
         }
         await batch.commit();
         return benchmarkExpenses.length;
+      });
+
+  // ---- Invitations + shared households (Phase 4) ----
+
+  /// The actor's own role in a group, read from the group doc's
+  /// `members` map (the rules' source of truth). Throws when the
+  /// group does not exist or the actor is not a member — the caller
+  /// turns that into the plain "only owner/admin" message.
+  Future<String> _roleInGroup(String groupId, String uid) async {
+    final snap = await _groupDoc(groupId).get();
+    final data = snap.data();
+    if (data == null) {
+      throw const CloudDataException('Group not found.');
+    }
+    final members = data['members'] as Map<String, dynamic>? ?? {};
+    final entry = members[uid] as Map<String, dynamic>?;
+    final role = entry?['role'] as String?;
+    if (role == null) {
+      throw const CloudDataException(
+          'Only the household owner or an admin can do that.');
+    }
+    return role;
+  }
+
+  CollectionReference<Map<String, dynamic>> get _invitations =>
+      _store.collection('invitations');
+
+  /// Marks stored-`pending`, past-expiry invitations as `expired`.
+  /// Admin path only (the rules let an owner/admin write that
+  /// transition); every write is best-effort so a sweep can never
+  /// fail the listing that triggered it.
+  Future<void> _sweepExpired(List<Invitation> invites) async {
+    for (final inv in invites) {
+      if (!inv.isExpired) continue;
+      try {
+        await _invitations.doc(inv.id).update({'status': 'expired'});
+      } catch (e) {
+        debugPrint('SplitNest: invitation expiry sweep skipped ($e)');
+      }
+    }
+  }
+
+  @override
+  Future<Invitation> createInvitation({
+    required String groupId,
+    required String groupName,
+    required String invitedEmail,
+    required String role,
+    required String actorUid,
+    required String? actorEmail,
+    required String actorName,
+  }) =>
+      _guard(() async {
+        final email = normalizeInviteEmail(invitedEmail);
+        if (!isValidInviteEmail(email)) {
+          throw const CloudDataException(
+              'Enter a valid email address, like name@example.com.');
+        }
+        if (actorEmail != null &&
+            email == normalizeInviteEmail(actorEmail)) {
+          throw const CloudDataException(
+              'You cannot invite yourself — that email is already in '
+              'this household.');
+        }
+        if (role != 'member' && role != 'admin') {
+          throw const CloudDataException(
+              'Role must be member or admin.');
+        }
+        final actorRole = await _roleInGroup(groupId, actorUid);
+        if (actorRole != 'owner' && actorRole != 'admin') {
+          throw const CloudDataException(
+              'Only the household owner or an admin can invite.');
+        }
+        if (role == 'admin' && actorRole != 'owner') {
+          throw const CloudDataException(
+              'Only the household owner can grant the admin role.');
+        }
+        // No duplicate ACTIVE invitation for the same email + group.
+        // Query on groupId + status (a composite index that already
+        // exists); the email filter is client-side so no new index
+        // is needed. Past-expiry duplicates are swept, not blocking.
+        final dupSnap = await _invitations
+            .where('groupId', isEqualTo: groupId)
+            .where('status', isEqualTo: 'pending')
+            .get();
+        final dupes = dupSnap.docs
+            .map((d) => invitationFromData(d.id, d.data()))
+            .where((i) => i.invitedEmail == email)
+            .toList();
+        for (final dupe in dupes) {
+          if (dupe.isExpired) continue;
+          throw CloudDataException(
+              'An invitation is already pending for $email in this '
+              'household.');
+        }
+        await _sweepExpired(dupes);
+        // The code is the document id: a secure-random 12-character
+        // code, retried on the (negligible) chance of a collision.
+        var code = '';
+        var ref = _invitations.doc();
+        for (var attempt = 0; attempt < 5; attempt++) {
+          code = generateInviteCode();
+          ref = _invitations.doc(code);
+          if (!(await ref.get()).exists) break;
+          if (attempt == 4) {
+            throw const CloudDataException(
+                'Could not create the invitation. Please try again.');
+          }
+        }
+        final now = DateTime.now();
+        await ref.set({
+          'groupId': groupId,
+          'groupName': groupName,
+          'invitedEmail': email,
+          'invitedBy': actorUid,
+          'inviterName': actorName,
+          'role': role,
+          'status': 'pending',
+          'createdAt': Timestamp.fromDate(now),
+          'expiresAt':
+              Timestamp.fromDate(invitationExpiryFrom(now)),
+        });
+        return Invitation(
+          id: code,
+          groupId: groupId,
+          groupName: groupName,
+          invitedEmail: email,
+          invitedBy: actorUid,
+          inviterName: actorName,
+          role: role,
+          status: 'pending',
+          createdAt: now,
+          expiresAt: invitationExpiryFrom(now),
+        );
+      });
+
+  @override
+  Future<List<Invitation>> getGroupInvitations(String groupId) =>
+      _guard(() async {
+        final snap = await _invitations
+            .where('groupId', isEqualTo: groupId)
+            .get();
+        final invites = snap.docs
+            .map((d) => invitationFromData(d.id, d.data()))
+            .toList();
+        invites.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+        // Admin-side sweep: past-expiry pending invites are stored
+        // as expired (the rules allow an owner/admin that write).
+        await _sweepExpired(invites);
+        return invites
+            .map((i) => i.isExpired ? i.copyWith(status: 'expired') : i)
+            .toList();
+      });
+
+  @override
+  Future<List<Invitation>> getMyInvitations(String email) =>
+      _guard(() async {
+        final clean = normalizeInviteEmail(email);
+        final snap = await _invitations
+            .where('invitedEmail', isEqualTo: clean)
+            .get();
+        final invites = snap.docs
+            .map((d) => invitationFromData(d.id, d.data()))
+            .toList();
+        invites.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+        // No sweep here: the invitee cannot write the expiry
+        // transition (rules), so expiry stays derived via
+        // Invitation.isExpired / effectiveStatus.
+        return invites;
+      });
+
+  @override
+  Future<void> revokeInvitation({
+    required String groupId,
+    required String invitationId,
+    required String actorUid,
+  }) =>
+      _guard(() async {
+        final role = await _roleInGroup(groupId, actorUid);
+        if (role != 'owner' && role != 'admin') {
+          throw const CloudDataException(
+              'Only the household owner or an admin can revoke an '
+              'invitation.');
+        }
+        final ref = _invitations.doc(invitationId);
+        final snap = await ref.get();
+        final data = snap.data();
+        if (data == null) {
+          throw const CloudDataException('Invitation not found.');
+        }
+        if (data['status'] != 'pending') {
+          throw const CloudDataException(
+              'This invitation is no longer pending.');
+        }
+        await ref.update({'status': 'revoked'});
+      });
+
+  @override
+  Future<Invitation> acceptInvitation({
+    required String invitationId,
+    required String actorUid,
+    required String email,
+    required String displayName,
+  }) =>
+      _guard(() async {
+        final cleanEmail = normalizeInviteEmail(email);
+        if (cleanEmail.isEmpty || !isValidInviteEmail(cleanEmail)) {
+          throw const CloudDataException(
+              'Sign in with an email address to accept an invitation.');
+        }
+        final code = normalizeInviteCode(invitationId);
+        if (code.isEmpty) {
+          throw const CloudDataException(
+              'Enter an invite code to join a household.');
+        }
+        final invRef = _invitations.doc(code);
+        // One transaction: verify the invite, add the user to the
+        // group's members map AND the members mirror, and mark the
+        // invite accepted — or nothing changes. This is the whole
+        // accept flow, client-side: it does NOT depend on the
+        // undeployed onInvitationAccepted Cloud Function (see
+        // functions/index.js — that Function is only a redundant
+        // notification path once deployed, and it re-checks the same
+        // accepted transition).
+        //
+        // The group doc is deliberately NOT read inside the
+        // transaction: the invitee is not a group member yet, so the
+        // rules deny them a group read. The blind update below is
+        // authorised by the rules' self-join branch (a pending,
+        // unexpired invitation for this group + email, adding only
+        // their own UID as `member`), and it fails outright when the
+        // group does not exist — which is the existence check.
+        final accepted = await _store.runTransaction<Invitation>(
+          (tx) async {
+            final snap = await tx.get(invRef);
+            final data = snap.data();
+            if (data == null) {
+              throw const CloudDataException('Invitation not found.');
+            }
+            final inv = invitationFromData(code, data);
+            if (inv.status == 'accepted') {
+              throw const CloudDataException(
+                  'This invitation has already been accepted.');
+            }
+            if (inv.status != 'pending') {
+              throw const CloudDataException(
+                  'This invitation is no longer pending.');
+            }
+            if (inv.isExpired) {
+              throw const CloudDataException(
+                  'This invitation has expired. Ask for a new one.');
+            }
+            if (inv.invitedEmail != cleanEmail) {
+              throw const CloudDataException(
+                  'This invitation was sent to a different email '
+                  'address. Sign in with that email to accept it.');
+            }
+            final grantedRole =
+                inv.role == 'admin' ? 'admin' : 'member';
+            final groupRef = _groupDoc(inv.groupId);
+            tx.update(groupRef, {
+              'members.$actorUid': {
+                'role': grantedRole,
+                'joinedAt': Timestamp.now(),
+              },
+              'joinInvitationId': code,
+            });
+            tx.set(
+              groupRef.collection('members').doc(actorUid),
+              {
+                'displayName': displayName,
+                'role': grantedRole,
+                'joinedAt': Timestamp.now(),
+                'invitationId': code,
+                'uid': actorUid,
+              },
+            );
+            tx.update(invRef, {
+              'status': 'accepted',
+              'acceptedBy': actorUid,
+              'acceptedAt': Timestamp.now(),
+            });
+            return inv.copyWith(
+              status: 'accepted',
+              acceptedBy: actorUid,
+            );
+          },
+        );
+        // Best-effort, outside the transaction: the activity log
+        // (rules deny client activity writes until Functions deploy,
+        // so logActivity swallows the denial) and the user's group
+        // link (so listUserGroups also finds the group from the
+        // profile, not only from the invitation).
+        await logActivity(
+          groupId: accepted.groupId,
+          entry: ActivityEntry(
+            type: 'member_joined',
+            title: '$displayName joined the group',
+            amount: '0.00',
+            memberId: actorUid,
+            detail: accepted.groupName,
+            timestamp: DateTime.now(),
+          ),
+          actorUid: actorUid,
+        );
+        try {
+          await _store.collection('users').doc(actorUid).set(
+            {
+              'groupIds': FieldValue.arrayUnion([accepted.groupId]),
+              'updatedAt': Timestamp.now(),
+            },
+            SetOptions(merge: true),
+          );
+        } catch (e) {
+          debugPrint('SplitNest: user group link skipped ($e)');
+        }
+        return accepted;
+      });
+
+  @override
+  Future<List<GroupSummary>> listUserGroups({
+    required String uid,
+    required String? email,
+  }) =>
+      _guard(() async {
+        // Candidate groups: the user's own household group, every
+        // group in their profile's groupIds list, and every group
+        // they joined by accepting an invitation. No members-map
+        // query is used: a user cannot query groups they do not
+        // belong to (rules), and the invitation trail already names
+        // every joined group.
+        final candidateIds = <String>{'household-$uid'};
+        try {
+          final userSnap =
+              await _store.collection('users').doc(uid).get();
+          final groupIds = userSnap.data()?['groupIds'] as List?;
+          if (groupIds != null) {
+            candidateIds.addAll(groupIds.whereType<String>());
+          }
+        } catch (e) {
+          debugPrint('SplitNest: user groupIds skipped ($e)');
+        }
+        if (email != null && email.isNotEmpty) {
+          final acceptedSnap = await _invitations
+              .where('invitedEmail',
+                  isEqualTo: normalizeInviteEmail(email))
+              .where('status', isEqualTo: 'accepted')
+              .get();
+          for (final d in acceptedSnap.docs) {
+            final gid = d.data()['groupId'] as String?;
+            if (gid != null && gid.isNotEmpty) candidateIds.add(gid);
+          }
+        }
+        final groups = <GroupSummary>[];
+        for (final gid in candidateIds) {
+          try {
+            final snap = await _groupDoc(gid).get();
+            final data = snap.data();
+            if (data == null) continue;
+            final members = data['members'] as Map<String, dynamic>? ?? {};
+            final entry = members[uid] as Map<String, dynamic>?;
+            groups.add(GroupSummary(
+              groupId: gid,
+              name: data['name'] as String? ?? 'SplitNest Household',
+              budgetPaisa: (data['budgetPaisa'] as num?)?.toInt() ??
+                  defaultBudgetPaisa,
+              role: entry?['role'] as String?,
+            ));
+          } catch (e) {
+            // Not a member (any more), or the group is gone: skip
+            // it silently — a missing group is never faked.
+            debugPrint('SplitNest: group $gid skipped ($e)');
+          }
+        }
+        // The user's own group first, then the rest by name.
+        groups.sort((a, b) {
+          if (a.groupId == 'household-$uid') return -1;
+          if (b.groupId == 'household-$uid') return 1;
+          return a.name.compareTo(b.name);
+        });
+        return groups;
+      });
+
+  @override
+  Future<String?> getMyRole({
+    required String groupId,
+    required String uid,
+  }) =>
+      _guard(() async {
+        final snap = await _groupDoc(groupId).get();
+        final data = snap.data();
+        if (data == null) return null;
+        final members = data['members'] as Map<String, dynamic>? ?? {};
+        final entry = members[uid] as Map<String, dynamic>?;
+        return entry?['role'] as String?;
       });
 
   @override

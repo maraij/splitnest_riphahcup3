@@ -18,13 +18,17 @@ import 'welcome_dialog.dart';
 /// member's balance card, an Active Members card and a Pending
 /// Shopping card (tap to open the Shopping tab).
 class HomeScreen extends StatelessWidget {
-  const HomeScreen({super.key, this.onGoToShopping, this.onGoToMonthly});
+  const HomeScreen(
+      {super.key, this.onGoToShopping, this.onGoToMonthly, this.onGoToInvite});
 
   /// Called when the Pending Shopping card is tapped.
   final VoidCallback? onGoToShopping;
 
   /// Called when the celebration's "View monthly summary" is tapped.
   final VoidCallback? onGoToMonthly;
+
+  /// Called when the Invite members card is tapped.
+  final VoidCallback? onGoToInvite;
 
   /// Shows the savings celebration once per login, if it applies.
   /// Called only AFTER the welcome popup has been dismissed (never
@@ -391,6 +395,44 @@ class HomeScreen extends StatelessWidget {
                       ),
                     ],
                   ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            // Invite members (Phase 4): opens Invite & households,
+            // where invitations are sent and accepted and households
+            // are switched. Shown with the pending-invite count so a
+            // waiting invitation is visible from Home.
+            Entrance(
+              delay: const Duration(milliseconds: 300),
+              child: Card(
+                child: InkWell(
+                  onTap: onGoToInvite,
+                  borderRadius:
+                      BorderRadius.circular(SplitNestTheme.cardRadius),
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.group_add_outlined,
+                          color: theme.colorScheme.primary,
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            state.myPendingInvitations.isEmpty
+                                ? 'Invite members'
+                                : '${state.myPendingInvitations.length} invitation(s) for you',
+                            style: SplitNestTheme.bodyStyle.copyWith(
+                                fontWeight: FontWeight.w700),
+                          ),
+                        ),
+                        const Icon(Icons.arrow_forward_ios_rounded,
+                            size: 16),
+                      ],
+                    ),
+                  ),
                 ),
               ),
             ),
