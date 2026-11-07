@@ -1,7 +1,6 @@
-# SplitNest — PRACTICE ONLY — NOT FOR SUBMISSION
+# SplitNest 
 
-> **PRACTICE ONLY. This app must never be submitted as an RC³ competition
-> entry.** It was built as a separate practice project at the user's explicit
+> **This app must never be submitted as an RC³ competition** It was built as a separate practice project at the user's explicit
 > confirmation ("Practice only, not for submission — build it separately",
 > 2026-11-05). It lives only in `~/workspace/splitnest-practice/`, touches
 > no other repo, and is not pushed to GitHub. The official RC³ task bans
